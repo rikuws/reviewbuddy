@@ -1,0 +1,20 @@
+[package]
+name = "gh-ui"
+version = "0.1.0"
+description = "Fast native desktop review tooling for GitHub built around gh"
+authors = ["Riku Wikman"]
+edition = "2021"
+
+[dependencies]
+dirs = "6"
+gpui = "0.2"
+rusqlite = { version = "0.33", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pulldown-cmark = "0.13"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage"] }
+objc2-foundation = { version = "0.3.2", features = ["NSData"] }
