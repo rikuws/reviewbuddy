@@ -6,5 +6,8 @@
   "dependencies": {
     "@github/copilot-sdk": "^0.2.2",
     "@openai/codex-sdk": "^0.120.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
   }
 }

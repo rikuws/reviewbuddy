@@ -14,6 +14,8 @@ use crate::{
 };
 
 const CODE_TOUR_CACHE_KEY_PREFIX: &str = "code-tour-v2";
+const BUNDLED_BRIDGE_SCRIPT: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/code-tour-bridge.bundle.mjs"));
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -880,13 +882,15 @@ where
     T: Serialize,
     R: DeserializeOwned,
 {
-    let script_path = code_tour_bridge_path()?;
-    let working_directory = project_root()?;
+    let node = find_node_binary().ok_or_else(|| {
+        "Node.js is not installed. Install Node.js (https://nodejs.org) to use AI-powered code tours.".to_string()
+    })?;
+    let script_path = ensure_bridge_script()?;
     let request_json = serde_json::to_vec(request)
         .map_err(|error| format!("Failed to serialize the code tour request: {error}"))?;
-    let mut child = Command::new(node_binary())
-        .arg(script_path)
-        .current_dir(working_directory)
+    let mut child = Command::new(node)
+        .arg(&script_path)
+        .current_dir(script_path.parent().unwrap_or(Path::new("/")))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -924,33 +928,21 @@ where
     })
 }
 
-fn code_tour_bridge_path() -> Result<PathBuf, String> {
-    let path = project_root()?.join("scripts").join("code-tour-bridge.mjs");
-
-    if path.exists() {
-        Ok(path)
-    } else {
-        Err(format!(
-            "Missing the code tour bridge script at '{}'.",
-            path.display()
-        ))
-    }
+fn ensure_bridge_script() -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("gh-ui");
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("Failed to create bridge script directory: {error}"))?;
+    let path = dir.join("code-tour-bridge.bundle.mjs");
+    std::fs::write(&path, BUNDLED_BRIDGE_SCRIPT)
+        .map_err(|error| format!("Failed to write the code tour bridge script: {error}"))?;
+    Ok(path)
 }
 
-fn project_root() -> Result<PathBuf, String> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-
-    if manifest_dir.exists() {
-        Ok(manifest_dir)
-    } else {
-        Err("Failed to resolve the project root from CARGO_MANIFEST_DIR.".to_string())
-    }
-}
-
-fn node_binary() -> String {
+fn find_node_binary() -> Option<String> {
     if let Ok(binary) = std::env::var("GH_UI_TOOL_NODE_BINARY") {
-        if !binary.trim().is_empty() {
-            return binary;
+        let binary = binary.trim().to_string();
+        if !binary.is_empty() {
+            return Some(binary);
         }
     }
 
@@ -958,14 +950,22 @@ fn node_binary() -> String {
         "/opt/homebrew/bin/node",
         "/usr/local/bin/node",
         "/usr/bin/node",
-        "node",
     ] {
-        if candidate == "node" || Path::new(candidate).exists() {
-            return candidate.to_string();
+        if Path::new(candidate).exists() {
+            return Some(candidate.to_string());
         }
     }
 
-    "node".to_string()
+    match Command::new("node")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => Some("node".to_string()),
+        _ => None,
+    }
 }
 
 fn code_tour_cache_key(
