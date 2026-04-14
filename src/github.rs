@@ -502,20 +502,28 @@ pub fn set_review_thread_resolution(
 }
 
 pub fn load_pull_request_file_content(
+    cache: &CacheStore,
     repository: &str,
     reference: &str,
     path: &str,
 ) -> Result<RepositoryFileContent, String> {
+    let key = pull_request_file_content_cache_key(repository, reference, path);
+    if let Some(cached) = cache.get::<RepositoryFileContent>(&key)? {
+        return Ok(cached.value);
+    }
+
     let auth = live_auth_state()?;
 
     if !auth.is_authenticated {
         return Err(auth.message);
     }
 
-    fetch_repository_file_content(repository, reference, path)
+    let document = fetch_repository_file_content(repository, reference, path)?;
+    cache.put(&key, &document, now_ms())?;
+    Ok(document)
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepositoryFileContent {
     pub repository: String,
     pub reference: String,
@@ -1144,6 +1152,18 @@ fn default_queues() -> Vec<PullRequestQueue> {
 
 fn pull_request_detail_cache_key(repository: &str, number: i64) -> String {
     format!("pr-detail-v2:{}#{}", repository, number)
+}
+
+fn pull_request_file_content_cache_key(repository: &str, reference: &str, path: &str) -> String {
+    format!(
+        "pr-file-v1:{}:{}:{}",
+        encode_uri_component(repository),
+        encode_uri_component(reference),
+        path.split('/')
+            .map(encode_uri_component)
+            .collect::<Vec<_>>()
+            .join("/")
+    )
 }
 
 fn default_change_type() -> String {

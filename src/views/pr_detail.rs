@@ -40,6 +40,7 @@ pub fn render_pr_workspace(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
     let loading = detail_state.map(|d| d.loading).unwrap_or(false);
     let syncing = detail_state.map(|d| d.syncing).unwrap_or(false);
     let error = detail_state.and_then(|d| d.error.clone());
+    let show_loading_state = detail.is_none() && (loading || syncing);
 
     let state_for_surface = state.clone();
     let state_for_refresh = state.clone();
@@ -89,6 +90,7 @@ pub fn render_pr_workspace(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
                                         .text_color(fg_muted())
                                         .child(badge_success(&pr_state))
                                         .child(author)
+                                        .when(syncing, |el| el.child(badge("Refreshing live")))
                                         .when_some(
                                             detail.map(|d| {
                                                 (d.base_ref_name.clone(), d.head_ref_name.clone())
@@ -118,20 +120,13 @@ pub fn render_pr_workspace(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
                                         )
                                     }
                                 }))
-                                .child(review_button(
-                                    if syncing {
-                                        "Refreshing..."
-                                    } else {
-                                        "Refresh PR"
-                                    },
-                                    {
-                                        let state = state_for_refresh.clone();
-                                        let repository = repository.clone();
-                                        move |_, window, cx| {
-                                            trigger_sync_pr(&state, &repository, number, window, cx)
-                                        }
-                                    },
-                                )),
+                                .child(review_button("Refresh PR", {
+                                    let state = state_for_refresh.clone();
+                                    let repository = repository.clone();
+                                    move |_, window, cx| {
+                                        trigger_sync_pr(&state, &repository, number, window, cx)
+                                    }
+                                })),
                         ),
                 )
                 // Surface nav
@@ -156,7 +151,7 @@ pub fn render_pr_workspace(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
                 )),
         )
         // Content area (scrollable or flex-fill depending on surface)
-        .when(loading, |el| {
+        .when(show_loading_state, |el| {
             el.child(
                 div()
                     .px(px(32.0))
@@ -211,6 +206,7 @@ fn render_overview_surface(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
         .and_then(|d| d.snapshot.as_ref())
         .map(|sn| sn.loaded_from_cache)
         .unwrap_or(false);
+    let syncing = detail_state.map(|d| d.syncing).unwrap_or(false);
     let fetched_at_ms = detail_state
         .and_then(|d| d.snapshot.as_ref())
         .and_then(|sn| sn.fetched_at_ms);
@@ -268,7 +264,18 @@ fn render_overview_surface(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
                                         .text_color(fg_emphasis())
                                         .child("Summary"),
                                 )
-                                .child(badge(if loaded_from_cache { "cache" } else { "live" })),
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap(px(6.0))
+                                        .items_center()
+                                        .child(badge(if loaded_from_cache {
+                                            "cache"
+                                        } else {
+                                            "live"
+                                        }))
+                                        .when(syncing, |el| el.child(badge("refreshing"))),
+                                ),
                         )
                         .child(div().max_w(px(640.0)).child(if detail.body.is_empty() {
                             div()
@@ -568,12 +575,28 @@ fn trigger_sync_pr(
     cx: &mut App,
 ) {
     let key = pr_key(repository, number);
+    let already_syncing = state
+        .read(cx)
+        .detail_states
+        .get(&key)
+        .map(|detail_state| detail_state.syncing)
+        .unwrap_or(false);
+    if already_syncing {
+        return;
+    }
+
     let model = state.clone();
     let repo = repository.to_string();
 
     state.update(cx, |s, cx| {
         let ds = s.detail_states.entry(key.clone()).or_default();
+        ds.loading = ds
+            .snapshot
+            .as_ref()
+            .and_then(|sn| sn.detail.as_ref())
+            .is_none();
         ds.syncing = true;
+        ds.error = None;
         cx.notify();
     });
 
@@ -591,6 +614,7 @@ fn trigger_sync_pr(
             model
                 .update(cx, |s, cx| {
                     let ds = s.detail_states.entry(detail_key.clone()).or_default();
+                    ds.loading = false;
                     ds.syncing = false;
                     match result {
                         Ok(snapshot) => {

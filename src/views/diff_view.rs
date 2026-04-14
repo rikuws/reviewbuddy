@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::prelude::*;
@@ -107,6 +106,7 @@ fn render_file_tree(
     div()
         .w(file_tree_width())
         .flex_shrink_0()
+        .min_h_0()
         .bg(bg_surface())
         .border_r(px(1.0))
         .border_color(border_default())
@@ -256,6 +256,7 @@ pub fn ensure_selected_file_content_loaded(
 async fn load_selected_file_content_flow(model: Entity<AppState>, cx: &mut AsyncWindowContext) {
     let request = model
         .read_with(cx, |state, _| {
+            let cache = state.cache.clone();
             let detail = state.active_detail()?.clone();
             let detail_key = state.active_pr_key.clone()?;
             let selected_path = state
@@ -280,12 +281,19 @@ async fn load_selected_file_content_flow(model: Entity<AppState>, cx: &mut Async
                 })
                 .unwrap_or(false);
 
-            Some((detail_key, detail, selected_file, request, already_loaded))
+            Some((
+                cache,
+                detail_key,
+                detail,
+                selected_file,
+                request,
+                already_loaded,
+            ))
         })
         .ok()
         .flatten();
 
-    let Some((detail_key, detail, selected_file, request, already_loaded)) = request else {
+    let Some((cache, detail_key, detail, selected_file, request, already_loaded)) = request else {
         return;
     };
 
@@ -311,15 +319,18 @@ async fn load_selected_file_content_flow(model: Entity<AppState>, cx: &mut Async
         })
         .ok();
 
-    let load_result = cx
-        .background_executor()
-        .spawn({
-            let repository = detail.repository.clone();
-            let path = request.path.clone();
-            let reference = request.reference.clone();
-            async move { github::load_pull_request_file_content(&repository, &reference, &path) }
-        })
-        .await;
+    let load_result =
+        cx.background_executor()
+            .spawn({
+                let cache = cache.clone();
+                let repository = detail.repository.clone();
+                let path = request.path.clone();
+                let reference = request.reference.clone();
+                async move {
+                    github::load_pull_request_file_content(&cache, &repository, &reference, &path)
+                }
+            })
+            .await;
 
     let prepared_result = load_result.map(|document| {
         let prepared = prepare_file_content(&selected_file.path, &request.reference, &document);
@@ -473,6 +484,7 @@ fn render_diff_panel(
 
     div()
         .flex_grow()
+        .min_h_0()
         .min_w_0()
         .flex()
         .flex_col()
@@ -483,38 +495,24 @@ fn render_diff_panel(
             selected_parsed,
             file_thread_count,
         ))
-        // Single scroll container for file contents + diff
         .child(
             div()
                 .flex_grow()
                 .min_h_0()
-                .id("files-scroll-container")
-                .overflow_y_scroll()
                 .bg(bg_canvas())
                 .p(px(16.0))
                 .pt(px(14.0))
                 .flex()
                 .flex_col()
-                .gap(px(16.0))
-                .child(if let Some(file) = selected_file {
-                    render_file_contents_panel(
-                        detail,
-                        file,
-                        selected_parsed,
-                        file_content_state.as_ref(),
-                        selected_anchor,
-                    )
-                    .into_any_element()
-                } else {
-                    div().into_any_element()
-                })
                 .child(
                     if let (Some(file), Some(diff_view_state)) = (selected_file, diff_view_state) {
                         render_file_diff(
                             state,
-                            detail,
                             file,
                             selected_parsed,
+                            file_content_state
+                                .as_ref()
+                                .and_then(|state| state.prepared.as_ref()),
                             selected_anchor,
                             diff_view_state,
                             cx,
@@ -601,6 +599,20 @@ fn render_diff_toolbar(
                 })
                 .when_some(selected_file, |el, f| {
                     el.child(render_change_type_chip(&f.change_type))
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_family("Fira Code")
+                                .text_color(success())
+                                .child(format!("+{}", f.additions)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_family("Fira Code")
+                                .text_color(danger())
+                                .child(format!("-{}", f.deletions)),
+                        )
                 })
                 .when(
                     selected_parsed.map(|p| p.is_binary).unwrap_or(false),
@@ -611,46 +623,33 @@ fn render_diff_toolbar(
 
 fn render_file_diff(
     state: &Entity<AppState>,
-    detail: &PullRequestDetail,
     file: &PullRequestFile,
     parsed: Option<&ParsedDiffFile>,
+    prepared_file: Option<&PreparedFileContent>,
     selected_anchor: Option<&DiffAnchor>,
     diff_view_state: DiffFileViewState,
-    cx: &App,
+    _cx: &App,
 ) -> impl IntoElement {
-    let rename_from = parsed
-        .and_then(|parsed| parsed.previous_path.as_deref())
-        .filter(|previous| *previous != file.path.as_str());
-    let hunk_count = parsed.map(|parsed| parsed.hunks.len()).unwrap_or(0);
-    let comment_count = detail
-        .review_threads
-        .iter()
-        .filter(|thread| thread.path == file.path)
-        .count();
-    let row_count = diff_view_state.rows.len();
-    let row_model = diff_view_state.rows.clone();
+    let rows = diff_view_state.rows.clone();
     let parsed_file_index = diff_view_state.parsed_file_index;
     let highlighted_hunks = diff_view_state.highlighted_hunks.clone();
     let selected_anchor = selected_anchor.cloned();
+    let list_state = diff_view_state.list_state.clone();
 
-    let rendered_rows: Vec<AnyElement> = row_model
-        .iter()
-        .map(|row| {
-            render_virtualized_diff_row(
-                state,
-                parsed_file_index,
-                highlighted_hunks.as_deref(),
-                row,
-                selected_anchor.as_ref(),
-                cx,
-            )
-            .into_any_element()
-        })
-        .collect();
+    let items = build_diff_view_items(file, parsed, prepared_file, &rows);
+
+    if list_state.item_count() != items.len() {
+        list_state.reset(items.len());
+    }
+
+    let items = Arc::new(items);
+    let state = state.clone();
 
     div()
         .flex()
         .flex_col()
+        .flex_grow()
+        .min_h_0()
         .rounded(radius())
         .border_1()
         .border_color(border_default())
@@ -659,238 +658,278 @@ fn render_file_diff(
         .shadow_sm()
         .child(
             div()
-                .px(px(16.0))
-                .py(px(12.0))
-                .border_b(px(1.0))
-                .border_color(border_default())
-                .bg(bg_overlay())
                 .flex()
-                .items_start()
-                .justify_between()
-                .gap(px(12.0))
+                .flex_col()
+                .flex_grow()
+                .min_h_0()
+                .bg(bg_inset())
                 .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(fg_emphasis())
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .overflow_x_hidden()
-                                .child(file.path.clone()),
-                        )
-                        .when_some(rename_from, |el, previous| {
-                            el.child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .font_family("Fira Code")
-                                    .text_color(fg_muted())
-                                    .child(format!("renamed from {previous}")),
-                            )
-                        })
-                        .when(rename_from.is_none(), |el| {
-                            el.child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .font_family("Fira Code")
-                                    .text_color(fg_muted())
-                                    .child(format!("{hunk_count} hunks \u{2022} {row_count} rows")),
-                            )
-                        }),
-                )
+                    list(list_state, move |ix, _window, cx| {
+                        match items[ix] {
+                            DiffViewItem::Gap(gap) => {
+                                render_diff_gap_row(gap).into_any_element()
+                            }
+                            DiffViewItem::Row(row_ix) => {
+                                render_virtualized_diff_row(
+                                    &state,
+                                    parsed_file_index,
+                                    highlighted_hunks.as_deref(),
+                                    &rows[row_ix],
+                                    selected_anchor.as_ref(),
+                                    cx,
+                                )
+                                .into_any_element()
+                            }
+                        }
+                    })
+                    .flex_grow()
+                    .min_h_0(),
+                ),
+        )
+}
+
+#[derive(Clone, Copy)]
+enum DiffViewItem {
+    Row(usize),
+    Gap(DiffGapSummary),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffGapPosition {
+    Start,
+    Between,
+    End,
+}
+
+#[derive(Clone, Copy)]
+struct DiffGapSummary {
+    position: DiffGapPosition,
+    hidden_count: usize,
+    start_line: Option<usize>,
+    end_line: Option<usize>,
+}
+
+fn build_diff_view_items(
+    file: &PullRequestFile,
+    parsed: Option<&ParsedDiffFile>,
+    prepared_file: Option<&PreparedFileContent>,
+    rows: &[DiffRenderRow],
+) -> Vec<DiffViewItem> {
+    let mut items = Vec::with_capacity(rows.len() + 4);
+    let mut last_hunk_index = None;
+    let last_hunk_row_index = rows.iter().rposition(|row| {
+        matches!(
+            row,
+            DiffRenderRow::HunkHeader { .. } | DiffRenderRow::Line { .. }
+        )
+    });
+
+    for (row_index, row) in rows.iter().enumerate() {
+        if let DiffRenderRow::HunkHeader { hunk_index } = row {
+            if let Some(gap) =
+                diff_gap_before_hunk(file, parsed, prepared_file, last_hunk_index, *hunk_index)
+            {
+                items.push(DiffViewItem::Gap(gap));
+            }
+            last_hunk_index = Some(*hunk_index);
+        }
+
+        items.push(DiffViewItem::Row(row_index));
+
+        if Some(row_index) == last_hunk_row_index {
+            if let Some(last_hunk_index) = last_hunk_index {
+                if let Some(gap) =
+                    diff_gap_after_last_hunk(file, parsed, prepared_file, last_hunk_index)
+                {
+                    items.push(DiffViewItem::Gap(gap));
+                }
+            }
+        }
+    }
+
+    items
+}
+
+fn diff_gap_before_hunk(
+    file: &PullRequestFile,
+    parsed: Option<&ParsedDiffFile>,
+    prepared_file: Option<&PreparedFileContent>,
+    previous_hunk_index: Option<usize>,
+    current_hunk_index: usize,
+) -> Option<DiffGapSummary> {
+    let parsed = parsed?;
+    let current_hunk = parsed.hunks.get(current_hunk_index)?;
+    let current_first = first_visible_line_number(file, current_hunk)?;
+
+    match previous_hunk_index {
+        Some(previous_hunk_index) => {
+            let previous_hunk = parsed.hunks.get(previous_hunk_index)?;
+            let previous_last = last_visible_line_number(file, previous_hunk)?;
+            if current_first <= previous_last.saturating_add(1) {
+                return None;
+            }
+
+            let start_line = previous_last.saturating_add(1);
+            let end_line = current_first.saturating_sub(1);
+            let hidden_count = end_line.saturating_sub(start_line).saturating_add(1);
+
+            Some(DiffGapSummary {
+                position: DiffGapPosition::Between,
+                hidden_count,
+                start_line: Some(start_line),
+                end_line: Some(end_line),
+            })
+        }
+        None => {
+            if current_first <= 1 {
+                return None;
+            }
+
+            let total_lines = prepared_file
+                .map(|prepared| prepared.lines.len())
+                .unwrap_or(0);
+            let end_line = current_first.saturating_sub(1);
+            let hidden_count = if total_lines > 0 {
+                end_line.min(total_lines)
+            } else {
+                end_line
+            };
+
+            Some(DiffGapSummary {
+                position: DiffGapPosition::Start,
+                hidden_count,
+                start_line: Some(1),
+                end_line: Some(end_line),
+            })
+        }
+    }
+}
+
+fn diff_gap_after_last_hunk(
+    file: &PullRequestFile,
+    parsed: Option<&ParsedDiffFile>,
+    prepared_file: Option<&PreparedFileContent>,
+    last_hunk_index: usize,
+) -> Option<DiffGapSummary> {
+    let prepared_file = prepared_file?;
+    let parsed = parsed?;
+    let last_hunk = parsed.hunks.get(last_hunk_index)?;
+    let last_visible = last_visible_line_number(file, last_hunk)?;
+    let total_lines = prepared_file.lines.len();
+
+    if total_lines <= last_visible {
+        return None;
+    }
+
+    Some(DiffGapSummary {
+        position: DiffGapPosition::End,
+        hidden_count: total_lines.saturating_sub(last_visible),
+        start_line: Some(last_visible.saturating_add(1)),
+        end_line: Some(total_lines),
+    })
+}
+
+fn first_visible_line_number(file: &PullRequestFile, hunk: &ParsedDiffHunk) -> Option<usize> {
+    hunk.lines
+        .iter()
+        .find_map(|line| primary_diff_line_number(file, line))
+}
+
+fn last_visible_line_number(file: &PullRequestFile, hunk: &ParsedDiffHunk) -> Option<usize> {
+    hunk.lines
+        .iter()
+        .rev()
+        .find_map(|line| primary_diff_line_number(file, line))
+}
+
+fn primary_diff_line_number(file: &PullRequestFile, line: &ParsedDiffLine) -> Option<usize> {
+    let number = if file.change_type == "DELETED" {
+        line.left_line_number.or(line.right_line_number)
+    } else {
+        line.right_line_number.or(line.left_line_number)
+    }?;
+
+    if number > 0 {
+        Some(number as usize)
+    } else {
+        None
+    }
+}
+
+fn render_diff_gap_row(summary: DiffGapSummary) -> impl IntoElement {
+    let markers = match summary.position {
+        DiffGapPosition::Start => vec!["...", "\u{2193}"],
+        DiffGapPosition::Between => vec!["\u{2191}", "...", "\u{2193}"],
+        DiffGapPosition::End => vec!["\u{2191}", "..."],
+    };
+
+    div()
+        .flex()
+        .items_center()
+        .w_full()
+        .min_h(px(30.0))
+        .bg(bg_surface())
+        .border_b(px(1.0))
+        .border_color(border_muted())
+        .font_family("Fira Code")
+        .text_size(px(11.0))
+        .child(
+            div()
+                .w(px(96.0))
+                .flex_shrink_0()
+                .h_full()
+                .bg(diff_context_gutter_bg())
+                .border_r(px(1.0))
+                .border_color(border_default()),
+        )
+        .child(
+            div()
+                .flex_grow()
+                .min_w_0()
+                .px(px(12.0))
+                .py(px(6.0))
+                .flex()
+                .items_center()
+                .gap(px(10.0))
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(6.0))
-                        .flex_wrap()
-                        .flex_shrink_0()
-                        .child(render_change_type_chip(&file.change_type))
-                        .when(comment_count > 0, |el| {
-                            el.child(badge(&format!("{comment_count} threads")))
-                        })
-                        .when(
-                            parsed.map(|parsed| parsed.is_binary).unwrap_or(false),
-                            |el| el.child(badge("binary")),
-                        )
-                        .child(
+                        .gap(px(4.0))
+                        .children(markers.into_iter().map(|marker| {
                             div()
-                                .text_size(px(11.0))
-                                .font_family("Fira Code")
-                                .text_color(success())
-                                .child(format!("+{}", file.additions)),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .font_family("Fira Code")
-                                .text_color(danger())
-                                .child(format!("-{}", file.deletions)),
-                        ),
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .rounded(px(999.0))
+                                .bg(bg_overlay())
+                                .border_1()
+                                .border_color(border_default())
+                                .text_color(accent())
+                                .child(marker)
+                        })),
+                )
+                .child(
+                    div()
+                        .text_color(fg_muted())
+                        .child(render_diff_gap_label(summary)),
                 ),
-        )
-        .child(
-            div()
-                .bg(bg_inset())
-                .flex()
-                .flex_col()
-                .children(rendered_rows),
         )
 }
 
-fn render_file_contents_panel(
-    _detail: &PullRequestDetail,
-    file: &PullRequestFile,
-    parsed: Option<&ParsedDiffFile>,
-    file_content_state: Option<&FileContentState>,
-    selected_anchor: Option<&DiffAnchor>,
-) -> impl IntoElement {
-    let rename_from = parsed
-        .and_then(|parsed| parsed.previous_path.as_deref())
-        .filter(|previous| *previous != file.path.as_str());
-    let prepared = file_content_state.and_then(|state| state.prepared.as_ref());
-    let changed_lines = prepared.map(|prepared| build_changed_line_kinds(file, parsed, prepared));
-    let display_side = if file.change_type == "DELETED" {
-        Some("LEFT")
+fn render_diff_gap_label(summary: DiffGapSummary) -> String {
+    let line_label = if summary.hidden_count == 1 {
+        "1 unchanged line".to_string()
     } else {
-        Some("RIGHT")
+        format!("{} unchanged lines", summary.hidden_count)
     };
 
-    div()
-        .rounded(radius())
-        .border_1()
-        .border_color(border_default())
-        .bg(bg_surface())
-        .overflow_hidden()
-        .shadow_sm()
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .bg(bg_inset())
-                .child(
-                    div()
-                        .px(px(16.0))
-                        .py(px(12.0))
-                        .border_b(px(1.0))
-                        .border_color(border_default())
-                        .bg(bg_overlay())
-                        .flex()
-                        .items_start()
-                        .justify_between()
-                        .gap(px(12.0))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(4.0))
-                                .min_w_0()
-                                .child(eyebrow_label("File contents"))
-                                .child(
-                                    div()
-                                        .text_size(px(13.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(fg_emphasis())
-                                        .text_ellipsis()
-                                        .whitespace_nowrap()
-                                        .overflow_x_hidden()
-                                        .child(file.path.clone()),
-                                )
-                                .when_some(rename_from, |el, previous| {
-                                    el.child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .font_family("Fira Code")
-                                            .text_color(fg_muted())
-                                            .child(format!("renamed from {previous}")),
-                                    )
-                                })
-                                .when_some(prepared, |el, prepared| {
-                                    el.child(
-                                        div()
-                                            .text_size(px(11.0))
-                                            .font_family("Fira Code")
-                                            .text_color(fg_muted())
-                                            .child(format!(
-                                                "{} lines \u{2022} ref {}",
-                                                prepared.lines.len(),
-                                                prepared.reference
-                                            )),
-                                    )
-                                }),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .flex_wrap()
-                                .child(render_change_type_chip(&file.change_type))
-                                .when_some(prepared, |el, prepared| {
-                                    if prepared.is_binary {
-                                        el.child(badge("binary"))
-                                    } else {
-                                        el
-                                    }
-                                }),
-                        ),
-                )
-                .child(match prepared {
-                    Some(prepared) if prepared.is_binary => {
-                        render_file_content_state_row("Binary file content is not displayed.")
-                            .into_any_element()
-                    }
-                    Some(prepared) if prepared.lines.is_empty() => {
-                        render_file_content_state_row("The file is empty.").into_any_element()
-                    }
-                    Some(prepared) => {
-                        let lines = prepared.lines.clone();
-                        let changed_lines = changed_lines.unwrap_or_default();
-                        let anchor = selected_anchor.cloned();
-                        div()
-                            .flex()
-                            .flex_col()
-                            .children(lines.iter().enumerate().map(move |(ix, line)| {
-                                render_file_content_line(
-                                    ix,
-                                    line,
-                                    changed_lines.get(&(ix + 1)).cloned(),
-                                    display_side,
-                                    anchor.as_ref(),
-                                )
-                                .into_any_element()
-                            }))
-                            .into_any_element()
-                    }
-                    _ if file_content_state
-                        .map(|state| state.loading)
-                        .unwrap_or(false) =>
-                    {
-                        render_file_content_state_row("Loading file contents…").into_any_element()
-                    }
-                    _ if file_content_state
-                        .and_then(|state| state.error.as_ref())
-                        .is_some() =>
-                    {
-                        render_file_content_state_row(
-                            file_content_state
-                                .and_then(|state| state.error.as_deref())
-                                .unwrap_or("Failed to load file contents."),
-                        )
-                        .into_any_element()
-                    }
-                    _ => render_file_content_state_row(
-                        "Select a file or refresh the pull request to load contents.",
-                    )
-                    .into_any_element(),
-                }),
-        )
+    match (summary.start_line, summary.end_line) {
+        (Some(start), Some(end)) if start == end => {
+            format!("{line_label} hidden at line {start}")
+        }
+        (Some(start), Some(end)) => format!("{line_label} hidden ({start}-{end})"),
+        _ => format!("{line_label} hidden"),
+    }
 }
 
 fn prepare_diff_view_state(
@@ -903,27 +942,32 @@ fn prepare_diff_view_state(
         app_state.active_pr_key.as_deref().unwrap_or("detached")
     );
     let revision = detail.updated_at.clone();
-    let (parsed_file_index, highlighted_hunks) =
-        find_parsed_diff_file_with_index(&detail.parsed_diff, file_path)
-            .map(|(ix, file)| (Some(ix), Some(build_diff_highlights(file))))
-            .unwrap_or((None, None));
 
     let mut diff_view_states = app_state.diff_view_states.borrow_mut();
     let entry = diff_view_states.entry(state_key).or_insert_with(|| {
+        let (parsed_file_index, highlighted_hunks) =
+            find_parsed_diff_file_with_index(&detail.parsed_diff, file_path)
+                .map(|(ix, file)| (Some(ix), Some(build_diff_highlights(file))))
+                .unwrap_or((None, None));
         DiffFileViewState::new(
             Arc::new(build_diff_render_rows(detail, file_path)),
             revision.clone(),
             parsed_file_index,
-            highlighted_hunks.clone(),
+            highlighted_hunks,
         )
     });
 
     if entry.revision != revision {
+        let (parsed_file_index, highlighted_hunks) =
+            find_parsed_diff_file_with_index(&detail.parsed_diff, file_path)
+                .map(|(ix, file)| (Some(ix), Some(build_diff_highlights(file))))
+                .unwrap_or((None, None));
         let rows = Arc::new(build_diff_render_rows(detail, file_path));
         entry.rows = rows;
-        entry.revision = revision.clone();
+        entry.revision = revision;
         entry.parsed_file_index = parsed_file_index;
         entry.highlighted_hunks = highlighted_hunks;
+        entry.list_state.reset(0);
     }
 
     entry.clone()
@@ -1337,11 +1381,9 @@ fn render_syntax_content(
 ) -> Div {
     let content_div = div()
         .flex_grow()
-        .min_w_0()
         .px(px(8.0))
         .py(px(1.0))
         .whitespace_nowrap()
-        .overflow_x_hidden()
         .text_size(px(12.0))
         .font_family("Fira Code");
 
@@ -1398,143 +1440,6 @@ fn build_diff_highlights(parsed_file: &ParsedDiffFile) -> Arc<Vec<Vec<Vec<Syntax
             })
             .collect(),
     )
-}
-
-fn build_changed_line_kinds(
-    file: &PullRequestFile,
-    parsed: Option<&ParsedDiffFile>,
-    prepared: &PreparedFileContent,
-) -> HashMap<usize, DiffLineKind> {
-    let mut changed_lines = HashMap::new();
-    let Some(parsed) = parsed else {
-        return changed_lines;
-    };
-
-    for hunk in &parsed.hunks {
-        for line in &hunk.lines {
-            match file.change_type.as_str() {
-                "DELETED" => {
-                    if line.kind == DiffLineKind::Deletion {
-                        if let Some(line_number) = line.left_line_number {
-                            if line_number > 0 && line_number as usize <= prepared.lines.len() {
-                                changed_lines.insert(line_number as usize, DiffLineKind::Deletion);
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    if line.kind == DiffLineKind::Addition {
-                        if let Some(line_number) = line.right_line_number {
-                            if line_number > 0 && line_number as usize <= prepared.lines.len() {
-                                changed_lines.insert(line_number as usize, DiffLineKind::Addition);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    changed_lines
-}
-
-fn render_file_content_state_row(message: &str) -> impl IntoElement {
-    div()
-        .flex()
-        .items_center()
-        .justify_center()
-        .h_full()
-        .px(px(24.0))
-        .text_size(px(13.0))
-        .text_color(fg_muted())
-        .child(message.to_string())
-}
-
-fn render_file_content_line(
-    ix: usize,
-    line: &PreparedFileLine,
-    change_kind: Option<DiffLineKind>,
-    display_side: Option<&str>,
-    selected_anchor: Option<&DiffAnchor>,
-) -> impl IntoElement {
-    let line_number = ix + 1;
-    let is_selected = selected_anchor
-        .filter(|anchor| {
-            anchor
-                .side
-                .as_deref()
-                .map(|side| Some(side) == display_side)
-                .unwrap_or(true)
-        })
-        .and_then(|anchor| anchor.line)
-        .map(|anchor_line| anchor_line as usize == line_number)
-        .unwrap_or(false);
-
-    let (row_bg, border_color, number_color) = if is_selected {
-        (accent_muted(), accent(), fg_default())
-    } else {
-        match change_kind {
-            Some(DiffLineKind::Addition) => (diff_add_bg(), diff_add_border(), fg_subtle()),
-            Some(DiffLineKind::Deletion) => (diff_remove_bg(), diff_remove_border(), fg_subtle()),
-            _ => (diff_context_bg(), border_muted(), fg_subtle()),
-        }
-    };
-
-    div()
-        .flex()
-        .items_start()
-        .w_full()
-        .min_h(px(22.0))
-        .bg(row_bg)
-        .border_b(px(1.0))
-        .border_color(border_color)
-        .font_family("Fira Code")
-        .text_size(px(12.0))
-        .when(is_selected, |el| {
-            el.border_l(px(2.0)).border_color(accent())
-        })
-        .child(
-            div()
-                .w(px(72.0))
-                .flex_shrink_0()
-                .px(px(10.0))
-                .py(px(1.0))
-                .text_size(px(11.0))
-                .text_color(number_color)
-                .text_align(TextAlign::Right)
-                .child(line_number.to_string()),
-        )
-        .child(
-            div()
-                .w(px(10.0))
-                .flex_shrink_0()
-                .py(px(1.0))
-                .text_color(match change_kind {
-                    Some(DiffLineKind::Addition) => success(),
-                    Some(DiffLineKind::Deletion) => danger(),
-                    _ => fg_subtle(),
-                })
-                .child(match change_kind {
-                    Some(DiffLineKind::Addition) => "+",
-                    Some(DiffLineKind::Deletion) => "-",
-                    _ => " ",
-                }),
-        )
-        .child(render_syntax_content(
-            "",
-            &line.text,
-            Some(line.spans.as_slice()),
-            fg_default(),
-        ))
-}
-
-fn eyebrow_label(label: &str) -> impl IntoElement {
-    div()
-        .text_size(px(10.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(fg_subtle())
-        .font_family("Fira Code")
-        .child(label.to_string())
 }
 
 fn render_review_thread(

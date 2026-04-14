@@ -13,7 +13,7 @@ use crate::github::{
 };
 use crate::local_repo::LocalRepositoryStatus;
 use crate::syntax::SyntaxSpan;
-use gpui::ScrollHandle;
+use gpui::{ListAlignment, ListState, ScrollHandle, px};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SectionId {
@@ -176,6 +176,7 @@ pub struct DiffFileViewState {
     pub revision: String,
     pub parsed_file_index: Option<usize>,
     pub highlighted_hunks: Option<Arc<Vec<Vec<Vec<SyntaxSpan>>>>>,
+    pub list_state: ListState,
 }
 
 impl DiffFileViewState {
@@ -190,6 +191,7 @@ impl DiffFileViewState {
             revision,
             parsed_file_index,
             highlighted_hunks,
+            list_state: ListState::new(0, ListAlignment::Top, px(400.0)),
         }
     }
 }

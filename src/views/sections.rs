@@ -5,9 +5,10 @@ use crate::github;
 use crate::state::*;
 use crate::theme::*;
 
-use super::tour_view::refresh_active_tour_flow;
 use super::workspace_sync::trigger_sync_workspace;
 use std::collections::BTreeMap;
+
+const DETAIL_AUTO_REFRESH_TTL_MS: i64 = 5 * 60 * 1000;
 
 pub fn render_section_workspace(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let s = state.read(cx);
@@ -288,21 +289,19 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                             .flex()
                             .flex_col()
                             .child(eyebrow("Muted Repos"))
-                            .child(
-                                div().flex().flex_col().gap(px(4.0)).children(
-                                    muted_list.into_iter().map(|repo| {
-                                        let state = state.clone();
-                                        let repo_for_unmute = repo.clone();
-                                        muted_repo_pill(&repo, move |_, _, cx| {
-                                            let r = repo_for_unmute.clone();
-                                            state.update(cx, |s, cx| {
-                                                s.muted_repos.remove(&r);
-                                                cx.notify();
-                                            });
-                                        })
-                                    }),
-                                ),
-                            ),
+                            .child(div().flex().flex_col().gap(px(4.0)).children(
+                                muted_list.into_iter().map(|repo| {
+                                    let state = state.clone();
+                                    let repo_for_unmute = repo.clone();
+                                    muted_repo_pill(&repo, move |_, _, cx| {
+                                        let r = repo_for_unmute.clone();
+                                        state.update(cx, |s, cx| {
+                                            s.muted_repos.remove(&r);
+                                            cx.notify();
+                                        });
+                                    })
+                                }),
+                            )),
                     )
                 }),
         )
@@ -366,15 +365,13 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                     el.child(div().px(px(28.0)).child(error_text(&err)))
                 })
                 .when(!workspace_loading && !has_any_lanes, |el| {
-                    el.child(div().px(px(28.0)).child(panel_state_text(
-                        if has_muted {
-                            "All repositories in this queue are muted."
-                        } else if is_auth {
-                            "No pull requests matched this queue."
-                        } else {
-                            "Authenticate with gh to load live pull request queues."
-                        },
-                    )))
+                    el.child(div().px(px(28.0)).child(panel_state_text(if has_muted {
+                        "All repositories in this queue are muted."
+                    } else if is_auth {
+                        "No pull requests matched this queue."
+                    } else {
+                        "Authenticate with gh to load live pull request queues."
+                    })))
                 })
                 // Swim lanes
                 .child(
@@ -403,29 +400,22 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                         state,
                                     ))
                                 })
-                                .children(
-                                    repo_groups.into_iter().map(|(repo, items)| {
-                                        let short_name = repo
-                                            .split('/')
-                                            .last()
-                                            .unwrap_or(&repo)
-                                            .to_string();
-                                        let count = items.len();
-                                        let accent_color = lane_accent_color(&repo);
-                                        let state = state_for_lanes.clone();
-                                        kanban_lane(
-                                            &repo,
-                                            &short_name,
-                                            &format!(
-                                                "{repo} \u{00b7} {count}"
-                                            ),
-                                            items,
-                                            accent_color,
-                                            false,
-                                            state,
-                                        )
-                                    }),
-                                ),
+                                .children(repo_groups.into_iter().map(|(repo, items)| {
+                                    let short_name =
+                                        repo.split('/').last().unwrap_or(&repo).to_string();
+                                    let count = items.len();
+                                    let accent_color = lane_accent_color(&repo);
+                                    let state = state_for_lanes.clone();
+                                    kanban_lane(
+                                        &repo,
+                                        &short_name,
+                                        &format!("{repo} \u{00b7} {count}"),
+                                        items,
+                                        accent_color,
+                                        false,
+                                        state,
+                                    )
+                                })),
                         ),
                 ),
         )
@@ -598,16 +588,32 @@ pub fn success_text(text: &str) -> impl IntoElement {
 pub fn meta_row(label: &str, value: &str) -> impl IntoElement {
     div()
         .flex()
+        .items_start()
         .gap(px(12.0))
-        .justify_between()
-        .text_size(px(13.0))
-        .child(div().text_color(fg_muted()).child(label.to_string()))
         .child(
             div()
+                .w(px(88.0))
+                .flex_shrink_0()
+                .text_color(fg_subtle())
+                .font_family("Fira Code")
+                .text_size(px(10.0))
+                .child(label.to_uppercase()),
+        )
+        .child(
+            div()
+                .flex_grow()
+                .min_w_0()
+                .px(px(10.0))
+                .py(px(8.0))
+                .rounded(radius_sm())
+                .bg(bg_inset())
+                .border_1()
+                .border_color(border_muted())
                 .text_color(fg_emphasis())
                 .font_weight(FontWeight::MEDIUM)
                 .font_family("Fira Code")
                 .text_size(px(11.0))
+                .whitespace_normal()
                 .child(value.to_string()),
         )
 }
@@ -878,18 +884,14 @@ fn kanban_lane(
                         .overflow_y_scroll()
                         .px(px(8.0))
                         .pb(px(8.0))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .gap(px(6.0))
-                                .children(items.into_iter().map(|item| {
-                                    let state = state.clone();
-                                    kanban_card(item, move |summary, window, cx| {
-                                        open_pull_request(&state, summary, window, cx);
-                                    })
-                                })),
-                        ),
+                        .child(div().flex().flex_col().gap(px(6.0)).children(
+                            items.into_iter().map(|item| {
+                                let state = state.clone();
+                                kanban_card(item, move |summary, window, cx| {
+                                    open_pull_request(&state, summary, window, cx);
+                                })
+                            }),
+                        )),
                 ),
         )
 }
@@ -965,12 +967,7 @@ fn kanban_card(
                                 .child(title),
                         )
                         // Meta line
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(fg_muted())
-                                .child(meta),
-                        )
+                        .child(div().text_size(px(11.0)).text_color(fg_muted()).child(meta))
                         // Stats row
                         .child(
                             div()
@@ -1066,6 +1063,10 @@ pub fn open_pull_request(
     let key = pr_key(&summary.repository, summary.number);
     let repository = summary.repository.clone();
     let number = summary.number;
+    let load_plan = {
+        let s = state.read(cx);
+        plan_pull_request_open(&s, &key)
+    };
 
     state.update(cx, |s, cx| {
         if !s
@@ -1086,18 +1087,17 @@ pub fn open_pull_request(
         s.active_tour_outline_id = "overview".to_string();
         s.collapsed_tour_panels.clear();
 
-        // Start loading if we don't have data
-        if !s.detail_states.contains_key(&key) {
-            s.detail_states.insert(
-                key.clone(),
-                DetailState {
-                    loading: true,
-                    ..Default::default()
-                },
-            );
+        let detail_state = s.detail_states.entry(key.clone()).or_default();
+        detail_state.loading = load_plan.show_loading;
+        if load_plan.load_cached_snapshot || load_plan.sync_live {
+            detail_state.error = None;
         }
         cx.notify();
     });
+
+    if !load_plan.load_cached_snapshot && !load_plan.sync_live {
+        return;
+    }
 
     // Load PR detail in background
     let model = state.clone();
@@ -1105,47 +1105,57 @@ pub fn open_pull_request(
         .spawn(cx, async move |cx: &mut AsyncWindowContext| {
             let cache = model.read_with(cx, |s, _| s.cache.clone()).ok();
             let Some(cache) = cache else { return };
-
-            // Load from cache first
-            let cached_result = cx
-                .background_executor()
-                .spawn({
-                    let cache = cache.clone();
-                    let repository = repository.clone();
-                    async move { github::load_pull_request_detail(&cache, &repository, number) }
-                })
-                .await;
-
             let detail_key = pr_key(&repository, number);
+            let mut should_sync = load_plan.sync_live;
 
-            model
-                .update(cx, |s, cx| {
-                    if let Ok(snapshot) = &cached_result {
+            if load_plan.load_cached_snapshot {
+                let cached_result = cx
+                    .background_executor()
+                    .spawn({
+                        let cache = cache.clone();
+                        let repository = repository.clone();
+                        async move { github::load_pull_request_detail(&cache, &repository, number) }
+                    })
+                    .await;
+
+                should_sync = match &cached_result {
+                    Ok(snapshot) => detail_snapshot_needs_background_refresh(snapshot),
+                    Err(_) => true,
+                };
+
+                model
+                    .update(cx, |s, cx| {
                         let ds = s.detail_states.entry(detail_key.clone()).or_default();
-                        ds.snapshot = Some(snapshot.clone());
-                        ds.loading = false;
-                    }
-                    cx.notify();
-                })
-                .ok();
-
-            let should_refresh_tour = model
-                .read_with(cx, |s, _| {
-                    s.active_surface == PullRequestSurface::Tour
-                        && s.active_pr_key.as_deref() == Some(&detail_key)
-                })
-                .ok()
-                .unwrap_or(false);
-
-            if should_refresh_tour {
-                refresh_active_tour_flow(model.clone(), true, cx).await;
+                        match &cached_result {
+                            Ok(snapshot) => {
+                                ds.snapshot = Some(snapshot.clone());
+                                ds.loading = snapshot.detail.is_none() && should_sync;
+                                ds.error = None;
+                            }
+                            Err(error) => {
+                                ds.loading = should_sync;
+                                ds.error = Some(error.clone());
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
             }
 
-            // Then sync from GitHub
+            if !should_sync {
+                return;
+            }
+
             model
                 .update(cx, |s, cx| {
                     let ds = s.detail_states.entry(detail_key.clone()).or_default();
+                    ds.loading = ds
+                        .snapshot
+                        .as_ref()
+                        .and_then(|sn| sn.detail.as_ref())
+                        .is_none();
                     ds.syncing = true;
+                    ds.error = None;
                     cx.notify();
                 })
                 .ok();
@@ -1162,6 +1172,7 @@ pub fn open_pull_request(
             model
                 .update(cx, |s, cx| {
                     let ds = s.detail_states.entry(detail_key.clone()).or_default();
+                    ds.loading = false;
                     ds.syncing = false;
                     match sync_result {
                         Ok(snapshot) => {
@@ -1186,20 +1197,76 @@ pub fn open_pull_request(
                     cx.notify();
                 })
                 .ok();
-
-            let should_refresh_tour = model
-                .read_with(cx, |s, _| {
-                    s.active_surface == PullRequestSurface::Tour
-                        && s.active_pr_key.as_deref() == Some(&detail_key)
-                })
-                .ok()
-                .unwrap_or(false);
-
-            if should_refresh_tour {
-                refresh_active_tour_flow(model.clone(), true, cx).await;
-            }
         })
         .detach();
+}
+
+#[derive(Clone, Copy)]
+struct PullRequestOpenPlan {
+    load_cached_snapshot: bool,
+    sync_live: bool,
+    show_loading: bool,
+}
+
+fn plan_pull_request_open(state: &AppState, key: &str) -> PullRequestOpenPlan {
+    let Some(detail_state) = state.detail_states.get(key) else {
+        return PullRequestOpenPlan {
+            load_cached_snapshot: true,
+            sync_live: false,
+            show_loading: true,
+        };
+    };
+
+    let has_detail = detail_state
+        .snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.detail.as_ref())
+        .is_some();
+
+    if detail_state.loading || detail_state.syncing {
+        return PullRequestOpenPlan {
+            load_cached_snapshot: false,
+            sync_live: false,
+            show_loading: !has_detail,
+        };
+    }
+
+    if !has_detail {
+        return PullRequestOpenPlan {
+            load_cached_snapshot: true,
+            sync_live: false,
+            show_loading: true,
+        };
+    }
+
+    PullRequestOpenPlan {
+        load_cached_snapshot: false,
+        sync_live: detail_state
+            .snapshot
+            .as_ref()
+            .map(detail_snapshot_needs_background_refresh)
+            .unwrap_or(true),
+        show_loading: false,
+    }
+}
+
+fn detail_snapshot_needs_background_refresh(snapshot: &github::PullRequestDetailSnapshot) -> bool {
+    if snapshot.detail.is_none() {
+        return true;
+    }
+
+    let Some(fetched_at_ms) = snapshot.fetched_at_ms else {
+        return true;
+    };
+
+    current_time_ms().saturating_sub(fetched_at_ms) > DETAIL_AUTO_REFRESH_TTL_MS
+}
+
+fn current_time_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn format_relative_time(value: &str) -> String {
