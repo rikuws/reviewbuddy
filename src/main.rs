@@ -1,10 +1,14 @@
 mod app_assets;
 mod cache;
+mod code_display;
 mod code_tour;
 mod diff;
 mod gh;
 mod github;
+mod local_documents;
 mod local_repo;
+mod lsp;
+mod managed_lsp;
 mod markdown;
 mod notifications;
 mod platform_macos;

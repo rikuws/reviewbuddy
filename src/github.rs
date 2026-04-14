@@ -531,7 +531,12 @@ pub struct RepositoryFileContent {
     pub content: Option<String>,
     pub is_binary: bool,
     pub size_bytes: usize,
+    #[serde(default = "default_repository_file_source")]
+    pub source: String,
 }
+
+pub const REPOSITORY_FILE_SOURCE_GITHUB: &str = "github";
+pub const REPOSITORY_FILE_SOURCE_LOCAL_CHECKOUT: &str = "local-checkout";
 
 // --- Private implementation ---
 
@@ -973,6 +978,7 @@ fn fetch_repository_file_content(
             content: Some(content),
             is_binary: false,
             size_bytes,
+            source: REPOSITORY_FILE_SOURCE_GITHUB.to_string(),
         }),
         Err(_) => Ok(RepositoryFileContent {
             repository: repository.to_string(),
@@ -981,8 +987,13 @@ fn fetch_repository_file_content(
             content: None,
             is_binary: true,
             size_bytes,
+            source: REPOSITORY_FILE_SOURCE_GITHUB.to_string(),
         }),
     }
+}
+
+fn default_repository_file_source() -> String {
+    REPOSITORY_FILE_SOURCE_GITHUB.to_string()
 }
 
 fn map_pull_request_summary(node: &Value) -> Option<PullRequestSummary> {

@@ -1,18 +1,27 @@
-use std::{sync::mpsc, time::Duration};
+use std::{collections::BTreeSet, sync::mpsc, time::Duration};
 
 use gpui::prelude::*;
 use gpui::*;
 
+use crate::code_display::{
+    build_prepared_file_lsp_context, prepared_file_has_line, render_highlighted_code_block,
+    render_highlighted_code_block_with_line_numbers,
+    render_prepared_file_excerpt_with_line_numbers,
+};
 use crate::code_tour::{
     build_code_tour_generation_input, build_tour_request_key, CodeTourProgressUpdate,
-    CodeTourProvider, CodeTourProviderStatus, GeneratedCodeTour, TourSection, TourStep,
+    CodeTourProvider, CodeTourProviderStatus, GeneratedCodeTour, TourCallsite, TourSection,
+    TourStep,
 };
 use crate::local_repo;
 use crate::state::{AppState, CodeTourState, PullRequestSurface};
 use crate::theme::*;
 use crate::{code_tour, github};
 
-use super::diff_view::{enter_files_surface, render_tour_diff_file};
+use super::diff_view::{
+    enter_files_surface, load_local_source_file_content_flow, load_pull_request_file_content_flow,
+    render_tour_diff_file,
+};
 use super::pr_detail::surface_tab;
 use super::sections::{
     badge, error_text, eyebrow, ghost_button, nested_panel, panel_state_text, review_button,
@@ -169,7 +178,14 @@ pub async fn refresh_active_tour_flow(
         .spawn({
             let cache = cache.clone();
             let repository = detail.repository.clone();
-            async move { local_repo::load_local_repository_status(&cache, &repository) }
+            let head_ref_oid = detail.head_ref_oid.clone();
+            async move {
+                local_repo::load_local_repository_status_for_pull_request(
+                    &cache,
+                    &repository,
+                    head_ref_oid.as_deref(),
+                )
+            }
         })
         .await;
 
@@ -253,6 +269,21 @@ pub async fn refresh_active_tour_flow(
             cx.notify();
         })
         .ok();
+
+    let changed_file_paths = cached_tour_result
+        .as_ref()
+        .ok()
+        .and_then(|document| document.as_ref())
+        .map(tour_changed_file_paths)
+        .unwrap_or_default();
+    let callsite_paths = cached_tour_result
+        .as_ref()
+        .ok()
+        .and_then(|document| document.as_ref())
+        .map(tour_callsite_paths)
+        .unwrap_or_default();
+
+    preload_tour_source_files(model.clone(), changed_file_paths, callsite_paths, cx).await;
 
     if should_auto_generate {
         model
@@ -454,7 +485,16 @@ async fn generate_tour_flow(
         .spawn({
             let cache = cache.clone();
             let repository = detail.repository.clone();
-            async move { local_repo::ensure_local_repository(&cache, &repository) }
+            let pull_request_number = detail.number;
+            let head_ref_oid = detail.head_ref_oid.clone();
+            async move {
+                local_repo::ensure_local_repository_for_pull_request(
+                    &cache,
+                    &repository,
+                    pull_request_number,
+                    head_ref_oid.as_deref(),
+                )
+            }
         })
         .await;
 
@@ -601,6 +641,56 @@ async fn generate_tour_flow(
             cx.notify();
         })
         .ok();
+
+    if let Ok(document) = &generation_result {
+        preload_tour_source_files(
+            model.clone(),
+            tour_changed_file_paths(document),
+            tour_callsite_paths(document),
+            cx,
+        )
+        .await;
+    }
+}
+
+async fn preload_tour_source_files(
+    model: Entity<AppState>,
+    changed_file_paths: BTreeSet<String>,
+    callsite_paths: BTreeSet<String>,
+    cx: &mut AsyncWindowContext,
+) {
+    for file_path in changed_file_paths {
+        load_pull_request_file_content_flow(model.clone(), Some(file_path), cx).await;
+    }
+
+    for file_path in callsite_paths {
+        load_local_source_file_content_flow(model.clone(), file_path, cx).await;
+    }
+}
+
+fn tour_changed_file_paths(tour: &GeneratedCodeTour) -> BTreeSet<String> {
+    tour.steps
+        .iter()
+        .filter_map(|step| {
+            step.file_path
+                .clone()
+                .or_else(|| step.anchor.as_ref().map(|anchor| anchor.file_path.clone()))
+        })
+        .filter(|path| !path.trim().is_empty())
+        .collect()
+}
+
+fn tour_callsite_paths(tour: &GeneratedCodeTour) -> BTreeSet<String> {
+    tour.sections
+        .iter()
+        .flat_map(|section| {
+            section
+                .callsites
+                .iter()
+                .map(|callsite| callsite.path.clone())
+        })
+        .filter(|path| !path.trim().is_empty())
+        .collect()
 }
 
 const MAX_TOUR_PROGRESS_LOG_ITEMS: usize = 10;
@@ -993,10 +1083,27 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
                 el.child(badge("Preparing checkout"))
             })
             .when_some(local_repo_status.clone(), |el, status| {
+                let status_badge = if !status.is_valid_repository {
+                    if status.exists {
+                        "needs repair"
+                    } else {
+                        "checkout pending"
+                    }
+                } else if status.ready_for_local_features {
+                    "PR head ready"
+                } else if !status.matches_expected_head {
+                    "needs sync"
+                } else if !status.is_worktree_clean {
+                    "dirty checkout"
+                } else {
+                    "checkout pending"
+                };
+
                 el.child(badge(match status.source.as_str() {
                     "linked" => "linked checkout",
                     _ => "managed checkout",
                 }))
+                .child(badge(status_badge))
             })
             .into_any_element(),
     );
@@ -1417,10 +1524,27 @@ fn render_pending_panel(
                     el.child(badge("Preparing checkout"))
                 })
                 .when_some(local_repo_status, |el, status| {
+                    let status_badge = if !status.is_valid_repository {
+                        if status.exists {
+                            "needs repair"
+                        } else {
+                            "checkout pending"
+                        }
+                    } else if status.ready_for_local_features {
+                        "PR head ready"
+                    } else if !status.matches_expected_head {
+                        "needs sync"
+                    } else if !status.is_worktree_clean {
+                        "dirty checkout"
+                    } else {
+                        "checkout pending"
+                    };
+
                     el.child(badge(match status.source.as_str() {
                         "linked" => "linked checkout",
                         _ => "managed checkout",
                     }))
+                    .child(badge(status_badge))
                     .child(badge(if status.is_valid_repository {
                         "repository ready"
                     } else if status.exists {
@@ -1822,10 +1946,12 @@ fn render_section_card(
                             ))),
                     )
                     .child(render_tour_diff_file(
+                        state,
                         detail,
                         step.file_path.as_deref(),
                         step.snippet.as_deref(),
                         step.anchor.as_ref(),
+                        cx,
                     ))
                 })
         }))
@@ -1888,24 +2014,86 @@ fn render_section_card(
                                         .mt(px(8.0))
                                         .child(callsite.summary.clone()),
                                 )
-                                .when_some(callsite.snippet.clone(), |el, snippet| {
-                                    el.child(
-                                        div()
-                                            .mt(px(10.0))
-                                            .p(px(12.0))
-                                            .rounded(radius_sm())
-                                            .bg(bg_inset())
-                                            .font_family("Fira Code")
-                                            .text_size(px(12.0))
-                                            .text_color(fg_default())
-                                            .child(snippet),
-                                    )
-                                })
+                                .when(
+                                    callsite.snippet.is_some() || callsite.line.is_some(),
+                                    |el| {
+                                        el.child(render_tour_callsite_snippet(state, callsite, cx))
+                                    },
+                                )
                         }),
                     )),
             )
         })
         .into_any_element()
+}
+
+const DEFAULT_CALLSITE_EXCERPT_LINE_COUNT: usize = 6;
+
+fn render_tour_callsite_snippet(
+    state: &Entity<AppState>,
+    callsite: &TourCallsite,
+    cx: &App,
+) -> AnyElement {
+    let start_line = callsite
+        .line
+        .and_then(|line| usize::try_from(line).ok())
+        .filter(|line| *line > 0);
+
+    let prepared_file = {
+        let app_state = state.read(cx);
+        app_state
+            .active_detail_state()
+            .and_then(|detail_state| detail_state.file_content_states.get(&callsite.path))
+            .and_then(|file_state| file_state.prepared.as_ref())
+            .cloned()
+    };
+
+    if let (Some(start_line), Some(prepared_file)) = (start_line, prepared_file.as_ref()) {
+        if prepared_file_has_line(prepared_file, start_line) {
+            let excerpt_line_count = callsite_excerpt_line_count(callsite.snippet.as_deref());
+            let lsp_context = build_prepared_file_lsp_context(
+                state,
+                callsite.path.as_str(),
+                Some(prepared_file),
+                cx,
+            );
+
+            return div()
+                .mt(px(10.0))
+                .child(render_prepared_file_excerpt_with_line_numbers(
+                    prepared_file,
+                    start_line,
+                    excerpt_line_count,
+                    lsp_context.as_ref(),
+                ))
+                .into_any_element();
+        }
+    }
+
+    callsite
+        .snippet
+        .as_deref()
+        .map(|snippet| {
+            div()
+                .mt(px(10.0))
+                .child(if let Some(start_line) = start_line {
+                    render_highlighted_code_block_with_line_numbers(
+                        callsite.path.as_str(),
+                        snippet,
+                        start_line,
+                    )
+                } else {
+                    render_highlighted_code_block(callsite.path.as_str(), snippet)
+                })
+                .into_any_element()
+        })
+        .unwrap_or_else(|| div().into_any_element())
+}
+
+fn callsite_excerpt_line_count(snippet: Option<&str>) -> usize {
+    snippet
+        .map(|snippet| snippet.lines().count().max(1))
+        .unwrap_or(DEFAULT_CALLSITE_EXCERPT_LINE_COUNT)
 }
 
 fn toggle_tour_panel(state: &Entity<AppState>, panel_key: &str, cx: &mut App) {
@@ -1949,4 +2137,19 @@ fn count_tour_callsites(tour: &GeneratedCodeTour) -> String {
         .map(|section| section.callsites.len())
         .sum::<usize>();
     format!("{count} callsite{}", if count == 1 { "" } else { "s" })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::callsite_excerpt_line_count;
+
+    #[test]
+    fn callsite_excerpt_line_count_defaults_when_snippet_missing() {
+        assert_eq!(callsite_excerpt_line_count(None), 6);
+    }
+
+    #[test]
+    fn callsite_excerpt_line_count_uses_snippet_line_count() {
+        assert_eq!(callsite_excerpt_line_count(Some("first\nsecond\nthird")), 3);
+    }
 }

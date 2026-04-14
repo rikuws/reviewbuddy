@@ -1,8 +1,12 @@
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use gpui::prelude::*;
 use gpui::*;
 
+use crate::code_display::{
+    build_interactive_code_tokens, render_highlighted_code_block, render_highlighted_code_content,
+    styled_code_text, InteractiveCodeToken,
+};
 use crate::code_tour::{line_matches_diff_anchor, thread_matches_diff_anchor, DiffAnchor};
 use crate::diff::{
     build_diff_render_rows, find_parsed_diff_file, find_parsed_diff_file_with_index, DiffLineKind,
@@ -11,8 +15,11 @@ use crate::diff::{
 use crate::github;
 use crate::github::{
     PullRequestDetail, PullRequestFile, PullRequestReviewComment, PullRequestReviewThread,
-    RepositoryFileContent,
+    RepositoryFileContent, REPOSITORY_FILE_SOURCE_LOCAL_CHECKOUT,
 };
+use crate::local_documents;
+use crate::local_repo;
+use crate::lsp;
 use crate::markdown::render_markdown;
 use crate::state::*;
 use crate::syntax::{self, SyntaxSpan};
@@ -248,20 +255,29 @@ pub fn ensure_selected_file_content_loaded(
     let model = state.clone();
     window
         .spawn(cx, async move |cx: &mut AsyncWindowContext| {
-            load_selected_file_content_flow(model, cx).await;
+            load_pull_request_file_content_flow(model, None, cx).await;
         })
         .detach();
 }
 
-async fn load_selected_file_content_flow(model: Entity<AppState>, cx: &mut AsyncWindowContext) {
+pub async fn load_pull_request_file_content_flow(
+    model: Entity<AppState>,
+    requested_path: Option<String>,
+    cx: &mut AsyncWindowContext,
+) {
     let request = model
         .read_with(cx, |state, _| {
             let cache = state.cache.clone();
+            let lsp_session_manager = state.lsp_session_manager.clone();
             let detail = state.active_detail()?.clone();
             let detail_key = state.active_pr_key.clone()?;
-            let selected_path = state
-                .selected_file_path
+            let existing_local_repo_status = state
+                .detail_states
+                .get(&detail_key)
+                .and_then(|detail_state| detail_state.local_repository_status.clone());
+            let selected_path = requested_path
                 .clone()
+                .or_else(|| state.selected_file_path.clone())
                 .or_else(|| detail.files.first().map(|file| file.path.clone()))?;
             let selected_file = detail
                 .files
@@ -270,30 +286,38 @@ async fn load_selected_file_content_flow(model: Entity<AppState>, cx: &mut Async
                 .cloned()?;
             let parsed = find_parsed_diff_file(&detail.parsed_diff, &selected_file.path).cloned();
             let request = build_file_content_request(&detail, &selected_file, parsed.as_ref())?;
+            let detail_state = state.detail_states.get(&detail_key);
 
-            let already_loaded = state
-                .detail_states
-                .get(&detail_key)
-                .and_then(|detail_state| detail_state.file_content_states.get(&request.path))
-                .map(|file_state| {
-                    file_state.request_key.as_deref() == Some(&request.request_key)
-                        && (file_state.loading || file_state.document.is_some())
-                })
-                .unwrap_or(false);
+            let file_content_loaded =
+                is_local_checkout_file_loaded(detail_state, &request.path, &request.request_key);
+            let lsp_loaded = is_lsp_status_loaded(detail_state, &selected_file.path);
+            let already_loaded = file_content_loaded && lsp_loaded;
 
             Some((
                 cache,
+                lsp_session_manager,
                 detail_key,
                 detail,
                 selected_file,
                 request,
                 already_loaded,
+                existing_local_repo_status,
             ))
         })
         .ok()
         .flatten();
 
-    let Some((cache, detail_key, detail, selected_file, request, already_loaded)) = request else {
+    let Some((
+        cache,
+        lsp_session_manager,
+        detail_key,
+        detail,
+        selected_file,
+        request,
+        already_loaded,
+        existing_local_repo_status,
+    )) = request
+    else {
         return;
     };
 
@@ -313,14 +337,98 @@ async fn load_selected_file_content_flow(model: Entity<AppState>, cx: &mut Async
                 file_state.prepared = None;
                 file_state.loading = true;
                 file_state.error = None;
+                detail_state.local_repository_loading = existing_local_repo_status
+                    .as_ref()
+                    .map(|status| !(status.ready_for_local_features && status.path.is_some()))
+                    .unwrap_or(true);
+                detail_state.local_repository_error = None;
+                detail_state
+                    .lsp_loading_paths
+                    .insert(selected_file.path.clone());
             }
 
             cx.notify();
         })
         .ok();
 
-    let load_result =
+    let local_repo_result = if let Some(status) = existing_local_repo_status
+        .clone()
+        .filter(|status| status.ready_for_local_features && status.path.is_some())
+    {
+        Ok(status)
+    } else {
         cx.background_executor()
+            .spawn({
+                let cache = cache.clone();
+                let repository = detail.repository.clone();
+                let pull_request_number = detail.number;
+                let head_ref_oid = detail.head_ref_oid.clone();
+                async move {
+                    local_repo::load_or_prepare_local_repository_for_pull_request(
+                        &cache,
+                        &repository,
+                        pull_request_number,
+                        head_ref_oid.as_deref(),
+                    )
+                }
+            })
+            .await
+    };
+
+    let local_repo_status = local_repo_result.as_ref().ok().cloned();
+    let local_repo_error = local_repo_result
+        .as_ref()
+        .ok()
+        .and_then(|status| {
+            if status.ready_for_local_features {
+                None
+            } else {
+                Some(status.message.clone())
+            }
+        })
+        .or_else(|| local_repo_result.as_ref().err().cloned());
+
+    let local_load_result = if let Some(status) = local_repo_status.as_ref() {
+        if status.ready_for_local_features {
+            if let Some(root) = status.path.as_deref() {
+                cx.background_executor()
+                    .spawn({
+                        let cache = cache.clone();
+                        let repository = detail.repository.clone();
+                        let path = request.path.clone();
+                        let reference = request.local_reference.clone();
+                        let prefer_worktree = request.prefer_worktree;
+                        let root = std::path::PathBuf::from(root);
+                        async move {
+                            local_documents::load_local_repository_file_content(
+                                &cache,
+                                &repository,
+                                &root,
+                                &reference,
+                                &path,
+                                prefer_worktree,
+                            )
+                        }
+                    })
+                    .await
+            } else {
+                Err(status.message.clone())
+            }
+        } else {
+            Err(local_repo_error
+                .clone()
+                .unwrap_or_else(|| "Local checkout is not ready yet.".to_string()))
+        }
+    } else {
+        Err(local_repo_error
+            .clone()
+            .unwrap_or_else(|| "Local checkout is not ready yet.".to_string()))
+    };
+
+    let load_result = match local_load_result {
+        Ok(document) => Ok(document),
+        Err(local_error) => cx
+            .background_executor()
             .spawn({
                 let cache = cache.clone();
                 let repository = detail.repository.clone();
@@ -328,9 +436,43 @@ async fn load_selected_file_content_flow(model: Entity<AppState>, cx: &mut Async
                 let reference = request.reference.clone();
                 async move {
                     github::load_pull_request_file_content(&cache, &repository, &reference, &path)
+                        .map_err(|github_error| {
+                            format!(
+                                "{local_error}\nGitHub fallback also failed for {repository}@{reference}:{path}: {github_error}"
+                            )
+                        })
                 }
             })
-            .await;
+            .await,
+    };
+    let lsp_status = if let Some(status) = local_repo_status.as_ref() {
+        if status.ready_for_local_features {
+            if let Some(root) = status.path.as_deref() {
+                cx.background_executor()
+                    .spawn({
+                        let lsp_session_manager = lsp_session_manager.clone();
+                        let root = std::path::PathBuf::from(root);
+                        let file_path = selected_file.path.clone();
+                        async move { lsp_session_manager.status_for_file(&root, &file_path) }
+                    })
+                    .await
+            } else {
+                lsp::LspServerStatus::checkout_unavailable(status.message.clone())
+            }
+        } else {
+            lsp::LspServerStatus::checkout_unavailable(
+                local_repo_error
+                    .clone()
+                    .unwrap_or_else(|| "Local checkout is not ready yet.".to_string()),
+            )
+        }
+    } else {
+        lsp::LspServerStatus::checkout_unavailable(
+            local_repo_error
+                .clone()
+                .unwrap_or_else(|| "Local checkout is not ready yet.".to_string()),
+        )
+    };
 
     let prepared_result = load_result.map(|document| {
         let prepared = prepare_file_content(&selected_file.path, &request.reference, &document);
@@ -350,6 +492,256 @@ async fn load_selected_file_content_flow(model: Entity<AppState>, cx: &mut Async
             }
 
             file_state.loading = false;
+            detail_state.local_repository_loading = false;
+            detail_state.local_repository_status = local_repo_status.clone();
+            detail_state.local_repository_error = local_repo_error.clone();
+            detail_state.lsp_loading_paths.remove(&selected_file.path);
+            detail_state
+                .lsp_statuses
+                .insert(selected_file.path.clone(), lsp_status.clone());
+            match prepared_result {
+                Ok((document, prepared)) => {
+                    file_state.document = Some(document);
+                    file_state.prepared = Some(prepared);
+                    file_state.error = None;
+                }
+                Err(error) => {
+                    file_state.document = None;
+                    file_state.prepared = None;
+                    file_state.error = Some(error);
+                }
+            }
+
+            cx.notify();
+        })
+        .ok();
+}
+
+pub async fn load_local_source_file_content_flow(
+    model: Entity<AppState>,
+    requested_path: String,
+    cx: &mut AsyncWindowContext,
+) {
+    let request = model
+        .read_with(cx, |state, _| {
+            let cache = state.cache.clone();
+            let lsp_session_manager = state.lsp_session_manager.clone();
+            let detail = state.active_detail()?.clone();
+            let detail_key = state.active_pr_key.clone()?;
+            let existing_local_repo_status = state
+                .detail_states
+                .get(&detail_key)
+                .and_then(|detail_state| detail_state.local_repository_status.clone());
+            let request = build_head_file_content_request(&detail, &requested_path)?;
+            let detail_state = state.detail_states.get(&detail_key);
+
+            let file_content_loaded =
+                is_local_checkout_file_loaded(detail_state, &request.path, &request.request_key);
+            let lsp_loaded = is_lsp_status_loaded(detail_state, &request.path);
+            let already_loaded = file_content_loaded && lsp_loaded;
+
+            Some((
+                cache,
+                lsp_session_manager,
+                detail_key,
+                detail,
+                request,
+                already_loaded,
+                existing_local_repo_status,
+            ))
+        })
+        .ok()
+        .flatten();
+
+    let Some((
+        cache,
+        lsp_session_manager,
+        detail_key,
+        detail,
+        request,
+        already_loaded,
+        existing_local_repo_status,
+    )) = request
+    else {
+        return;
+    };
+
+    if already_loaded {
+        return;
+    }
+
+    model
+        .update(cx, |state, cx| {
+            if let Some(detail_state) = state.detail_states.get_mut(&detail_key) {
+                let file_state = detail_state
+                    .file_content_states
+                    .entry(request.path.clone())
+                    .or_default();
+                file_state.request_key = Some(request.request_key.clone());
+                file_state.document = None;
+                file_state.prepared = None;
+                file_state.loading = true;
+                file_state.error = None;
+                detail_state.local_repository_loading = existing_local_repo_status
+                    .as_ref()
+                    .map(|status| !(status.ready_for_local_features && status.path.is_some()))
+                    .unwrap_or(true);
+                detail_state.local_repository_error = None;
+                detail_state.lsp_loading_paths.insert(request.path.clone());
+            }
+
+            cx.notify();
+        })
+        .ok();
+
+    let local_repo_result = if let Some(status) = existing_local_repo_status
+        .clone()
+        .filter(|status| status.ready_for_local_features && status.path.is_some())
+    {
+        Ok(status)
+    } else {
+        cx.background_executor()
+            .spawn({
+                let cache = cache.clone();
+                let repository = detail.repository.clone();
+                let pull_request_number = detail.number;
+                let head_ref_oid = detail.head_ref_oid.clone();
+                async move {
+                    local_repo::load_or_prepare_local_repository_for_pull_request(
+                        &cache,
+                        &repository,
+                        pull_request_number,
+                        head_ref_oid.as_deref(),
+                    )
+                }
+            })
+            .await
+    };
+
+    let local_repo_status = local_repo_result.as_ref().ok().cloned();
+    let local_repo_error = local_repo_result
+        .as_ref()
+        .ok()
+        .and_then(|status| {
+            if status.ready_for_local_features {
+                None
+            } else {
+                Some(status.message.clone())
+            }
+        })
+        .or_else(|| local_repo_result.as_ref().err().cloned());
+
+    let local_load_result = if let Some(status) = local_repo_status.as_ref() {
+        if status.ready_for_local_features {
+            if let Some(root) = status.path.as_deref() {
+                cx.background_executor()
+                    .spawn({
+                        let cache = cache.clone();
+                        let repository = detail.repository.clone();
+                        let path = request.path.clone();
+                        let reference = request.local_reference.clone();
+                        let prefer_worktree = request.prefer_worktree;
+                        let root = std::path::PathBuf::from(root);
+                        async move {
+                            local_documents::load_local_repository_file_content(
+                                &cache,
+                                &repository,
+                                &root,
+                                &reference,
+                                &path,
+                                prefer_worktree,
+                            )
+                        }
+                    })
+                    .await
+            } else {
+                Err(status.message.clone())
+            }
+        } else {
+            Err(local_repo_error
+                .clone()
+                .unwrap_or_else(|| "Local checkout is not ready yet.".to_string()))
+        }
+    } else {
+        Err(local_repo_error
+            .clone()
+            .unwrap_or_else(|| "Local checkout is not ready yet.".to_string()))
+    };
+
+    let load_result = match local_load_result {
+        Ok(document) => Ok(document),
+        Err(local_error) => cx
+            .background_executor()
+            .spawn({
+                let cache = cache.clone();
+                let repository = detail.repository.clone();
+                let path = request.path.clone();
+                let reference = request.reference.clone();
+                async move {
+                    github::load_pull_request_file_content(&cache, &repository, &reference, &path)
+                        .map_err(|github_error| {
+                            format!(
+                                "{local_error}\nGitHub fallback also failed for {repository}@{reference}:{path}: {github_error}"
+                            )
+                        })
+                }
+            })
+            .await,
+    };
+    let lsp_status = if let Some(status) = local_repo_status.as_ref() {
+        if status.ready_for_local_features {
+            if let Some(root) = status.path.as_deref() {
+                cx.background_executor()
+                    .spawn({
+                        let lsp_session_manager = lsp_session_manager.clone();
+                        let root = std::path::PathBuf::from(root);
+                        let file_path = request.path.clone();
+                        async move { lsp_session_manager.status_for_file(&root, &file_path) }
+                    })
+                    .await
+            } else {
+                lsp::LspServerStatus::checkout_unavailable(status.message.clone())
+            }
+        } else {
+            lsp::LspServerStatus::checkout_unavailable(
+                local_repo_error
+                    .clone()
+                    .unwrap_or_else(|| "Local checkout is not ready yet.".to_string()),
+            )
+        }
+    } else {
+        lsp::LspServerStatus::checkout_unavailable(
+            local_repo_error
+                .clone()
+                .unwrap_or_else(|| "Local checkout is not ready yet.".to_string()),
+        )
+    };
+
+    let prepared_result = load_result.map(|document| {
+        let prepared = prepare_file_content(&request.path, &request.reference, &document);
+        (document, prepared)
+    });
+
+    model
+        .update(cx, |state, cx| {
+            let Some(detail_state) = state.detail_states.get_mut(&detail_key) else {
+                return;
+            };
+            let Some(file_state) = detail_state.file_content_states.get_mut(&request.path) else {
+                return;
+            };
+            if file_state.request_key.as_deref() != Some(&request.request_key) {
+                return;
+            }
+
+            file_state.loading = false;
+            detail_state.local_repository_loading = false;
+            detail_state.local_repository_status = local_repo_status.clone();
+            detail_state.local_repository_error = local_repo_error.clone();
+            detail_state.lsp_loading_paths.remove(&request.path);
+            detail_state
+                .lsp_statuses
+                .insert(request.path.clone(), lsp_status.clone());
             match prepared_result {
                 Ok((document, prepared)) => {
                     file_state.document = Some(document);
@@ -372,6 +764,8 @@ async fn load_selected_file_content_flow(model: Entity<AppState>, cx: &mut Async
 struct FileContentRequest {
     path: String,
     reference: String,
+    local_reference: String,
+    prefer_worktree: bool,
     request_key: String,
 }
 
@@ -380,7 +774,7 @@ fn build_file_content_request(
     file: &PullRequestFile,
     parsed: Option<&ParsedDiffFile>,
 ) -> Option<FileContentRequest> {
-    let (path, reference) = if file.change_type == "DELETED" {
+    let (path, reference, local_reference, prefer_worktree) = if file.change_type == "DELETED" {
         (
             parsed
                 .and_then(|parsed| parsed.previous_path.clone())
@@ -389,6 +783,11 @@ fn build_file_content_request(
                 .base_ref_oid
                 .clone()
                 .unwrap_or_else(|| detail.base_ref_name.clone()),
+            detail
+                .base_ref_oid
+                .clone()
+                .unwrap_or_else(|| detail.base_ref_name.clone()),
+            false,
         )
     } else {
         (
@@ -397,10 +796,15 @@ fn build_file_content_request(
                 .head_ref_oid
                 .clone()
                 .unwrap_or_else(|| detail.head_ref_name.clone()),
+            detail
+                .head_ref_oid
+                .clone()
+                .unwrap_or_else(|| "HEAD".to_string()),
+            true,
         )
     };
 
-    if path.is_empty() || reference.is_empty() {
+    if path.is_empty() || reference.is_empty() || local_reference.is_empty() {
         return None;
     }
 
@@ -411,7 +815,71 @@ fn build_file_content_request(
         ),
         path,
         reference,
+        local_reference,
+        prefer_worktree,
     })
+}
+
+fn build_head_file_content_request(
+    detail: &PullRequestDetail,
+    path: &str,
+) -> Option<FileContentRequest> {
+    let path = path.trim();
+    if path.is_empty() {
+        return None;
+    }
+
+    let reference = detail
+        .head_ref_oid
+        .clone()
+        .unwrap_or_else(|| detail.head_ref_name.clone());
+    let local_reference = detail
+        .head_ref_oid
+        .clone()
+        .unwrap_or_else(|| "HEAD".to_string());
+
+    if reference.is_empty() || local_reference.is_empty() {
+        return None;
+    }
+
+    Some(FileContentRequest {
+        request_key: format!(
+            "{}:{reference}:{path}:{}",
+            detail.updated_at, detail.repository
+        ),
+        path: path.to_string(),
+        reference,
+        local_reference,
+        prefer_worktree: true,
+    })
+}
+
+fn is_local_checkout_file_loaded(
+    detail_state: Option<&DetailState>,
+    path: &str,
+    request_key: &str,
+) -> bool {
+    detail_state
+        .and_then(|detail_state| detail_state.file_content_states.get(path))
+        .map(|file_state| {
+            file_state.request_key.as_deref() == Some(request_key)
+                && (file_state.loading
+                    || file_state
+                        .document
+                        .as_ref()
+                        .map(|document| document.source == REPOSITORY_FILE_SOURCE_LOCAL_CHECKOUT)
+                        .unwrap_or(false))
+        })
+        .unwrap_or(false)
+}
+
+fn is_lsp_status_loaded(detail_state: Option<&DetailState>, path: &str) -> bool {
+    detail_state
+        .map(|detail_state| {
+            detail_state.lsp_loading_paths.contains(path)
+                || detail_state.lsp_statuses.contains_key(path)
+        })
+        .unwrap_or(false)
 }
 
 fn prepare_file_content(
@@ -437,7 +905,12 @@ fn prepare_file_content(
     let prepared_lines = text_lines
         .into_iter()
         .zip(spans)
-        .map(|(text, spans)| PreparedFileLine { text, spans })
+        .enumerate()
+        .map(|(index, (text, spans))| PreparedFileLine {
+            line_number: index + 1,
+            text,
+            spans,
+        })
         .collect::<Vec<_>>();
 
     PreparedFileContent {
@@ -445,6 +918,7 @@ fn prepare_file_content(
         reference: reference.to_string(),
         is_binary: document.is_binary,
         size_bytes: document.size_bytes,
+        text: Arc::<str>::from(document.content.as_deref().unwrap_or_default()),
         lines: Arc::new(prepared_lines),
     }
 }
@@ -481,6 +955,32 @@ fn render_diff_panel(
             .and_then(|detail_state| detail_state.file_content_states.get(&file.path))
             .cloned()
     });
+    let local_repo_status = app_state
+        .active_detail_state()
+        .and_then(|detail_state| detail_state.local_repository_status.as_ref());
+    let local_repo_loading = app_state
+        .active_detail_state()
+        .map(|detail_state| detail_state.local_repository_loading)
+        .unwrap_or(false);
+    let local_repo_error = app_state
+        .active_detail_state()
+        .and_then(|detail_state| detail_state.local_repository_error.as_deref());
+    let file_document = file_content_state
+        .as_ref()
+        .and_then(|state| state.document.as_ref());
+    let lsp_status = selected_file.and_then(|file| {
+        app_state
+            .active_detail_state()
+            .and_then(|detail_state| detail_state.lsp_statuses.get(&file.path))
+    });
+    let lsp_loading = selected_file
+        .map(|file| {
+            app_state
+                .active_detail_state()
+                .map(|detail_state| detail_state.lsp_loading_paths.contains(&file.path))
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
 
     div()
         .flex_grow()
@@ -494,6 +994,12 @@ fn render_diff_panel(
             selected_file,
             selected_parsed,
             file_thread_count,
+            file_document,
+            local_repo_status,
+            local_repo_loading,
+            local_repo_error,
+            lsp_status,
+            lsp_loading,
         ))
         .child(
             div()
@@ -531,6 +1037,12 @@ fn render_diff_toolbar(
     selected_file: Option<&PullRequestFile>,
     selected_parsed: Option<&ParsedDiffFile>,
     file_thread_count: usize,
+    file_document: Option<&RepositoryFileContent>,
+    local_repo_status: Option<&local_repo::LocalRepositoryStatus>,
+    local_repo_loading: bool,
+    local_repo_error: Option<&str>,
+    lsp_status: Option<&lsp::LspServerStatus>,
+    lsp_loading: bool,
 ) -> impl IntoElement {
     div()
         .flex()
@@ -584,6 +1096,32 @@ fn render_diff_toolbar(
                     } else {
                         el
                     }
+                })
+                .when(
+                    file_document
+                        .map(|document| document.source != REPOSITORY_FILE_SOURCE_LOCAL_CHECKOUT)
+                        .unwrap_or(false)
+                        && local_repo_error.is_some(),
+                    |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_family("Fira Code")
+                                .text_color(fg_muted())
+                                .child(
+                                    "Showing a GitHub snapshot because the local checkout is not ready.",
+                                ),
+                        )
+                    },
+                )
+                .when_some(lsp_status.filter(|status| !status.is_ready()), |el, status| {
+                    el.child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_family("Fira Code")
+                            .text_color(fg_muted())
+                            .child(status.message.clone()),
+                    )
                 }),
         )
         .child(
@@ -594,6 +1132,55 @@ fn render_diff_toolbar(
                 .flex_wrap()
                 .flex_shrink_0()
                 .child(badge("Unified"))
+                .when(local_repo_loading, |el| el.child(badge("Preparing checkout")))
+                .when_some(local_repo_status, |el, status| {
+                    let status_badge = if !status.is_valid_repository {
+                        if status.exists {
+                            "needs repair"
+                        } else {
+                            "checkout pending"
+                        }
+                    } else if status.ready_for_local_features {
+                        "PR head ready"
+                    } else if !status.matches_expected_head {
+                        "needs sync"
+                    } else if !status.is_worktree_clean {
+                        "dirty checkout"
+                    } else {
+                        "checkout pending"
+                    };
+
+                    el.child(badge(match status.source.as_str() {
+                        "linked" => "linked checkout",
+                        _ => "managed checkout",
+                    }))
+                    .child(badge(status_badge))
+                })
+                .when_some(file_document, |el, document| {
+                    el.child(badge(match document.source.as_str() {
+                        REPOSITORY_FILE_SOURCE_LOCAL_CHECKOUT => "local checkout",
+                        _ => "GitHub snapshot",
+                    }))
+                })
+                .when(lsp_loading, |el| el.child(badge("Starting LSP")))
+                .when_some(lsp_status, |el, status| {
+                    let el = el.child(badge(status.badge_label()));
+                    let el = if status.is_ready() && status.capabilities.hover_supported {
+                        el.child(badge("hover"))
+                    } else {
+                        el
+                    };
+                    let el = if status.is_ready() && status.capabilities.definition_supported {
+                        el.child(badge("definition"))
+                    } else {
+                        el
+                    };
+                    if status.is_ready() && status.capabilities.signature_help_supported {
+                        el.child(badge("signature"))
+                    } else {
+                        el
+                    }
+                })
                 .when(file_thread_count > 0, |el| {
                     el.child(badge(&format!("{file_thread_count} threads")))
                 })
@@ -628,15 +1215,18 @@ fn render_file_diff(
     prepared_file: Option<&PreparedFileContent>,
     selected_anchor: Option<&DiffAnchor>,
     diff_view_state: DiffFileViewState,
-    _cx: &App,
+    cx: &App,
 ) -> impl IntoElement {
     let rows = diff_view_state.rows.clone();
     let parsed_file_index = diff_view_state.parsed_file_index;
     let highlighted_hunks = diff_view_state.highlighted_hunks.clone();
     let selected_anchor = selected_anchor.cloned();
     let list_state = diff_view_state.list_state.clone();
+    let prepared_file = prepared_file.cloned();
+    let file_lsp_context =
+        build_diff_file_lsp_context(state, file.path.as_str(), prepared_file.as_ref(), cx);
 
-    let items = build_diff_view_items(file, parsed, prepared_file, &rows);
+    let items = build_diff_view_items(file, parsed, prepared_file.as_ref(), &rows);
 
     if list_state.item_count() != items.len() {
         list_state.reset(items.len());
@@ -664,23 +1254,18 @@ fn render_file_diff(
                 .min_h_0()
                 .bg(bg_inset())
                 .child(
-                    list(list_state, move |ix, _window, cx| {
-                        match items[ix] {
-                            DiffViewItem::Gap(gap) => {
-                                render_diff_gap_row(gap).into_any_element()
-                            }
-                            DiffViewItem::Row(row_ix) => {
-                                render_virtualized_diff_row(
-                                    &state,
-                                    parsed_file_index,
-                                    highlighted_hunks.as_deref(),
-                                    &rows[row_ix],
-                                    selected_anchor.as_ref(),
-                                    cx,
-                                )
-                                .into_any_element()
-                            }
-                        }
+                    list(list_state, move |ix, _window, cx| match items[ix] {
+                        DiffViewItem::Gap(gap) => render_diff_gap_row(gap).into_any_element(),
+                        DiffViewItem::Row(row_ix) => render_virtualized_diff_row(
+                            &state,
+                            parsed_file_index,
+                            highlighted_hunks.as_deref(),
+                            file_lsp_context.as_ref(),
+                            &rows[row_ix],
+                            selected_anchor.as_ref(),
+                            cx,
+                        )
+                        .into_any_element(),
                     })
                     .flex_grow()
                     .min_h_0(),
@@ -707,6 +1292,205 @@ struct DiffGapSummary {
     hidden_count: usize,
     start_line: Option<usize>,
     end_line: Option<usize>,
+}
+
+#[derive(Clone)]
+struct DiffFileLspContext {
+    state: Entity<AppState>,
+    detail_key: String,
+    lsp_session_manager: Arc<lsp::LspSessionManager>,
+    repo_root: PathBuf,
+    file_path: String,
+    reference: String,
+    document_text: Arc<str>,
+}
+
+#[derive(Clone)]
+struct DiffLineLspContext {
+    file: DiffFileLspContext,
+    line_number: usize,
+}
+
+#[derive(Clone)]
+struct DiffLineLspQuery {
+    state: Entity<AppState>,
+    detail_key: String,
+    lsp_session_manager: Arc<lsp::LspSessionManager>,
+    repo_root: PathBuf,
+    query_key: String,
+    token_label: String,
+    request: lsp::LspTextDocumentRequest,
+}
+
+impl DiffLineLspContext {
+    fn query_for_index(
+        &self,
+        index: usize,
+        tokens: &[InteractiveCodeToken],
+    ) -> Option<DiffLineLspQuery> {
+        let token = tokens
+            .iter()
+            .find(|token| token.byte_range.contains(&index))?;
+        Some(DiffLineLspQuery {
+            state: self.file.state.clone(),
+            detail_key: self.file.detail_key.clone(),
+            lsp_session_manager: self.file.lsp_session_manager.clone(),
+            repo_root: self.file.repo_root.clone(),
+            query_key: format!(
+                "{}:{}:{}:{}",
+                self.file.file_path, self.file.reference, self.line_number, token.column_start
+            ),
+            token_label: display_lsp_token_label(&token.text),
+            request: lsp::LspTextDocumentRequest {
+                file_path: self.file.file_path.clone(),
+                document_text: self.file.document_text.clone(),
+                line: self.line_number,
+                column: token.column_start,
+            },
+        })
+    }
+}
+
+fn build_diff_file_lsp_context(
+    state: &Entity<AppState>,
+    file_path: &str,
+    prepared_file: Option<&PreparedFileContent>,
+    cx: &App,
+) -> Option<DiffFileLspContext> {
+    let prepared_file = prepared_file?;
+    if prepared_file.is_binary || prepared_file.text.is_empty() {
+        return None;
+    }
+
+    let app_state = state.read(cx);
+    let detail_key = app_state.active_pr_key.clone()?;
+    let detail_state = app_state.detail_states.get(&detail_key)?;
+    let local_repo_status = detail_state.local_repository_status.as_ref()?;
+    if !local_repo_status.ready_for_local_features {
+        return None;
+    }
+
+    let repo_root = PathBuf::from(local_repo_status.path.as_ref()?);
+    let lsp_status = detail_state.lsp_statuses.get(file_path)?;
+    if !lsp_status.is_ready()
+        || (!lsp_status.capabilities.hover_supported
+            && !lsp_status.capabilities.signature_help_supported)
+    {
+        return None;
+    }
+
+    Some(DiffFileLspContext {
+        state: state.clone(),
+        detail_key,
+        lsp_session_manager: app_state.lsp_session_manager.clone(),
+        repo_root,
+        file_path: file_path.to_string(),
+        reference: prepared_file.reference.clone(),
+        document_text: prepared_file.text.clone(),
+    })
+}
+
+fn build_diff_line_lsp_context(
+    file_context: Option<&DiffFileLspContext>,
+    line: &ParsedDiffLine,
+) -> Option<DiffLineLspContext> {
+    let line_number = usize::try_from(line.right_line_number?).ok()?;
+    if line_number == 0 {
+        return None;
+    }
+
+    Some(DiffLineLspContext {
+        file: file_context?.clone(),
+        line_number,
+    })
+}
+
+fn display_lsp_token_label(text: &str) -> String {
+    let trimmed = text.trim();
+    let mut label = trimmed.chars().take(48).collect::<String>();
+    if trimmed.chars().count() > 48 {
+        label.push('…');
+    }
+    label
+}
+
+fn should_request_diff_line_lsp_details(query: &DiffLineLspQuery, cx: &App) -> bool {
+    query
+        .state
+        .read(cx)
+        .detail_states
+        .get(&query.detail_key)
+        .and_then(|detail_state| detail_state.lsp_symbol_states.get(&query.query_key))
+        .map(|state| !state.loading && state.details.is_none() && state.error.is_none())
+        .unwrap_or(true)
+}
+
+fn request_diff_line_lsp_details(query: DiffLineLspQuery, window: &mut Window, cx: &mut App) {
+    if !should_request_diff_line_lsp_details(&query, cx) {
+        return;
+    }
+
+    let query_key = query.query_key.clone();
+    let detail_key = query.detail_key.clone();
+    let state = query.state.clone();
+
+    state.update(cx, |state, cx| {
+        let Some(detail_state) = state.detail_states.get_mut(&detail_key) else {
+            return;
+        };
+        let symbol_state = detail_state
+            .lsp_symbol_states
+            .entry(query_key.clone())
+            .or_default();
+        if symbol_state.loading || symbol_state.details.is_some() || symbol_state.error.is_some() {
+            return;
+        }
+        symbol_state.loading = true;
+        symbol_state.details = None;
+        symbol_state.error = None;
+        cx.notify();
+    });
+
+    window
+        .spawn(cx, {
+            let state = state.clone();
+            let detail_key = detail_key.clone();
+            let query_key = query_key.clone();
+            let lsp_session_manager = query.lsp_session_manager.clone();
+            let repo_root = query.repo_root.clone();
+            let request = query.request.clone();
+            async move |cx: &mut AsyncWindowContext| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { lsp_session_manager.symbol_details(&repo_root, &request) })
+                    .await;
+
+                state
+                    .update(cx, |state, cx| {
+                        let Some(detail_state) = state.detail_states.get_mut(&detail_key) else {
+                            return;
+                        };
+                        let symbol_state = detail_state
+                            .lsp_symbol_states
+                            .entry(query_key.clone())
+                            .or_default();
+                        symbol_state.loading = false;
+                        match result {
+                            Ok(details) => {
+                                symbol_state.details = Some(details);
+                                symbol_state.error = None;
+                            }
+                            Err(error) => {
+                                symbol_state.details = None;
+                                symbol_state.error = Some(error);
+                            }
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            }
+        })
+        .detach();
 }
 
 fn build_diff_view_items(
@@ -786,7 +1570,7 @@ fn diff_gap_before_hunk(
             }
 
             let total_lines = prepared_file
-                .map(|prepared| prepared.lines.len())
+                .and_then(|prepared| prepared.lines.last().map(|line| line.line_number))
                 .unwrap_or(0);
             let end_line = current_first.saturating_sub(1);
             let hidden_count = if total_lines > 0 {
@@ -815,7 +1599,11 @@ fn diff_gap_after_last_hunk(
     let parsed = parsed?;
     let last_hunk = parsed.hunks.get(last_hunk_index)?;
     let last_visible = last_visible_line_number(file, last_hunk)?;
-    let total_lines = prepared_file.lines.len();
+    let total_lines = prepared_file
+        .lines
+        .last()
+        .map(|line| line.line_number)
+        .unwrap_or(0);
 
     if total_lines <= last_visible {
         return None;
@@ -977,6 +1765,7 @@ fn render_virtualized_diff_row(
     state: &Entity<AppState>,
     parsed_file_index: Option<usize>,
     highlighted_hunks: Option<&Vec<Vec<Vec<SyntaxSpan>>>>,
+    file_lsp_context: Option<&DiffFileLspContext>,
     row: &DiffRenderRow,
     selected_anchor: Option<&DiffAnchor>,
     cx: &App,
@@ -1051,7 +1840,15 @@ fn render_virtualized_diff_row(
                             .and_then(|hunks| hunks.get(*hunk_index))
                             .and_then(|lines| lines.get(*line_index))
                             .map(|spans| spans.as_slice());
-                        render_diff_line(path, line, spans, selected_anchor).into_any_element()
+                        let line_lsp_context = build_diff_line_lsp_context(file_lsp_context, line);
+                        render_diff_line(
+                            path,
+                            line,
+                            spans,
+                            selected_anchor,
+                            line_lsp_context.as_ref(),
+                        )
+                        .into_any_element()
                     })
             })
             .unwrap_or_else(|| div().into_any_element()),
@@ -1121,17 +1918,15 @@ fn render_raw_diff_fallback(raw_diff: &str) -> impl IntoElement {
         .border_b(px(1.0))
         .border_color(border_muted())
         .bg(bg_inset())
-        .child(
+        .child(if raw_diff.is_empty() {
             div()
-                .font_family("Fira Code")
                 .text_size(px(12.0))
                 .text_color(fg_muted())
-                .child(if raw_diff.is_empty() {
-                    "No diff returned.".to_string()
-                } else {
-                    raw_diff.to_string()
-                }),
-        )
+                .child("No diff returned.".to_string())
+                .into_any_element()
+        } else {
+            render_highlighted_code_content("diff.patch", raw_diff).into_any_element()
+        })
 }
 
 fn render_change_type_chip(change_type: &str) -> impl IntoElement {
@@ -1223,7 +2018,13 @@ fn render_diff_line_with_threads(
     div()
         .flex()
         .flex_col()
-        .child(render_diff_line(file_path, line, None, selected_anchor))
+        .child(render_diff_line(
+            file_path,
+            line,
+            None,
+            selected_anchor,
+            None,
+        ))
         .when(!threads.is_empty(), |el| {
             el.child(
                 div()
@@ -1250,6 +2051,7 @@ fn render_diff_line(
     line: &ParsedDiffLine,
     syntax_spans: Option<&[SyntaxSpan]>,
     selected_anchor: Option<&DiffAnchor>,
+    lsp_context: Option<&DiffLineLspContext>,
 ) -> impl IntoElement {
     let is_selected = line_matches_diff_anchor(line, selected_anchor);
 
@@ -1370,6 +2172,7 @@ fn render_diff_line(
             &line.content,
             syntax_spans,
             fallback_text_color,
+            lsp_context,
         ))
 }
 
@@ -1378,6 +2181,7 @@ fn render_syntax_content(
     content: &str,
     syntax_spans: Option<&[SyntaxSpan]>,
     fallback_color: Rgba,
+    lsp_context: Option<&DiffLineLspContext>,
 ) -> Div {
     let content_div = div()
         .flex_grow()
@@ -1407,24 +2211,50 @@ fn render_syntax_content(
             .child(content.to_string());
     }
 
-    let mut text = String::new();
-    let mut runs = Vec::with_capacity(spans.len());
+    let styled = styled_code_text(spans).unwrap_or_else(|| StyledText::new(content.to_string()));
+    let token_ranges = Arc::new(build_interactive_code_tokens(content));
 
-    for span in spans {
-        text.push_str(&span.text);
-        runs.push(TextRun {
-            len: span.text.len(),
-            font: font("Fira Code"),
-            color: span.color,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        });
+    if let Some(lsp_context) = lsp_context.filter(|_| !token_ranges.is_empty()) {
+        let hover_context = lsp_context.clone();
+        let hover_tokens = token_ranges.clone();
+        let tooltip_context = lsp_context.clone();
+        let tooltip_tokens = token_ranges.clone();
+        let element_id = ElementId::Name(
+            format!(
+                "diff-lsp:{}:{}",
+                lsp_context.file.file_path, lsp_context.line_number
+            )
+            .into(),
+        );
+
+        let interactive = InteractiveText::new(element_id, styled)
+            .on_hover(move |index, _event, window, cx| {
+                let Some(index) = index else {
+                    return;
+                };
+                let Some(query) = hover_context.query_for_index(index, hover_tokens.as_ref())
+                else {
+                    return;
+                };
+                request_diff_line_lsp_details(query, window, cx);
+            })
+            .tooltip(move |index, _window, cx| {
+                let query = tooltip_context.query_for_index(index, tooltip_tokens.as_ref())?;
+                Some(AnyView::from(cx.new(move |cx| {
+                    LspHoverTooltipView::new(
+                        query.state.clone(),
+                        query.detail_key.clone(),
+                        query.query_key.clone(),
+                        query.token_label.clone(),
+                        cx,
+                    )
+                })))
+            });
+
+        return content_div.text_color(fallback_color).child(interactive);
     }
 
-    content_div
-        .text_color(fallback_color)
-        .child(StyledText::new(text).with_runs(runs))
+    content_div.text_color(fallback_color).child(styled)
 }
 
 fn build_diff_highlights(parsed_file: &ParsedDiffFile) -> Arc<Vec<Vec<Vec<SyntaxSpan>>>> {
@@ -1440,6 +2270,178 @@ fn build_diff_highlights(parsed_file: &ParsedDiffFile) -> Arc<Vec<Vec<Vec<Syntax
             })
             .collect(),
     )
+}
+
+struct LspHoverTooltipView {
+    state: Entity<AppState>,
+    detail_key: String,
+    query_key: String,
+    token_label: String,
+}
+
+impl LspHoverTooltipView {
+    fn new(
+        state: Entity<AppState>,
+        detail_key: String,
+        query_key: String,
+        token_label: String,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(&state, |_, _, cx| {
+            cx.notify();
+        })
+        .detach();
+
+        Self {
+            state,
+            detail_key,
+            query_key,
+            token_label,
+        }
+    }
+}
+
+impl Render for LspHoverTooltipView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let app_state = self.state.read(cx);
+        let symbol_state = app_state
+            .detail_states
+            .get(&self.detail_key)
+            .and_then(|detail_state| detail_state.lsp_symbol_states.get(&self.query_key));
+
+        div()
+            .w(px(360.0))
+            .max_w(px(420.0))
+            .rounded(radius())
+            .border_1()
+            .border_color(border_default())
+            .bg(bg_overlay())
+            .shadow_sm()
+            .child(
+                div()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .border_b(px(1.0))
+                    .border_color(border_default())
+                    .bg(bg_surface())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .font_family("Fira Code")
+                            .text_size(px(12.0))
+                            .text_color(fg_emphasis())
+                            .child(self.token_label.clone()),
+                    )
+                    .child(badge("LSP")),
+            )
+            .child(
+                div()
+                    .max_h(px(320.0))
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(match symbol_state {
+                        Some(state) if state.loading => div()
+                            .text_size(px(12.0))
+                            .text_color(fg_muted())
+                            .child("Loading symbol info…")
+                            .into_any_element(),
+                        Some(state) => {
+                            if let Some(error) = state.error.as_deref() {
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(danger())
+                                    .child(error.to_string())
+                                    .into_any_element()
+                            } else if let Some(details) = state.details.as_ref() {
+                                render_lsp_symbol_details(details).into_any_element()
+                            } else {
+                                div()
+                                    .text_size(px(12.0))
+                                    .text_color(fg_muted())
+                                    .child("No symbol details available.")
+                                    .into_any_element()
+                            }
+                        }
+                        None => div()
+                            .text_size(px(12.0))
+                            .text_color(fg_muted())
+                            .child("Loading symbol info…")
+                            .into_any_element(),
+                    }),
+            )
+    }
+}
+
+fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails) -> AnyElement {
+    if details.is_empty() {
+        return div()
+            .text_size(px(12.0))
+            .text_color(fg_muted())
+            .child("No LSP details are available for this token.")
+            .into_any_element();
+    }
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .when_some(details.hover.as_ref(), |el, hover| {
+            el.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_family("Fira Code")
+                            .text_color(accent())
+                            .child("HOVER"),
+                    )
+                    .child(render_markdown(&hover.markdown)),
+            )
+        })
+        .when_some(details.signature_help.as_ref(), |el, signature| {
+            el.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_family("Fira Code")
+                                    .text_color(accent())
+                                    .child("SIGNATURE"),
+                            )
+                            .when_some(signature.active_parameter.as_ref(), |el, parameter| {
+                                el.child(badge(&format!("active: {parameter}")))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .font_family("Fira Code")
+                            .text_size(px(12.0))
+                            .text_color(fg_default())
+                            .child(signature.label.clone()),
+                    )
+                    .when_some(signature.documentation.as_deref(), |el, documentation| {
+                        el.child(render_markdown(documentation))
+                    }),
+            )
+        })
+        .into_any_element()
 }
 
 fn render_review_thread(
@@ -1583,10 +2585,12 @@ fn render_hunk_header(
 // Helpers
 
 pub fn render_tour_diff_file(
+    state: &Entity<AppState>,
     detail: &PullRequestDetail,
     file_path: Option<&str>,
     snippet: Option<&str>,
     anchor: Option<&DiffAnchor>,
+    cx: &App,
 ) -> impl IntoElement {
     let Some(file_path) = file_path else {
         return div().into_any_element();
@@ -1599,6 +2603,19 @@ pub fn render_tour_diff_file(
     let parsed_file = find_parsed_diff_file(&detail.parsed_diff, file_path);
 
     if let Some(parsed_file) = parsed_file {
+        let prepared_file = state
+            .read(cx)
+            .active_detail_state()
+            .and_then(|detail_state| detail_state.file_content_states.get(file_path))
+            .and_then(|file_state| file_state.prepared.as_ref())
+            .cloned();
+        let file_lsp_context = build_diff_file_lsp_context(
+            state,
+            parsed_file.path.as_str(),
+            prepared_file.as_ref(),
+            cx,
+        );
+
         return nested_panel()
             .child(
                 div()
@@ -1616,7 +2633,7 @@ pub fn render_tour_diff_file(
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(fg_subtle())
                                     .font_family("Fira Code")
-                                    .child("DIFF PREVIEW"),
+                                    .child("CHANGESET"),
                             )
                             .child(
                                 div()
@@ -1656,7 +2673,8 @@ pub fn render_tour_diff_file(
             .child(if parsed_file.hunks.is_empty() {
                 panel_state_text("No textual hunks available for this file.").into_any_element()
             } else {
-                render_tour_diff_preview(parsed_file, anchor).into_any_element()
+                render_tour_diff_preview(parsed_file, anchor, file_lsp_context.as_ref())
+                    .into_any_element()
             })
             .into_any_element();
     }
@@ -1670,15 +2688,9 @@ pub fn render_tour_diff_file(
                     .text_color(fg_subtle())
                     .font_family("Fira Code")
                     .mb(px(8.0))
-                    .child("DIFF PREVIEW"),
+                    .child("CHANGESET"),
             )
-            .child(
-                div()
-                    .font_family("Fira Code")
-                    .text_size(px(12.0))
-                    .text_color(fg_default())
-                    .child(snippet.to_string()),
-            )
+            .child(div().child(render_highlighted_code_block("diff.patch", snippet)))
             .into_any_element();
     }
 
@@ -1688,61 +2700,30 @@ pub fn render_tour_diff_file(
 fn render_tour_diff_preview(
     parsed_file: &ParsedDiffFile,
     anchor: Option<&DiffAnchor>,
+    file_lsp_context: Option<&DiffFileLspContext>,
 ) -> impl IntoElement {
-    const MAX_PREVIEW_LINES: usize = 40;
-
-    let total_lines: usize = parsed_file.hunks.iter().map(|h| h.lines.len()).sum();
     let highlighted_hunks = build_diff_highlights(parsed_file);
-
-    // If anchor specifies a hunk, start there; otherwise start from the beginning
-    let start_hunk = anchor
-        .and_then(|a| a.hunk_header.as_ref())
-        .and_then(|header| parsed_file.hunks.iter().position(|h| h.header == *header))
-        .unwrap_or(0);
-
-    let mut rendered_lines = 0usize;
     let mut elements: Vec<AnyElement> = Vec::new();
     let file_path = parsed_file.path.as_str();
 
-    for hunk_idx in start_hunk..parsed_file.hunks.len() {
-        if rendered_lines >= MAX_PREVIEW_LINES {
-            break;
-        }
-
+    for hunk_idx in 0..parsed_file.hunks.len() {
         let hunk = &parsed_file.hunks[hunk_idx];
         elements.push(render_hunk_header(hunk, anchor).into_any_element());
 
-        let lines_remaining = MAX_PREVIEW_LINES.saturating_sub(rendered_lines);
-        let lines_to_show = lines_remaining.min(hunk.lines.len());
-
-        for (line_idx, line) in hunk.lines[..lines_to_show].iter().enumerate() {
+        for (line_idx, line) in hunk.lines.iter().enumerate() {
             let spans = highlighted_hunks
                 .get(hunk_idx)
                 .and_then(|lines| lines.get(line_idx))
                 .map(|spans| spans.as_slice());
-            elements.push(render_diff_line(file_path, line, spans, anchor).into_any_element());
+            let line_lsp_context = build_diff_line_lsp_context(file_lsp_context, line);
+            elements.push(
+                render_diff_line(file_path, line, spans, anchor, line_lsp_context.as_ref())
+                    .into_any_element(),
+            );
         }
-        rendered_lines += lines_to_show;
     }
 
-    let hidden_lines = total_lines.saturating_sub(rendered_lines);
-
-    div()
-        .flex()
-        .flex_col()
-        .children(elements)
-        .when(hidden_lines > 0, |el| {
-            el.child(
-                div()
-                    .px(px(16.0))
-                    .py(px(8.0))
-                    .bg(bg_subtle())
-                    .text_size(px(11.0))
-                    .font_family("Fira Code")
-                    .text_color(fg_muted())
-                    .child(format!("{hidden_lines} more lines not shown")),
-            )
-        })
+    div().flex().flex_col().children(elements)
 }
 
 fn find_threads_for_line<'a>(

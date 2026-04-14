@@ -19,6 +19,11 @@ pub struct LocalRepositoryStatus {
     pub source: String,
     pub exists: bool,
     pub is_valid_repository: bool,
+    pub current_head_oid: Option<String>,
+    pub expected_head_oid: Option<String>,
+    pub matches_expected_head: bool,
+    pub is_worktree_clean: bool,
+    pub ready_for_local_features: bool,
     pub message: String,
 }
 
@@ -32,20 +37,61 @@ pub fn load_local_repository_status(
     cache: &CacheStore,
     repository: &str,
 ) -> Result<LocalRepositoryStatus, String> {
-    resolve_local_repository_status(cache, repository)
+    resolve_local_repository_status(cache, repository, None)
 }
 
-pub fn ensure_local_repository(
+pub fn load_local_repository_status_for_pull_request(
     cache: &CacheStore,
     repository: &str,
+    head_ref_oid: Option<&str>,
 ) -> Result<LocalRepositoryStatus, String> {
-    prepare_local_repository(cache, repository)?;
-    resolve_local_repository_status(cache, repository)
+    resolve_local_repository_status(cache, repository, head_ref_oid)
+}
+
+pub fn load_or_prepare_local_repository_for_pull_request(
+    cache: &CacheStore,
+    repository: &str,
+    pull_request_number: i64,
+    head_ref_oid: Option<&str>,
+) -> Result<LocalRepositoryStatus, String> {
+    let status = resolve_local_repository_status(cache, repository, head_ref_oid)?;
+    if status.source == "managed" && !status.ready_for_local_features {
+        prepare_local_repository_for_pull_request(
+            cache,
+            repository,
+            pull_request_number,
+            head_ref_oid,
+        )?;
+        return resolve_local_repository_status(cache, repository, head_ref_oid);
+    }
+
+    Ok(status)
+}
+
+pub fn ensure_local_repository_for_pull_request(
+    cache: &CacheStore,
+    repository: &str,
+    pull_request_number: i64,
+    head_ref_oid: Option<&str>,
+) -> Result<LocalRepositoryStatus, String> {
+    let status = load_or_prepare_local_repository_for_pull_request(
+        cache,
+        repository,
+        pull_request_number,
+        head_ref_oid,
+    )?;
+
+    if status.ready_for_local_features {
+        Ok(status)
+    } else {
+        Err(status.message.clone())
+    }
 }
 
 fn resolve_local_repository_status(
     cache: &CacheStore,
     repository: &str,
+    expected_head_oid: Option<&str>,
 ) -> Result<LocalRepositoryStatus, String> {
     if let Some(link) = cache.get::<LocalRepositoryLink>(&local_repo_link_key(repository))? {
         return inspect_repository_candidate(
@@ -53,10 +99,11 @@ fn resolve_local_repository_status(
             PathBuf::from(link.value.path),
             "linked".to_string(),
             Some("Using your linked checkout.".to_string()),
+            expected_head_oid,
         );
     }
 
-    inspect_managed_repository_candidate(repository)
+    inspect_managed_repository_candidate(repository, expected_head_oid)
 }
 
 fn inspect_repository_candidate(
@@ -64,15 +111,17 @@ fn inspect_repository_candidate(
     candidate: PathBuf,
     source: String,
     default_message: Option<String>,
+    expected_head_oid: Option<&str>,
 ) -> Result<LocalRepositoryStatus, String> {
     let exists = candidate.exists();
+    let expected_head_oid = normalized_expected_head_oid(expected_head_oid);
 
     if !exists {
         let message = if source == "linked" {
             "The linked checkout no longer exists. Pick another folder or switch back to the app-managed checkout.".to_string()
         } else {
             format!(
-                "The app will create and manage a hidden checkout in {} when a tour needs local code context.",
+                "The app will create and manage a hidden checkout in {} when a pull request needs local code context.",
                 candidate.display()
             )
         };
@@ -83,6 +132,11 @@ fn inspect_repository_candidate(
             source,
             exists: false,
             is_valid_repository: false,
+            current_head_oid: None,
+            expected_head_oid,
+            matches_expected_head: false,
+            is_worktree_clean: false,
+            ready_for_local_features: false,
             message,
         });
     }
@@ -107,6 +161,11 @@ fn inspect_repository_candidate(
             source,
             exists: true,
             is_valid_repository: false,
+            current_head_oid: None,
+            expected_head_oid,
+            matches_expected_head: false,
+            is_worktree_clean: false,
+            ready_for_local_features: false,
             message,
         });
     };
@@ -132,9 +191,75 @@ fn inspect_repository_candidate(
             source,
             exists: true,
             is_valid_repository: false,
+            current_head_oid: None,
+            expected_head_oid,
+            matches_expected_head: false,
+            is_worktree_clean: false,
+            ready_for_local_features: false,
             message,
         });
     }
+
+    let current_head_oid = current_head_oid(&root)?;
+    let matches_expected_head = expected_head_oid
+        .as_ref()
+        .map(|expected| current_head_oid.as_deref() == Some(expected.as_str()))
+        .unwrap_or(true);
+    let is_worktree_clean = worktree_is_clean(&root)?;
+    let ready_for_local_features = matches_expected_head && is_worktree_clean;
+
+    let message = if let Some(expected_head) = expected_head_oid.as_deref() {
+        if !matches_expected_head {
+            if source == "linked" {
+                format!(
+                    "The linked checkout at {} is on {}, but this pull request expects {}. Check out the PR head commit or switch back to the app-managed checkout.",
+                    root.display(),
+                    current_head_oid.as_deref().unwrap_or("unknown"),
+                    expected_head
+                )
+            } else {
+                format!(
+                    "The app-managed checkout at {} is out of date. The app will refresh it to pull request head {} before local code features run.",
+                    root.display(),
+                    expected_head
+                )
+            }
+        } else if !is_worktree_clean {
+            if source == "linked" {
+                format!(
+                    "The linked checkout at {} has local changes. Commit, stash, or discard them before using local code features, or switch back to the app-managed checkout.",
+                    root.display()
+                )
+            } else {
+                format!(
+                    "The app-managed checkout at {} has local changes. Remove that folder and let the app recreate it for local code features.",
+                    root.display()
+                )
+            }
+        } else {
+            default_message.unwrap_or_else(|| {
+                format!(
+                    "Using {} at pull request head {}.",
+                    root.display(),
+                    expected_head
+                )
+            })
+        }
+    } else if !is_worktree_clean {
+        if source == "linked" {
+            format!(
+                "The linked checkout at {} has local changes. Commit, stash, or discard them before using local code features.",
+                root.display()
+            )
+        } else {
+            format!(
+                "The app-managed checkout at {} has local changes. Remove that folder and let the app recreate it.",
+                root.display()
+            )
+        }
+    } else {
+        default_message.unwrap_or_else(|| format!("Using {}.", root.display()))
+    };
 
     Ok(LocalRepositoryStatus {
         repository: repository.to_string(),
@@ -142,19 +267,28 @@ fn inspect_repository_candidate(
         source,
         exists: true,
         is_valid_repository: true,
-        message: default_message.unwrap_or_else(|| format!("Using {}.", root.display())),
+        current_head_oid,
+        expected_head_oid,
+        matches_expected_head,
+        is_worktree_clean,
+        ready_for_local_features,
+        message,
     })
 }
 
-fn prepare_local_repository(cache: &CacheStore, repository: &str) -> Result<PathBuf, String> {
-    if let Some(link) = cache.get::<LocalRepositoryLink>(&local_repo_link_key(repository))? {
-        return validate_linked_repository(repository, PathBuf::from(link.value.path));
-    }
-
-    ensure_managed_repository(repository)
+fn prepare_local_repository_for_pull_request(
+    _cache: &CacheStore,
+    repository: &str,
+    pull_request_number: i64,
+    head_ref_oid: Option<&str>,
+) -> Result<PathBuf, String> {
+    ensure_managed_repository_for_pull_request(repository, pull_request_number, head_ref_oid)
 }
 
-fn inspect_managed_repository_candidate(repository: &str) -> Result<LocalRepositoryStatus, String> {
+fn inspect_managed_repository_candidate(
+    repository: &str,
+    expected_head_oid: Option<&str>,
+) -> Result<LocalRepositoryStatus, String> {
     let managed_path = managed_repository_path(repository)?;
 
     inspect_repository_candidate(
@@ -162,27 +296,8 @@ fn inspect_managed_repository_candidate(repository: &str) -> Result<LocalReposit
         managed_path,
         "managed".to_string(),
         Some("Using the app-managed checkout.".to_string()),
+        expected_head_oid,
     )
-}
-
-fn validate_linked_repository(repository: &str, candidate: PathBuf) -> Result<PathBuf, String> {
-    if !candidate.exists() {
-        return Err(
-            "The linked checkout no longer exists. Pick another folder or switch back to the app-managed checkout."
-                .to_string(),
-        );
-    }
-
-    let root = resolve_git_root(&candidate)?.ok_or_else(|| {
-        format!(
-            "'{}' is not a git repository. Pick the repository root or any folder inside it.",
-            candidate.display()
-        )
-    })?;
-
-    ensure_repository_matches_path(repository, &root)?;
-
-    Ok(root)
 }
 
 fn ensure_managed_repository(repository: &str) -> Result<PathBuf, String> {
@@ -253,19 +368,62 @@ fn ensure_managed_repository(repository: &str) -> Result<PathBuf, String> {
     }
 }
 
-fn ensure_repository_matches_path(repository: &str, path: &Path) -> Result<(), String> {
-    let root = resolve_git_root(path)?
-        .ok_or_else(|| format!("'{}' is not inside a git repository.", path.display()))?;
+fn ensure_managed_repository_for_pull_request(
+    repository: &str,
+    pull_request_number: i64,
+    head_ref_oid: Option<&str>,
+) -> Result<PathBuf, String> {
+    let root = ensure_managed_repository(repository)?;
+    sync_managed_repository_to_pull_request(&root, repository, pull_request_number, head_ref_oid)?;
+    Ok(root)
+}
 
-    if repository_matches_git_remote(repository, &root)? {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} does not match {}. Link a clone whose remotes point at that repository.",
-            root.display(),
-            repository
-        ))
+fn sync_managed_repository_to_pull_request(
+    root: &Path,
+    repository: &str,
+    pull_request_number: i64,
+    head_ref_oid: Option<&str>,
+) -> Result<(), String> {
+    let expected_head = head_ref_oid
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+
+    if expected_head.is_some() && current_head_oid(root)? == expected_head.clone() {
+        return Ok(());
     }
+
+    let output = gh::run_owned_in(
+        vec![
+            "pr".to_string(),
+            "checkout".to_string(),
+            pull_request_number.to_string(),
+            "--detach".to_string(),
+        ],
+        Some(root),
+    )?;
+
+    if output.exit_code != Some(0) {
+        return Err(combine_process_error(
+            output,
+            &format!(
+                "Failed to update the app-managed checkout at {} to pull request #{pull_request_number} for {repository}",
+                root.display()
+            ),
+        ));
+    }
+
+    if let Some(expected_head) = expected_head {
+        let current_head = current_head_oid(root)?.unwrap_or_else(|| "unknown".to_string());
+        if current_head != expected_head {
+            return Err(format!(
+                "The app-managed checkout at {} did not reach pull request #{pull_request_number}. Expected HEAD {expected_head}, but found {current_head}.",
+                root.display()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn resolve_git_root(path: &Path) -> Result<Option<PathBuf>, String> {
@@ -290,6 +448,41 @@ fn resolve_git_root(path: &Path) -> Result<Option<PathBuf>, String> {
     }
 
     Ok(Some(PathBuf::from(root)))
+}
+
+fn current_head_oid(path: &Path) -> Result<Option<String>, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .map_err(|error| format!("Failed to launch git: {error}"))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if head.is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(head))
+}
+
+fn worktree_is_clean(path: &Path) -> Result<bool, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["status", "--porcelain", "--untracked-files=normal"])
+        .output()
+        .map_err(|error| format!("Failed to launch git: {error}"))?;
+
+    if !output.status.success() {
+        return Ok(false);
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().is_empty())
 }
 
 fn repository_matches_git_remote(repository: &str, path: &Path) -> Result<bool, String> {
@@ -367,6 +560,13 @@ fn local_repo_link_key(repository: &str) -> String {
     format!("{LOCAL_REPO_LINK_KEY_PREFIX}{repository}")
 }
 
+fn normalized_expected_head_oid(head_ref_oid: Option<&str>) -> Option<String> {
+    head_ref_oid
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn combine_process_error(output: gh::CommandOutput, prefix: &str) -> String {
     if !output.stderr.is_empty() {
         format!("{prefix}: {}", output.stderr)
@@ -406,7 +606,122 @@ fn normalized_remote_repository(remote_url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{managed_repository_directory_name, normalized_remote_repository};
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use crate::cache::CacheStore;
+
+    use super::{
+        load_local_repository_status_for_pull_request, local_repo_link_key,
+        managed_repository_directory_name, normalized_remote_repository, LocalRepositoryLink,
+    };
+
+    static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
+
+    struct GitTestRepository {
+        root: PathBuf,
+        _workspace: PathBuf,
+    }
+
+    impl GitTestRepository {
+        fn new(remote_repository: &str) -> Self {
+            let workspace = unique_test_directory("local-repo");
+            let root = workspace.join("repo");
+            fs::create_dir_all(&root).expect("failed to create repo directory");
+            run_git(&root, ["init"]);
+            run_git(&root, ["config", "user.name", "ReviewBuddy Tests"]);
+            run_git(
+                &root,
+                ["config", "user.email", "reviewbuddy-tests@example.com"],
+            );
+            run_git(
+                &root,
+                [
+                    "remote",
+                    "add",
+                    "origin",
+                    &format!("git@github.com:{remote_repository}.git"),
+                ],
+            );
+            Self {
+                root,
+                _workspace: workspace,
+            }
+        }
+
+        fn write_file(&self, path: &str, contents: &str) {
+            let full_path = self.root.join(path);
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent).expect("failed to create parent directory");
+            }
+            fs::write(full_path, contents).expect("failed to write test file");
+        }
+
+        fn commit_all(&self, message: &str) -> String {
+            run_git(&self.root, ["add", "."]);
+            run_git(&self.root, ["commit", "-m", message]);
+            self.head_oid()
+        }
+
+        fn head_oid(&self) -> String {
+            git_output(&self.root, ["rev-parse", "HEAD"])
+        }
+    }
+
+    fn unique_test_directory(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let test_id = NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "gh-ui-{prefix}-{nanos}-{test_id}-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&path).expect("failed to create temp directory");
+        path
+    }
+
+    fn run_git<const N: usize>(path: &Path, args: [&str; N]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .expect("failed to run git");
+
+        if !output.status.success() {
+            panic!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    fn git_output<const N: usize>(path: &Path, args: [&str; N]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(args)
+            .output()
+            .expect("failed to run git");
+
+        if !output.status.success() {
+            panic!(
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
 
     #[test]
     fn normalizes_https_remote_urls() {
@@ -443,5 +758,78 @@ mod tests {
             managed_repository_directory_name("OpenAI/example.repo"),
             "openai__example.repo".to_string()
         );
+    }
+
+    #[test]
+    fn linked_repository_status_requires_expected_head() {
+        let repository = GitTestRepository::new("openai/example");
+        repository.write_file("src/lib.rs", "pub fn value() -> i32 { 1 }\n");
+        let initial_head = repository.commit_all("initial");
+
+        repository.write_file("src/lib.rs", "pub fn value() -> i32 { 2 }\n");
+        let current_head = repository.commit_all("second");
+
+        let cache =
+            CacheStore::new(unique_test_directory("local-repo-cache").join("cache.sqlite3"))
+                .expect("failed to create cache");
+        cache
+            .put(
+                &local_repo_link_key("openai/example"),
+                &LocalRepositoryLink {
+                    path: repository.root.display().to_string(),
+                },
+                0,
+            )
+            .expect("failed to write link");
+
+        let status = load_local_repository_status_for_pull_request(
+            &cache,
+            "openai/example",
+            Some(&initial_head),
+        )
+        .expect("failed to load status");
+
+        assert!(status.is_valid_repository);
+        assert_eq!(
+            status.current_head_oid.as_deref(),
+            Some(current_head.as_str())
+        );
+        assert_eq!(
+            status.expected_head_oid.as_deref(),
+            Some(initial_head.as_str())
+        );
+        assert!(!status.matches_expected_head);
+        assert!(!status.ready_for_local_features);
+        assert!(status.message.contains("expects"));
+    }
+
+    #[test]
+    fn linked_repository_status_requires_clean_worktree() {
+        let repository = GitTestRepository::new("openai/example");
+        repository.write_file("src/lib.rs", "pub fn value() -> i32 { 1 }\n");
+        let head = repository.commit_all("initial");
+        repository.write_file("src/lib.rs", "pub fn value() -> i32 { 3 }\n");
+
+        let cache =
+            CacheStore::new(unique_test_directory("local-repo-cache").join("cache.sqlite3"))
+                .expect("failed to create cache");
+        cache
+            .put(
+                &local_repo_link_key("openai/example"),
+                &LocalRepositoryLink {
+                    path: repository.root.display().to_string(),
+                },
+                0,
+            )
+            .expect("failed to write link");
+
+        let status =
+            load_local_repository_status_for_pull_request(&cache, "openai/example", Some(&head))
+                .expect("failed to load status");
+
+        assert!(status.matches_expected_head);
+        assert!(!status.is_worktree_clean);
+        assert!(!status.ready_for_local_features);
+        assert!(status.message.contains("local changes"));
     }
 }

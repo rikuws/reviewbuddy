@@ -12,8 +12,10 @@ use crate::github::{
     RepositoryFileContent, ReviewAction, WorkspaceSnapshot,
 };
 use crate::local_repo::LocalRepositoryStatus;
+use crate::lsp::{LspServerStatus, LspSessionManager, LspSymbolDetails};
+use crate::managed_lsp::{ManagedServerInstallStatus, ManagedServerKind};
 use crate::syntax::SyntaxSpan;
-use gpui::{ListAlignment, ListState, ScrollHandle, px};
+use gpui::{px, ListAlignment, ListState, ScrollHandle};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SectionId {
@@ -21,6 +23,7 @@ pub enum SectionId {
     Pulls,
     Issues,
     Reviews,
+    Settings,
 }
 
 impl SectionId {
@@ -30,6 +33,7 @@ impl SectionId {
             Self::Pulls => "Pull Requests",
             Self::Issues => "Issues",
             Self::Reviews => "Reviews",
+            Self::Settings => "Settings",
         }
     }
 
@@ -39,6 +43,7 @@ impl SectionId {
             SectionId::Pulls,
             SectionId::Issues,
             SectionId::Reviews,
+            SectionId::Settings,
         ]
     }
 }
@@ -83,6 +88,9 @@ pub struct DetailState {
     pub local_repository_error: Option<String>,
     pub tour_states: std::collections::HashMap<CodeTourProvider, CodeTourState>,
     pub file_content_states: std::collections::HashMap<String, FileContentState>,
+    pub lsp_statuses: std::collections::HashMap<String, LspServerStatus>,
+    pub lsp_loading_paths: std::collections::HashSet<String>,
+    pub lsp_symbol_states: std::collections::HashMap<String, LspSymbolState>,
 }
 
 impl Default for DetailState {
@@ -97,6 +105,9 @@ impl Default for DetailState {
             local_repository_error: None,
             tour_states: std::collections::HashMap::new(),
             file_content_states: std::collections::HashMap::new(),
+            lsp_statuses: std::collections::HashMap::new(),
+            lsp_loading_paths: std::collections::HashSet::new(),
+            lsp_symbol_states: std::collections::HashMap::new(),
         }
     }
 }
@@ -155,17 +166,36 @@ impl Default for FileContentState {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct LspSymbolState {
+    pub loading: bool,
+    pub details: Option<LspSymbolDetails>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ManagedLspSettingsState {
+    pub statuses: std::collections::HashMap<ManagedServerKind, ManagedServerInstallStatus>,
+    pub loading: bool,
+    pub loaded: bool,
+    pub installing: std::collections::HashSet<ManagedServerKind>,
+    pub install_errors: std::collections::HashMap<ManagedServerKind, String>,
+    pub install_messages: std::collections::HashMap<ManagedServerKind, String>,
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedFileContent {
     pub path: String,
     pub reference: String,
     pub is_binary: bool,
     pub size_bytes: usize,
+    pub text: Arc<str>,
     pub lines: Arc<Vec<PreparedFileLine>>,
 }
 
 #[derive(Clone, Debug)]
 pub struct PreparedFileLine {
+    pub line_number: usize,
     pub text: String,
     pub spans: Vec<SyntaxSpan>,
 }
@@ -198,6 +228,7 @@ impl DiffFileViewState {
 
 pub struct AppState {
     pub cache: Arc<CacheStore>,
+    pub lsp_session_manager: Arc<LspSessionManager>,
 
     // Navigation
     pub active_section: SectionId,
@@ -248,6 +279,7 @@ pub struct AppState {
     pub active_tour_outline_id: String,
     pub collapsed_tour_panels: std::collections::HashSet<String>,
     pub tour_content_scroll_handle: ScrollHandle,
+    pub managed_lsp_settings: ManagedLspSettingsState,
 }
 
 impl AppState {
@@ -255,6 +287,7 @@ impl AppState {
         let cache_path = cache.path().display().to_string();
         Self {
             cache: Arc::new(cache),
+            lsp_session_manager: Arc::new(LspSessionManager::new()),
             active_section: SectionId::Overview,
             active_surface: PullRequestSurface::Overview,
             active_queue_id: "reviewRequested".to_string(),
@@ -290,6 +323,7 @@ impl AppState {
             active_tour_outline_id: "overview".to_string(),
             collapsed_tour_panels: std::collections::HashSet::new(),
             tour_content_scroll_handle: ScrollHandle::new(),
+            managed_lsp_settings: ManagedLspSettingsState::default(),
         }
     }
 
@@ -360,6 +394,7 @@ impl AppState {
                 .and_then(|w| w.queues.iter().find(|q| q.id == "reviewRequested"))
                 .map(|q| q.total_count)
                 .unwrap_or(0),
+            SectionId::Settings => 0,
         }
     }
 

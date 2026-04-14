@@ -1,12 +1,9 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
+use crate::code_display::render_highlighted_code_block;
 use crate::theme::*;
-
-static CODE_BLOCK_ID: AtomicUsize = AtomicUsize::new(0);
 
 /// Render a markdown string into GPUI elements.
 pub fn render_markdown(text: &str) -> impl IntoElement {
@@ -469,39 +466,15 @@ fn render_inline_div(
         .child(StyledText::new(text).with_runs(runs))
 }
 
-fn render_code_block(text: &str, _lang: Option<&str>) -> AnyElement {
-    let block_id = CODE_BLOCK_ID.fetch_add(1, Ordering::Relaxed);
+fn render_code_block(text: &str, lang: Option<&str>) -> AnyElement {
     div()
         .w_full()
         .min_w_0()
         .my(px(8.0))
-        .rounded(radius())
-        .bg(bg_inset())
-        .overflow_hidden()
-        .child(
-            div().px(px(16.0)).py(px(12.0)).child(
-                div()
-                    .w_full()
-                    .id(ElementId::Name(format!("code-block-{block_id}").into()))
-                    .overflow_x_scroll()
-                    .child(
-                        div()
-                            .whitespace_nowrap()
-                            .font_family("Fira Code")
-                            .text_size(px(12.0))
-                            .text_color(fg_default())
-                            .flex()
-                            .flex_col()
-                            .children(text.lines().map(|line| {
-                                div().child(if line.is_empty() {
-                                    "\u{00a0}".to_string()
-                                } else {
-                                    line.to_string()
-                                })
-                            })),
-                    ),
-            ),
-        )
+        .child(render_highlighted_code_block(
+            lang.unwrap_or_default(),
+            text,
+        ))
         .into_any_element()
 }
 

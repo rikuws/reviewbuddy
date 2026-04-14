@@ -9,6 +9,8 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 pub struct SyntaxSpan {
     pub text: String,
     pub color: Hsla,
+    pub column_start: usize,
+    pub column_end: usize,
 }
 
 fn syntax_set() -> &'static SyntaxSet {
@@ -85,22 +87,31 @@ fn highlight_with_state(
     highlighter
         .highlight_line(&line, syntax_set)
         .map(|spans| {
+            let mut next_column = 1usize;
             spans
                 .into_iter()
-                .map(|(style, text)| {
+                .filter_map(|(style, text)| {
                     let text = text.trim_end_matches('\n').to_string();
+                    if text.is_empty() {
+                        return None;
+                    }
+
+                    let column_start = next_column;
+                    let column_end = column_start + text.chars().count();
+                    next_column = column_end;
                     let rgba = Rgba {
                         r: style.foreground.r as f32 / 255.0,
                         g: style.foreground.g as f32 / 255.0,
                         b: style.foreground.b as f32 / 255.0,
                         a: style.foreground.a as f32 / 255.0,
                     };
-                    SyntaxSpan {
+                    Some(SyntaxSpan {
                         text,
                         color: rgba.into(),
-                    }
+                        column_start,
+                        column_end,
+                    })
                 })
-                .filter(|span| !span.text.is_empty())
                 .collect()
         })
         .unwrap_or_default()
@@ -152,5 +163,18 @@ mod tests {
             highlighted.iter().any(|line| !line.is_empty()),
             "Expected syntax spans across multiline input"
         );
+    }
+
+    #[test]
+    fn test_spans_include_column_offsets() {
+        let spans = highlight_line("app.js", "const answer = 42;");
+        assert!(!spans.is_empty(), "Expected highlighted spans");
+
+        let mut expected_column = 1usize;
+        for span in spans {
+            assert_eq!(span.column_start, expected_column);
+            assert!(span.column_end > span.column_start);
+            expected_column = span.column_end;
+        }
     }
 }

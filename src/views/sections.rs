@@ -5,6 +5,7 @@ use crate::github;
 use crate::state::*;
 use crate::theme::*;
 
+use super::settings::render_settings_view;
 use super::workspace_sync::trigger_sync_workspace;
 use std::collections::BTreeMap;
 
@@ -16,6 +17,7 @@ pub fn render_section_workspace(state: &Entity<AppState>, cx: &App) -> impl Into
         SectionId::Overview => render_overview(state, cx).into_any_element(),
         SectionId::Pulls | SectionId::Reviews => render_pull_list(state, cx).into_any_element(),
         SectionId::Issues => render_issues(state, cx).into_any_element(),
+        SectionId::Settings => render_settings_view(state, cx).into_any_element(),
     }
 }
 

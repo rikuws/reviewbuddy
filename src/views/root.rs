@@ -9,6 +9,7 @@ use crate::theme::*;
 use super::palette::render_palette;
 use super::pr_detail::render_pr_workspace;
 use super::sections::render_section_workspace;
+use super::settings::ensure_managed_lsp_statuses_loaded;
 use super::workspace_sync::{sync_workspace_flow, wait_for_workspace_poll_interval};
 
 pub struct RootView {
@@ -175,7 +176,10 @@ fn render_topbar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                     let is_active = active_section == section && active_pr_key.is_none();
                     let count = s.section_count(section);
                     let state = state_for_nav.clone();
-                    nav_pill(section.label(), count, is_active, move |_, _, cx| {
+                    nav_pill(section.label(), count, is_active, move |_, window, cx| {
+                        if section == SectionId::Settings {
+                            ensure_managed_lsp_statuses_loaded(&state, window, cx);
+                        }
                         state.update(cx, |s, cx| {
                             s.active_section = section;
                             s.active_pr_key = None;

@@ -22,6 +22,16 @@ const MAX_COMMENTS_PER_THREAD = 3;
 const MAX_SECTIONS = 10;
 const MAX_REVIEW_POINTS = 4;
 const MAX_CALLSITES_PER_SECTION = 3;
+const COPILOT_TOUR_AVAILABLE_TOOLS = ["report_intent", "view", "rg", "glob"];
+const COPILOT_TOUR_READ_TOOLS = new Set(["view", "rg", "glob"]);
+const MAX_COPILOT_VIEW_RANGE_LINES = 260;
+const MAX_COPILOT_RG_HEAD_LIMIT = 40;
+const MAX_COPILOT_SUPPORTING_PATH_USES = 2;
+const MIN_COPILOT_READ_TOOL_BUDGET = 8;
+const MAX_COPILOT_READ_TOOL_BUDGET = 24;
+const COPILOT_READ_TOOL_BUDGET_BUFFER = 8;
+const MIN_COPILOT_SUPPORTING_TOOL_BUDGET = 4;
+const MAX_COPILOT_SUPPORTING_TOOL_BUDGET = 10;
 const PROJECT_ROOT = resolveProjectRoot();
 let currentRunLogger = null;
 
@@ -490,47 +500,74 @@ async function generateWithCopilot(input) {
     emitProgress({
       stage: "model_lookup",
       summary: "Loading GitHub Copilot models",
-      detail: "Choosing the fastest suitable model for the code tour run.",
+      detail: "Choosing the preferred model and reasoning level for the code tour run.",
       log: "Loading Copilot models"
     });
     const models = await loadCopilotModels(client);
     const model = selectCopilotModel(models);
+    const reasoningEffort = selectCopilotReasoningEffort(models, model);
+    const orchestration = createCopilotTurnOrchestration(input);
     writeRunLog("copilot.models", {
       availableModels: ensureArray(models)
         .map((candidate) => sanitizeString(candidate?.id))
         .filter(Boolean),
-      selectedModel: model
+      selectedModel: model,
+      selectedReasoningEffort: reasoningEffort
     });
     emitProgress({
       stage: "session",
       summary: "Creating GitHub Copilot session",
       detail: model
-        ? `Using ${model} for the code tour run.`
+        ? reasoningEffort
+          ? `Using ${model} with ${reasoningEffort} reasoning effort for the code tour run.`
+          : `Using ${model} for the code tour run.`
         : "Using the default Copilot model for the code tour run.",
-      log: model ? `Selected model ${model}` : "Using the default Copilot model"
+      log: model
+        ? reasoningEffort
+          ? `Selected model ${model} (${reasoningEffort} reasoning)`
+          : `Selected model ${model}`
+        : "Using the default Copilot model"
     });
     const session = await withTimeout(
       client.createSession({
         model: model ?? undefined,
+        reasoningEffort: reasoningEffort ?? undefined,
+        availableTools: COPILOT_TOUR_AVAILABLE_TOOLS,
         workingDirectory: input.workingDirectory,
         streaming: true,
+        hooks: orchestration.hooks,
         systemMessage: {
           content: [
             "You are helping generate a code-review tour inside a desktop pull-request tool.",
             "Stay read-only. Never edit files or claim you made changes.",
             "Work directly in the current session. Do not spawn sub-agents, background agents, or web searches.",
+            "Use only these read-only tools when needed: report_intent, view, rg, and glob. Never use shell or git commands in this session.",
             "Finish the task in a single turn. Do not wait for follow-up instructions.",
             "Prefer the provided pull-request context and candidate snippets first.",
             "Only inspect files from the checkout when they are needed to verify a concrete claim.",
+            "If a candidate file is missing from the checkout, continue with the provided pull-request context and snippets instead of trying recovery commands.",
             "After you have enough evidence for a best-effort tour, stop using tools and return the JSON immediately.",
             "If a search or file read is inconclusive, do not keep broadening the search; continue with the verified context you already have.",
             "Return strict JSON with no markdown fences."
           ].join(" ")
         },
         onPermissionRequest(request) {
-          if (request.kind === "read") {
+          const kind = sanitizeString(request?.kind);
+          const toolName = sanitizeString(request?.toolName);
+          if (
+            kind === "read" ||
+            (kind === "custom-tool" &&
+              toolName &&
+              COPILOT_TOUR_AVAILABLE_TOOLS.includes(toolName))
+          ) {
             return { kind: "approved" };
           }
+
+          writeRunLog("copilot.permission.denied", {
+            kind,
+            toolName,
+            fullCommandText: sanitizeOptionalString(request?.fullCommandText, 240)
+          });
 
           return { kind: "denied-by-rules" };
         }
@@ -548,11 +585,19 @@ async function generateWithCopilot(input) {
         candidateStepCount: ensureArray(input.candidateSteps).length,
         candidateGroupCount: ensureArray(input.candidateGroups).length
       });
-      const response = await waitForCopilotTurn(
-        session,
-        prompt,
-        input.workingDirectory
-      );
+      let response;
+      try {
+        response = await waitForCopilotTurn(
+          session,
+          prompt,
+          input.workingDirectory,
+          orchestration
+        );
+      } catch (error) {
+        return {
+          tour: buildCopilotFallbackTour(input, model, error, orchestration)
+        };
+      }
       const content = response?.data?.content?.trim();
       writeRunLog("copilot.response.received", {
         hasResponse: Boolean(response),
@@ -561,7 +606,14 @@ async function generateWithCopilot(input) {
       });
 
       if (!content) {
-        throw new Error("GitHub Copilot returned an empty code tour response.");
+        return {
+          tour: buildCopilotFallbackTour(
+            input,
+            model,
+            new Error("GitHub Copilot returned an empty code tour response."),
+            orchestration
+          )
+        };
       }
 
       emitProgress({
@@ -570,10 +622,17 @@ async function generateWithCopilot(input) {
         detail: "Parsing the structured response and merging it into the final code tour.",
         log: "Finalizing Copilot output"
       });
-      return {
-        tour: mergeTour(parseStructuredResponse(content), input, model)
-      };
+      try {
+        return {
+          tour: mergeTour(parseStructuredResponse(content), input, model)
+        };
+      } catch (error) {
+        return {
+          tour: buildCopilotFallbackTour(input, model, error, orchestration)
+        };
+      }
     } finally {
+      orchestration.clearAbortHandler();
       await session.disconnect().catch(() => {});
     }
   } finally {
@@ -592,10 +651,13 @@ function buildTourPrompt(input) {
     "Do not edit files, propose patches, or imply that you changed the code.",
     "Finish the whole task in this turn. Do not wait for more instructions.",
     "Be fast and selective. Do not exhaustively explore the repository.",
+    "Use only the available read-only tools: report_intent, view, rg, and glob.",
     "Start from the provided candidate groups and candidate steps before opening more files.",
     "Inspect only the changed files plus direct supporting callsites.",
-    "Do not spawn sub-agents or background agents.",
-    "Inspect at most a few targeted supporting callsites beyond the changed files. Once the story is clear, stop using tools and return the final JSON immediately.",
+    "Do not spawn sub-agents or background agents, and never try shell or git recovery commands.",
+    "Inspect at most one targeted supporting callsite per section beyond the changed files. Once the story is clear, stop using tools and return the final JSON immediately.",
+    "Do not reopen the same supporting file more than twice. If you already inspected a supporting file, treat that as enough evidence unless the first read was clearly insufficient.",
+    "If a candidate file is missing from the checkout, treat it as deleted, renamed, or out-of-sync and continue with the provided pull-request context, snippets, and remaining files.",
     "If a supporting callsite cannot be verified quickly, omit it instead of continuing to search.",
     "If a search returns no direct hit, do not keep widening it. Continue with the verified pull-request context you already have.",
     "A complete best-effort tour is better than an exhaustive investigation.",
@@ -680,6 +742,307 @@ function buildPromptContext(input) {
     })),
     candidateSteps: fileSteps.map(summarizeStep)
   };
+}
+
+function createCopilotTurnOrchestration(input) {
+  const candidatePaths = new Set(
+    ensureArray(input.candidateSteps)
+      .map((step) => normalizeRepositoryPath(step?.filePath, input.workingDirectory))
+      .filter(Boolean)
+  );
+  const inspectedCandidatePaths = new Set();
+  const supportingPathCounts = new Map();
+  let totalReadToolCalls = 0;
+  let totalSupportingToolCalls = 0;
+  let stopRequestedReason = null;
+  let hardStopReason = null;
+  let abortHandler = null;
+  let announcedCandidateCoverage = false;
+  const maxReadToolCalls = computeCopilotReadToolBudget(candidatePaths.size);
+  const maxSupportingToolCalls = computeCopilotSupportingToolBudget(candidatePaths.size);
+
+  function snapshot() {
+    return {
+      candidatePathCount: candidatePaths.size,
+      inspectedCandidatePathCount: inspectedCandidatePaths.size,
+      totalReadToolCalls,
+      totalSupportingToolCalls,
+      maxReadToolCalls,
+      maxSupportingToolCalls,
+      stopRequestedReason,
+      hardStopReason,
+      supportingPathCounts: Object.fromEntries([...supportingPathCounts.entries()].slice(0, 12))
+    };
+  }
+
+  function requestAbort(reason) {
+    const normalized = sanitizeString(reason);
+    if (!normalized || hardStopReason) {
+      return;
+    }
+
+    hardStopReason = limitText(normalized, 240);
+    writeRunLog("copilot.orchestration.abort", snapshot());
+    queueMicrotask(() => {
+      abortHandler?.(hardStopReason);
+    });
+  }
+
+  function denyTool(toolName, toolArgs, reason) {
+    const normalizedReason = limitText(reason, 240);
+    const normalizedPath = normalizeRepositoryPath(
+      pickObjectValue(toolArgs, ["path"]),
+      input.workingDirectory
+    );
+    const alreadyRequestedStop = Boolean(stopRequestedReason);
+    if (!stopRequestedReason) {
+      stopRequestedReason = normalizedReason;
+    } else {
+      requestAbort(
+        `GitHub Copilot kept requesting more tools after being told to stop. ${stopRequestedReason}`
+      );
+    }
+
+    writeRunLog("copilot.tool.denied", {
+      toolName,
+      path: normalizedPath,
+      reason: normalizedReason,
+      alreadyRequestedStop,
+      orchestration: snapshot()
+    });
+
+    return {
+      permissionDecision: "deny",
+      permissionDecisionReason: normalizedReason,
+      modifiedArgs: toolArgs,
+      additionalContext: buildCopilotStopUsingToolsContext(normalizedReason)
+    };
+  }
+
+  function allowTool(toolArgs, additionalContext = null) {
+    return {
+      permissionDecision: "allow",
+      modifiedArgs: toolArgs,
+      ...(additionalContext ? { additionalContext } : {})
+    };
+  }
+
+  function onPreToolUse(hookInput) {
+    const toolName = sanitizeString(hookInput?.toolName) ?? "tool";
+    const toolArgs = clampCopilotToolArgs(toolName, hookInput?.toolArgs);
+
+    if (!COPILOT_TOUR_AVAILABLE_TOOLS.includes(toolName)) {
+      return denyTool(
+        toolName,
+        toolArgs,
+        `Only ${COPILOT_TOUR_AVAILABLE_TOOLS.join(", ")} are allowed while generating a code tour.`
+      );
+    }
+
+    if (!COPILOT_TOUR_READ_TOOLS.has(toolName)) {
+      return allowTool(toolArgs);
+    }
+
+    if (stopRequestedReason) {
+      return denyTool(toolName, toolArgs, stopRequestedReason);
+    }
+
+    totalReadToolCalls += 1;
+
+    const normalizedPath = normalizeRepositoryPath(
+      pickObjectValue(toolArgs, ["path"]),
+      input.workingDirectory
+    );
+    const isCandidatePath = normalizedPath ? candidatePaths.has(normalizedPath) : false;
+
+    if (isCandidatePath) {
+      inspectedCandidatePaths.add(normalizedPath);
+    }
+
+    let supportingPathCount = 0;
+    if (normalizedPath && !isCandidatePath) {
+      supportingPathCount = (supportingPathCounts.get(normalizedPath) ?? 0) + 1;
+      supportingPathCounts.set(normalizedPath, supportingPathCount);
+      totalSupportingToolCalls += 1;
+    }
+
+    if (totalReadToolCalls > maxReadToolCalls) {
+      return denyTool(
+        toolName,
+        toolArgs,
+        `GitHub Copilot already used ${maxReadToolCalls} read-only tool calls for this tour. Use the gathered evidence and return the final JSON now.`
+      );
+    }
+
+    if (normalizedPath && !isCandidatePath && supportingPathCount > MAX_COPILOT_SUPPORTING_PATH_USES) {
+      return denyTool(
+        toolName,
+        toolArgs,
+        `Supporting path ${limitText(normalizedPath, 120)} was already inspected ${MAX_COPILOT_SUPPORTING_PATH_USES} times. Return the final JSON from the context you already gathered.`
+      );
+    }
+
+    if (totalSupportingToolCalls > maxSupportingToolCalls) {
+      return denyTool(
+        toolName,
+        toolArgs,
+        `GitHub Copilot already used ${maxSupportingToolCalls} supporting lookups for this tour. Return the final JSON from the changed files and gathered context now.`
+      );
+    }
+
+    if (
+      !announcedCandidateCoverage &&
+      candidatePaths.size > 0 &&
+      inspectedCandidatePaths.size >= candidatePaths.size
+    ) {
+      announcedCandidateCoverage = true;
+      return allowTool(
+        toolArgs,
+        "All changed files in the candidate tour have now been inspected. Only use a supporting callsite if it changes the walkthrough materially; otherwise return the final JSON now."
+      );
+    }
+
+    return allowTool(toolArgs);
+  }
+
+  function onPostToolUse(hookInput) {
+    const toolName = sanitizeString(hookInput?.toolName) ?? "tool";
+    if (!COPILOT_TOUR_READ_TOOLS.has(toolName)) {
+      return;
+    }
+
+    const normalizedPath = normalizeRepositoryPath(
+      pickObjectValue(hookInput?.toolArgs, ["path"]),
+      input.workingDirectory
+    );
+    if (!normalizedPath || candidatePaths.has(normalizedPath)) {
+      return;
+    }
+
+    const supportingPathCount = supportingPathCounts.get(normalizedPath) ?? 0;
+    if (supportingPathCount >= MAX_COPILOT_SUPPORTING_PATH_USES) {
+      return {
+        additionalContext: `Supporting path ${limitText(normalizedPath, 120)} has already been inspected enough to form the tour. Return the final JSON instead of reopening it.`
+      };
+    }
+  }
+
+  return {
+    hooks: {
+      onPreToolUse,
+      onPostToolUse
+    },
+    registerAbortHandler(handler) {
+      abortHandler = handler;
+    },
+    clearAbortHandler() {
+      abortHandler = null;
+    },
+    hardStopReason() {
+      return hardStopReason;
+    },
+    snapshot
+  };
+}
+
+function computeCopilotReadToolBudget(candidateFileCount) {
+  return Math.max(
+    MIN_COPILOT_READ_TOOL_BUDGET,
+    Math.min(MAX_COPILOT_READ_TOOL_BUDGET, candidateFileCount + COPILOT_READ_TOOL_BUDGET_BUFFER)
+  );
+}
+
+function computeCopilotSupportingToolBudget(candidateFileCount) {
+  return Math.max(
+    MIN_COPILOT_SUPPORTING_TOOL_BUDGET,
+    Math.min(
+      MAX_COPILOT_SUPPORTING_TOOL_BUDGET,
+      Math.ceil(candidateFileCount / 2) + 2
+    )
+  );
+}
+
+function clampCopilotToolArgs(toolName, toolArgs) {
+  if (!toolArgs || typeof toolArgs !== "object" || Array.isArray(toolArgs)) {
+    return toolArgs;
+  }
+
+  let modifiedArgs = toolArgs;
+
+  if (toolName === "rg") {
+    const headLimit = Number(pickObjectValue(toolArgs, ["head_limit", "headLimit"]));
+    if (Number.isFinite(headLimit) && headLimit > MAX_COPILOT_RG_HEAD_LIMIT) {
+      modifiedArgs = { ...modifiedArgs };
+      if (Object.prototype.hasOwnProperty.call(toolArgs, "headLimit")) {
+        modifiedArgs.headLimit = MAX_COPILOT_RG_HEAD_LIMIT;
+      } else {
+        modifiedArgs.head_limit = MAX_COPILOT_RG_HEAD_LIMIT;
+      }
+      writeRunLog("copilot.tool.args_clamped", {
+        toolName,
+        field: "head_limit",
+        original: headLimit,
+        clampedTo: MAX_COPILOT_RG_HEAD_LIMIT
+      });
+    }
+  }
+
+  if (toolName === "view") {
+    const range = pickObjectValue(toolArgs, ["view_range", "viewRange"]);
+    const clampedRange = clampViewRange(range);
+    if (clampedRange) {
+      const originalRange = JSON.stringify(range);
+      const nextRange = JSON.stringify(clampedRange);
+      if (originalRange !== nextRange) {
+        if (modifiedArgs === toolArgs) {
+          modifiedArgs = { ...modifiedArgs };
+        }
+        if (Object.prototype.hasOwnProperty.call(toolArgs, "viewRange")) {
+          modifiedArgs.viewRange = clampedRange;
+        } else {
+          modifiedArgs.view_range = clampedRange;
+        }
+        writeRunLog("copilot.tool.args_clamped", {
+          toolName,
+          field: "view_range",
+          original: range,
+          clampedTo: clampedRange
+        });
+      }
+    }
+  }
+
+  return modifiedArgs;
+}
+
+function clampViewRange(range) {
+  if (!Array.isArray(range) || range.length === 0) {
+    return null;
+  }
+
+  const start = Number.isFinite(range[0]) ? Math.max(1, Math.floor(range[0])) : null;
+  if (start === null) {
+    return null;
+  }
+
+  const end = Number.isFinite(range[1]) ? Math.floor(range[1]) : null;
+  if (end === null) {
+    return [start];
+  }
+
+  if (end < 0) {
+    return [start, start + MAX_COPILOT_VIEW_RANGE_LINES - 1];
+  }
+
+  if (end - start + 1 > MAX_COPILOT_VIEW_RANGE_LINES) {
+    return [start, start + MAX_COPILOT_VIEW_RANGE_LINES - 1];
+  }
+
+  return [start, end];
+}
+
+function buildCopilotStopUsingToolsContext(reason) {
+  return `${reason} Use the changed files and previously gathered tool results to return the final code tour JSON now without requesting more tools.`;
 }
 
 function summarizeStep(step) {
@@ -804,6 +1167,39 @@ function mergeTour(response, input, model) {
   };
 }
 
+function buildCopilotFallbackTour(input, model, error, orchestration = null) {
+  const reason =
+    orchestration?.hardStopReason() ??
+    sanitizeString(error?.message) ??
+    "GitHub Copilot did not finish a structured response.";
+  writeRunLog("copilot.fallback.generated", {
+    reason,
+    orchestration: orchestration?.snapshot() ?? null
+  });
+  emitProgress({
+    stage: "fallback",
+    summary: "Using the verified pull-request context",
+    detail:
+      "GitHub Copilot did not finish a structured code tour, so the app is assembling a fallback walkthrough from the changed files and grouped review context.",
+    log: "Using fallback code tour"
+  });
+
+  return mergeTour(
+    {
+      summary:
+        "Fallback code tour assembled from the verified pull-request context and grouped changed files.",
+      reviewFocus:
+        "Review the grouped changed files and diff anchors below; GitHub Copilot did not finish a custom narrative for this run.",
+      openQuestions: [],
+      warnings: [limitText(reason, 240)],
+      steps: [],
+      sections: []
+    },
+    input,
+    model
+  );
+}
+
 async function loadCopilotModels(client) {
   try {
     return await withTimeout(
@@ -833,41 +1229,72 @@ function selectCopilotModel(models) {
   return preferredMatch?.id ?? null;
 }
 
+function selectCopilotReasoningEffort(models, modelId) {
+  const normalizedModelId = sanitizeString(modelId);
+  if (!normalizedModelId) {
+    return null;
+  }
+
+  const selectedModel = ensureArray(models).find(
+    (candidate) => sanitizeString(candidate?.id) === normalizedModelId
+  );
+  if (!selectedModel?.capabilities?.supports?.reasoningEffort) {
+    return null;
+  }
+
+  const supportedReasoningEfforts = ensureArray(
+    selectedModel?.supportedReasoningEfforts
+  )
+    .map((value) => sanitizeString(value)?.toLowerCase())
+    .filter(Boolean);
+  if (supportedReasoningEfforts.includes("medium")) {
+    return "medium";
+  }
+
+  const defaultReasoningEffort = sanitizeString(
+    selectedModel?.defaultReasoningEffort
+  )?.toLowerCase();
+  return defaultReasoningEffort ?? supportedReasoningEfforts[0] ?? null;
+}
+
 function scoreCopilotModel(modelId) {
   const normalized = sanitizeString(modelId)?.toLowerCase();
   if (!normalized) {
     return Number.MAX_SAFE_INTEGER;
   }
 
-  if (normalized.startsWith("gpt-5") && normalized.includes("mini")) {
+  if (normalized === "gpt-5.4") {
     return 0;
   }
-  if (normalized.includes("mini")) {
+  if (normalized.startsWith("gpt-5") && normalized.includes("mini")) {
     return 1;
   }
-  if (normalized.includes("haiku")) {
+  if (normalized.includes("mini")) {
     return 2;
   }
-  if (normalized === "gpt-5") {
+  if (normalized.includes("haiku")) {
     return 3;
   }
-  if (normalized.startsWith("gpt-5")) {
+  if (normalized === "gpt-5") {
     return 4;
   }
-  if (normalized.startsWith("gpt-4.1")) {
+  if (normalized.startsWith("gpt-5")) {
     return 5;
   }
-  if (normalized.startsWith("claude")) {
+  if (normalized.startsWith("gpt-4.1")) {
     return 6;
   }
-  if (normalized.startsWith("o")) {
+  if (normalized.startsWith("claude")) {
     return 7;
+  }
+  if (normalized.startsWith("o")) {
+    return 8;
   }
 
   return 100;
 }
 
-async function waitForCopilotTurn(session, prompt, workingDirectory) {
+async function waitForCopilotTurn(session, prompt, workingDirectory, orchestration = null) {
   const activeTools = new Map();
   const requestedTools = new Map();
   let finalMessage = null;
@@ -920,6 +1347,17 @@ async function waitForCopilotTurn(session, prompt, workingDirectory) {
     session.abort().catch(() => {});
     rejectOnce(new Error(generationAbortMessage("GitHub Copilot", abortReason)));
   });
+  orchestration?.registerAbortHandler((reason) => {
+    emitProgress({
+      stage: "orchestration_limit",
+      summary: "Stopping repetitive tool use",
+      detail:
+        "GitHub Copilot kept requesting more tools after the tour already had enough verified context.",
+      log: limitText(reason, 240)
+    });
+    session.abort().catch(() => {});
+    rejectOnce(new Error(reason));
+  });
   const subscriptions = [
     session.on("assistant.message", (event) => {
       finalMessage = event;
@@ -946,9 +1384,9 @@ async function waitForCopilotTurn(session, prompt, workingDirectory) {
       writeRunLog("copilot.assistant.message_delta.started");
       emitProgress({
         stage: "drafting",
-        summary: "GitHub Copilot is drafting the code tour",
-        detail: "Streaming the final structured response back to the app.",
-        log: "Copilot started drafting the final response"
+        summary: "GitHub Copilot is streaming a response",
+        detail: "Receiving incremental output from the current Copilot turn.",
+        log: "Copilot started streaming a response"
       });
     }),
     session.on("assistant.reasoning_delta", (event) => {
@@ -1095,6 +1533,7 @@ async function waitForCopilotTurn(session, prompt, workingDirectory) {
     writeRunLog("copilot.session.send.accepted");
     return await done;
   } finally {
+    orchestration?.clearAbortHandler();
     watchdog.clear();
     for (const unsubscribe of subscriptions) {
       unsubscribe();
@@ -1697,6 +2136,15 @@ function formatToolPath(value, workingDirectory) {
   }
 
   return path;
+}
+
+function normalizeRepositoryPath(value, workingDirectory) {
+  const normalized = formatToolPath(value, workingDirectory);
+  if (!normalized) {
+    return null;
+  }
+
+  return normalized.replace(/\\/g, "/").replace(/^\.\/+/, "");
 }
 
 function formatViewRange(value) {
