@@ -136,11 +136,12 @@ pub struct LspTextDocumentRequest {
 pub struct LspSymbolDetails {
     pub hover: Option<LspHoverResult>,
     pub signature_help: Option<LspSignatureHelp>,
+    pub definition_targets: Vec<LspDefinitionTarget>,
 }
 
 impl LspSymbolDetails {
     pub fn is_empty(&self) -> bool {
-        self.hover.is_none() && self.signature_help.is_none()
+        self.hover.is_none() && self.signature_help.is_none() && self.definition_targets.is_empty()
     }
 }
 
@@ -233,7 +234,13 @@ impl LspSessionManager {
             .map_err(|status| status.message.clone())?;
         let session = self.session_for(repo_root, &config)?;
         let capabilities = session.capabilities()?;
-        session.symbol_details(request, &capabilities)
+        let mut details = session.symbol_details(request, &capabilities)?;
+        if capabilities.definition_supported {
+            if let Ok(targets) = session.definition_targets(request, &capabilities) {
+                details.definition_targets = targets;
+            }
+        }
+        Ok(details)
     }
 
     pub fn definition(
@@ -469,6 +476,7 @@ impl LspSession {
         Ok(LspSymbolDetails {
             hover,
             signature_help,
+            definition_targets: Vec::new(),
         })
     }
 

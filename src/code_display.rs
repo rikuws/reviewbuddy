@@ -10,11 +10,13 @@ use std::{
 use gpui::prelude::*;
 use gpui::*;
 
+use crate::code_tour::DiffAnchor;
 use crate::lsp;
 use crate::markdown::render_markdown;
 use crate::state::{AppState, PreparedFileContent, PreparedFileLine};
 use crate::syntax::{self, SyntaxSpan};
 use crate::theme::*;
+use crate::views::diff_view::ensure_selected_file_content_loaded;
 
 static CODE_BLOCK_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -157,7 +159,7 @@ pub fn build_prepared_file_lsp_context(
     let detail_key = app_state.active_pr_key.clone()?;
     let detail_state = app_state.detail_states.get(&detail_key)?;
     let local_repo_status = detail_state.local_repository_status.as_ref()?;
-    if !local_repo_status.ready_for_local_features {
+    if !local_repo_status.ready_for_snapshot_features() {
         return None;
     }
 
@@ -382,6 +384,10 @@ fn render_prepared_code_line_content(
         let hover_tokens = token_ranges.clone();
         let tooltip_context = lsp_context.clone();
         let tooltip_tokens = token_ranges.clone();
+        let click_context = lsp_context.clone();
+        let click_tokens = token_ranges.clone();
+        let click_ranges: Vec<std::ops::Range<usize>> =
+            token_ranges.iter().map(|t| t.byte_range.clone()).collect();
         let element_id = ElementId::Name(
             format!(
                 "prepared-code-lsp:{}:{}:{}",
@@ -391,6 +397,15 @@ fn render_prepared_code_line_content(
         );
 
         let interactive = InteractiveText::new(element_id, styled)
+            .on_click(click_ranges, move |range_ix, window, cx| {
+                let token = &click_tokens[range_ix];
+                let Some(query) =
+                    click_context.query_for_index(token.byte_range.start, click_tokens.as_ref())
+                else {
+                    return;
+                };
+                navigate_to_prepared_file_lsp_definition(query, window, cx);
+            })
             .on_hover(move |index, _event, window, cx| {
                 let Some(index) = index else {
                     return;
@@ -590,6 +605,74 @@ fn request_prepared_file_lsp_details(
         .detach();
 }
 
+fn navigate_to_prepared_file_lsp_definition(
+    query: PreparedFileLspQuery,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    // Try to read cached definition targets
+    let targets = query
+        .state
+        .read(cx)
+        .detail_states
+        .get(&query.detail_key)
+        .and_then(|detail_state| detail_state.lsp_symbol_states.get(&query.query_key))
+        .and_then(|symbol_state| symbol_state.details.as_ref())
+        .map(|details| details.definition_targets.clone());
+
+    if let Some(targets) = targets.filter(|t| !t.is_empty()) {
+        let target = &targets[0];
+        query.state.update(cx, |state, cx| {
+            state.selected_file_path = Some(target.path.clone());
+            state.selected_diff_anchor = Some(DiffAnchor {
+                file_path: target.path.clone(),
+                hunk_header: None,
+                line: Some(target.line as i64),
+                side: Some("RIGHT".to_string()),
+                thread_id: None,
+            });
+            cx.notify();
+        });
+        ensure_selected_file_content_loaded(&query.state, window, cx);
+        return;
+    }
+
+    // Not cached — fetch definition asynchronously, then navigate
+    let state = query.state.clone();
+    window
+        .spawn(cx, {
+            let lsp_session_manager = query.lsp_session_manager.clone();
+            let repo_root = query.repo_root.clone();
+            let request = query.request.clone();
+            async move |cx: &mut AsyncWindowContext| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { lsp_session_manager.definition(&repo_root, &request) })
+                    .await;
+
+                if let Ok(targets) = result {
+                    if let Some(target) = targets.first() {
+                        let target = target.clone();
+                        state
+                            .update(cx, |state, cx| {
+                                state.selected_file_path = Some(target.path.clone());
+                                state.selected_diff_anchor = Some(DiffAnchor {
+                                    file_path: target.path.clone(),
+                                    hunk_header: None,
+                                    line: Some(target.line as i64),
+                                    side: Some("RIGHT".to_string()),
+                                    thread_id: None,
+                                });
+                                cx.notify();
+                            })
+                            .ok();
+                    }
+                }
+            }
+        })
+        .detach();
+}
+
 struct PreparedFileLspHoverTooltipView {
     state: Entity<AppState>,
     detail_key: String,
@@ -776,6 +859,28 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails) -> AnyElement {
                     .when_some(signature.documentation.as_deref(), |el, documentation| {
                         el.child(render_markdown(documentation))
                     }),
+            )
+        })
+        .when(!details.definition_targets.is_empty(), |el| {
+            el.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_family("Fira Code")
+                            .text_color(accent())
+                            .child("DEFINITION"),
+                    )
+                    .children(details.definition_targets.iter().map(|target| {
+                        div()
+                            .font_family("Fira Code")
+                            .text_size(px(12.0))
+                            .text_color(fg_default())
+                            .child(format!("{}:{}", target.path, target.line))
+                    })),
             )
         })
         .into_any_element()

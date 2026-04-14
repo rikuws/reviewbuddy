@@ -23,17 +23,47 @@ fn theme_set() -> &'static ThemeSet {
     SET.get_or_init(ThemeSet::load_defaults)
 }
 
+fn find_syntax_by_hint<'a>(ss: &'a SyntaxSet, hint: &str) -> Option<&'a SyntaxReference> {
+    ss.find_syntax_by_token(hint)
+        .or_else(|| ss.find_syntax_by_name(hint))
+}
+
+fn syntax_aliases(hint: &str) -> &'static [&'static str] {
+    if hint.eq_ignore_ascii_case("ts")
+        || hint.eq_ignore_ascii_case("tsx")
+        || hint.eq_ignore_ascii_case("mts")
+        || hint.eq_ignore_ascii_case("cts")
+        || hint.eq_ignore_ascii_case("typescript")
+        || hint.eq_ignore_ascii_case("typescriptreact")
+        || hint.eq_ignore_ascii_case("jsx")
+        || hint.eq_ignore_ascii_case("javascriptreact")
+    {
+        &["JavaScript", "js"]
+    } else {
+        &[]
+    }
+}
+
 fn find_syntax<'a>(ss: &'a SyntaxSet, file_path: &str) -> Option<&'a SyntaxReference> {
     let filename = file_path.rsplit('/').next().unwrap_or(file_path);
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .filter(|ext| !ext.is_empty() && *ext != filename);
 
-    ss.find_syntax_by_token(filename)
+    find_syntax_by_hint(ss, filename)
+        .or_else(|| ext.and_then(|ext| find_syntax_by_hint(ss, ext)))
         .or_else(|| {
-            let ext = filename.rsplit('.').next().unwrap_or("");
-            if !ext.is_empty() && ext != filename {
-                ss.find_syntax_by_extension(ext)
-            } else {
-                None
-            }
+            syntax_aliases(filename)
+                .iter()
+                .find_map(|alias| find_syntax_by_hint(ss, alias))
+        })
+        .or_else(|| {
+            ext.and_then(|ext| {
+                syntax_aliases(ext)
+                    .iter()
+                    .find_map(|alias| find_syntax_by_hint(ss, alias))
+            })
         })
         .filter(|s| s.name != "Plain Text")
 }
@@ -105,9 +135,10 @@ fn highlight_with_state(
                         b: style.foreground.b as f32 / 255.0,
                         a: style.foreground.a as f32 / 255.0,
                     };
+                    let color = boost_saturation(rgba.into());
                     Some(SyntaxSpan {
                         text,
-                        color: rgba.into(),
+                        color,
                         column_start,
                         column_end,
                     })
@@ -115,6 +146,23 @@ fn highlight_with_state(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Boost saturation of syntax colors to make highlighting more vivid.
+/// The base16-ocean.dark theme produces very muted colors (s: 0.12–0.42).
+/// This amplifies saturation while preserving the hue relationships, giving
+/// results closer to modern editor themes (IntelliJ, VS Code).
+fn boost_saturation(color: Hsla) -> Hsla {
+    // Don't touch near-gray text (comments, punctuation) — keep those subtle.
+    if color.s < 0.08 {
+        return color;
+    }
+    // Raise saturation towards ~0.65–0.85 range, capping at 1.0.
+    let boosted_s = (color.s * 2.2).min(1.0);
+    Hsla {
+        s: boosted_s,
+        ..color
+    }
 }
 
 #[cfg(test)]
@@ -139,6 +187,27 @@ mod tests {
             eprintln!("  [{:?}] {:?}", s.text, s.color);
         }
         assert!(!spans.is_empty(), "Should produce syntax spans for JS");
+    }
+
+    #[test]
+    fn test_typescript_highlighting_from_extension_and_language_hint() {
+        let file_spans = highlight_line("app.ts", "const answer: number = 42;");
+        assert!(
+            !file_spans.is_empty(),
+            "Expected syntax spans for TypeScript files"
+        );
+
+        let hint_spans = highlight_line("typescript", "const answer: number = 42;");
+        assert!(
+            !hint_spans.is_empty(),
+            "Expected syntax spans for TypeScript language hints"
+        );
+
+        let tsx_spans = highlight_line("tsx", "const view = props.children;");
+        assert!(
+            !tsx_spans.is_empty(),
+            "Expected syntax spans for TSX language hints"
+        );
     }
 
     #[test]

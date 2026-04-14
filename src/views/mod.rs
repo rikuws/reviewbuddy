@@ -1,4 +1,4 @@
-mod diff_view;
+pub(crate) mod diff_view;
 mod palette;
 mod pr_detail;
 mod root;

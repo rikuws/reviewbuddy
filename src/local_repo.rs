@@ -27,6 +27,16 @@ pub struct LocalRepositoryStatus {
     pub message: String,
 }
 
+impl LocalRepositoryStatus {
+    pub fn ready_for_snapshot_features(&self) -> bool {
+        self.is_valid_repository && self.matches_expected_head && self.path.is_some()
+    }
+
+    pub fn should_prefer_worktree_contents(&self) -> bool {
+        self.ready_for_snapshot_features() && self.is_worktree_clean
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LocalRepositoryLink {
@@ -830,6 +840,8 @@ mod tests {
         assert!(status.matches_expected_head);
         assert!(!status.is_worktree_clean);
         assert!(!status.ready_for_local_features);
+        assert!(status.ready_for_snapshot_features());
+        assert!(!status.should_prefer_worktree_contents());
         assert!(status.message.contains("local changes"));
     }
 }
