@@ -475,11 +475,11 @@ fn build_file_step(detail: &PullRequestDetail, file: &PullRequestFile) -> Option
     let anchor = file_threads
         .iter()
         .find(|thread| !thread.is_resolved)
-        .and_then(|thread| resolve_review_thread_anchor(thread))
+        .and_then(|thread| review_thread_anchor(thread))
         .or_else(|| {
             file_threads
                 .first()
-                .and_then(|thread| resolve_review_thread_anchor(thread))
+                .and_then(|thread| review_thread_anchor(thread))
         })
         .or_else(|| parsed_file.and_then(first_anchor_for_parsed_file))
         .or_else(|| {
@@ -805,7 +805,7 @@ fn prioritize_review_threads(threads: &[PullRequestReviewThread]) -> Vec<PullReq
     prioritized
 }
 
-fn resolve_review_thread_anchor(thread: &PullRequestReviewThread) -> Option<DiffAnchor> {
+pub fn review_thread_anchor(thread: &PullRequestReviewThread) -> Option<DiffAnchor> {
     if thread.subject_type == "FILE" {
         return Some(DiffAnchor {
             file_path: thread.path.clone(),

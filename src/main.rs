@@ -1,3 +1,4 @@
+mod app_storage;
 mod app_assets;
 mod cache;
 mod code_display;
@@ -20,9 +21,10 @@ mod views;
 use gpui::*;
 
 use app_assets::AppAssets;
+use app_storage::cache_path;
 use cache::CacheStore;
 use platform_macos::apply_app_icon;
-use state::{cache_path, AppState};
+use state::AppState;
 use views::RootView;
 
 fn main() {

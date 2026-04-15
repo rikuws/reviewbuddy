@@ -6,10 +6,9 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{cache::CacheStore, gh};
+use crate::{app_storage, cache::CacheStore, gh};
 
 const LOCAL_REPO_LINK_KEY_PREFIX: &str = "local-repo-link-v1:";
-const MANAGED_REPO_DIRECTORY_NAME: &str = "managed-repositories";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -130,10 +129,7 @@ fn inspect_repository_candidate(
         let message = if source == "linked" {
             "The linked checkout no longer exists. Pick another folder or switch back to the app-managed checkout.".to_string()
         } else {
-            format!(
-                "The app will create and manage a hidden checkout in {} when a pull request needs local code context.",
-                candidate.display()
-            )
+            "The app will create and manage a hidden checkout when a pull request needs local code context.".to_string()
         };
 
         return Ok(LocalRepositoryStatus {
@@ -154,15 +150,9 @@ fn inspect_repository_candidate(
     let root = resolve_git_root(&candidate)?;
     let Some(root) = root else {
         let message = if source == "linked" {
-            format!(
-                "'{}' is not a git repository. Pick the repository root or any folder inside it.",
-                candidate.display()
-            )
+            "The linked checkout is not a git repository. Pick the repository root or any folder inside it.".to_string()
         } else {
-            format!(
-                "The app-managed checkout at '{}' is missing its git metadata. Remove the folder and try again.",
-                candidate.display()
-            )
+            "The app-managed checkout is missing its git metadata. Remove it from app storage and try again.".to_string()
         };
 
         return Ok(LocalRepositoryStatus {
@@ -183,14 +173,12 @@ fn inspect_repository_candidate(
     if !repository_matches_git_remote(repository, &root)? {
         let message = if source == "linked" {
             format!(
-                "{} does not match {}. Use a clone whose remotes point at that repository.",
-                root.display(),
+                "The linked checkout does not match {}. Use a clone whose remotes point at that repository.",
                 repository
             )
         } else {
             format!(
-                "The app-managed checkout at {} does not match {}. Remove the folder and try again.",
-                root.display(),
+                "The app-managed checkout does not match {}. Remove it from app storage and try again.",
                 repository
             )
         };
@@ -222,53 +210,34 @@ fn inspect_repository_candidate(
         if !matches_expected_head {
             if source == "linked" {
                 format!(
-                    "The linked checkout at {} is on {}, but this pull request expects {}. Check out the PR head commit or switch back to the app-managed checkout.",
-                    root.display(),
+                    "The linked checkout is on {}, but this pull request expects {}. Check out the PR head commit or switch back to the app-managed checkout.",
                     current_head_oid.as_deref().unwrap_or("unknown"),
                     expected_head
                 )
             } else {
                 format!(
-                    "The app-managed checkout at {} is out of date. The app will refresh it to pull request head {} before local code features run.",
-                    root.display(),
+                    "The app-managed checkout is out of date. The app will refresh it to pull request head {} before local code features run.",
                     expected_head
                 )
             }
         } else if !is_worktree_clean {
             if source == "linked" {
-                format!(
-                    "The linked checkout at {} has local changes. Commit, stash, or discard them before using local code features, or switch back to the app-managed checkout.",
-                    root.display()
-                )
+                "The linked checkout has local changes. Commit, stash, or discard them before using local code features, or switch back to the app-managed checkout.".to_string()
             } else {
-                format!(
-                    "The app-managed checkout at {} has local changes. Remove that folder and let the app recreate it for local code features.",
-                    root.display()
-                )
+                "The app-managed checkout has local changes. Remove it from app storage and let the app recreate it for local code features.".to_string()
             }
         } else {
-            default_message.unwrap_or_else(|| {
-                format!(
-                    "Using {} at pull request head {}.",
-                    root.display(),
-                    expected_head
-                )
-            })
+            default_message
+                .unwrap_or_else(|| format!("Using your checkout at pull request head {}.", expected_head))
         }
     } else if !is_worktree_clean {
         if source == "linked" {
-            format!(
-                "The linked checkout at {} has local changes. Commit, stash, or discard them before using local code features.",
-                root.display()
-            )
+            "The linked checkout has local changes. Commit, stash, or discard them before using local code features.".to_string()
         } else {
-            format!(
-                "The app-managed checkout at {} has local changes. Remove that folder and let the app recreate it.",
-                root.display()
-            )
+            "The app-managed checkout has local changes. Remove it from app storage and let the app recreate it.".to_string()
         }
     } else {
-        default_message.unwrap_or_else(|| format!("Using {}.", root.display()))
+        default_message.unwrap_or_else(|| "Using your checkout.".to_string())
     };
 
     Ok(LocalRepositoryStatus {
@@ -315,10 +284,7 @@ fn ensure_managed_repository(repository: &str) -> Result<PathBuf, String> {
 
     if target.exists() {
         let root = resolve_git_root(&target)?.ok_or_else(|| {
-            format!(
-                "The app-managed checkout at '{}' is missing its git metadata. Remove the folder and try again.",
-                target.display()
-            )
+            "The app-managed checkout is missing its git metadata. Remove it from app storage and try again.".to_string()
         })?;
 
         if repository_matches_git_remote(repository, &root)? {
@@ -326,24 +292,19 @@ fn ensure_managed_repository(repository: &str) -> Result<PathBuf, String> {
         }
 
         return Err(format!(
-            "The app-managed checkout at {} does not match {}. Remove the folder and try again.",
-            root.display(),
+            "The app-managed checkout does not match {}. Remove it from app storage and try again.",
             repository
         ));
     }
 
     let Some(parent) = target.parent() else {
-        return Err(format!(
-            "Failed to resolve the parent folder for the app-managed checkout '{}'.",
-            target.display()
-        ));
+        return Err(
+            "Failed to resolve the app-managed checkout folder inside app storage.".to_string(),
+        );
     };
 
     fs::create_dir_all(parent).map_err(|error| {
-        format!(
-            "Failed to create the app-managed checkout folder '{}': {error}",
-            parent.display()
-        )
+        format!("Failed to create the app-managed checkout folder in app storage: {error}")
     })?;
 
     let output = gh::run_owned(vec![
@@ -361,18 +322,14 @@ fn ensure_managed_repository(repository: &str) -> Result<PathBuf, String> {
     }
 
     let root = resolve_git_root(&target)?.ok_or_else(|| {
-        format!(
-            "The app-managed checkout at '{}' was created but is not a git repository.",
-            target.display()
-        )
+        "The app-managed checkout was created but is not a git repository.".to_string()
     })?;
 
     if repository_matches_git_remote(repository, &root)? {
         Ok(root)
     } else {
         Err(format!(
-            "The app-managed checkout at {} does not match {}.",
-            root.display(),
+            "The app-managed checkout does not match {}.",
             repository
         ))
     }
@@ -417,8 +374,7 @@ fn sync_managed_repository_to_pull_request(
         return Err(combine_process_error(
             output,
             &format!(
-                "Failed to update the app-managed checkout at {} to pull request #{pull_request_number} for {repository}",
-                root.display()
+                "Failed to update the app-managed checkout to pull request #{pull_request_number} for {repository}"
             ),
         ));
     }
@@ -427,8 +383,7 @@ fn sync_managed_repository_to_pull_request(
         let current_head = current_head_oid(root)?.unwrap_or_else(|| "unknown".to_string());
         if current_head != expected_head {
             return Err(format!(
-                "The app-managed checkout at {} did not reach pull request #{pull_request_number}. Expected HEAD {expected_head}, but found {current_head}.",
-                root.display()
+                "The app-managed checkout did not reach pull request #{pull_request_number}. Expected HEAD {expected_head}, but found {current_head}.",
             ));
         }
     }
@@ -533,18 +488,7 @@ fn repository_matches_git_remote(repository: &str, path: &Path) -> Result<bool, 
 }
 
 fn managed_repository_path(repository: &str) -> Result<PathBuf, String> {
-    let base = if let Some(data_dir) = dirs::data_local_dir() {
-        data_dir
-            .join("gh-ui-tool")
-            .join(MANAGED_REPO_DIRECTORY_NAME)
-    } else {
-        std::env::current_dir()
-            .map_err(|error| format!("Failed to resolve the current working directory: {error}"))?
-            .join(".gh-ui-tool")
-            .join(MANAGED_REPO_DIRECTORY_NAME)
-    };
-
-    Ok(base.join(managed_repository_directory_name(repository)))
+    Ok(app_storage::managed_repositories_root().join(managed_repository_directory_name(repository)))
 }
 
 fn managed_repository_directory_name(repository: &str) -> String {
@@ -811,6 +755,9 @@ mod tests {
         assert!(!status.matches_expected_head);
         assert!(!status.ready_for_local_features);
         assert!(status.message.contains("expects"));
+        assert!(!status
+            .message
+            .contains(&repository.root.display().to_string()));
     }
 
     #[test]
@@ -843,5 +790,8 @@ mod tests {
         assert!(status.ready_for_snapshot_features());
         assert!(!status.should_prefer_worktree_contents());
         assert!(status.message.contains("local changes"));
+        assert!(!status
+            .message
+            .contains(&repository.root.display().to_string()));
     }
 }

@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cache::CacheStore;
@@ -263,6 +262,7 @@ pub struct AppState {
     pub review_loading: bool,
     pub review_message: Option<String>,
     pub review_success: bool,
+    pub pr_header_compact: bool,
 
     // Command palette
     pub palette_open: bool,
@@ -311,6 +311,7 @@ impl AppState {
             review_loading: false,
             review_message: None,
             review_success: false,
+            pr_header_compact: false,
             palette_open: false,
             palette_query: String::new(),
             code_tour_provider_statuses: Vec::new(),
@@ -428,13 +429,4 @@ impl AppState {
             .iter()
             .find(|q| q.id == "authored")
     }
-}
-
-pub fn cache_path() -> PathBuf {
-    if let Some(data_dir) = dirs::data_local_dir() {
-        return data_dir.join("gh-ui-tool").join("cache.sqlite3");
-    }
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".gh-ui-tool-cache.sqlite3")
 }

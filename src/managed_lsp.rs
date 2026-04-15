@@ -14,8 +14,8 @@ use sha1::{Digest, Sha1};
 use tar::Archive;
 use zip::ZipArchive;
 
-const APP_DATA_DIR: &str = "gh-ui-tool";
-const MANAGED_LSP_DIR: &str = "lsp-servers";
+use crate::app_storage;
+
 const USER_AGENT: &str = concat!("gh-ui/", env!("CARGO_PKG_VERSION"));
 const MINIMUM_JDTLS_JAVA_MAJOR_VERSION: u32 = 21;
 
@@ -88,7 +88,6 @@ pub enum ManagedServerInstallState {
 pub struct ManagedServerInstallStatus {
     pub state: ManagedServerInstallState,
     pub version: Option<String>,
-    pub install_dir: Option<String>,
     pub detail: String,
 }
 
@@ -176,29 +175,34 @@ pub fn install_managed_server(
         .lock()
         .map_err(|_| "Managed LSP installer is unavailable.".to_string())?;
 
-    match kind {
-        ManagedServerKind::RustAnalyzer => {
-            install_rust_analyzer()?;
+    let result = (|| -> Result<(), String> {
+        match kind {
+            ManagedServerKind::RustAnalyzer => {
+                install_rust_analyzer()?;
+            }
+            ManagedServerKind::TypescriptLanguageServer => {
+                install_typescript_language_server()?;
+            }
+            ManagedServerKind::Pyright => {
+                install_pyright()?;
+            }
+            ManagedServerKind::Gopls => {
+                install_gopls()?;
+            }
+            ManagedServerKind::KotlinLsp => {
+                install_kotlin_lsp()?;
+            }
+            ManagedServerKind::Jdtls => {
+                ensure_jdtls_installed()?;
+            }
+            ManagedServerKind::Roslyn => {
+                install_roslyn()?;
+            }
         }
-        ManagedServerKind::TypescriptLanguageServer => {
-            install_typescript_language_server()?;
-        }
-        ManagedServerKind::Pyright => {
-            install_pyright()?;
-        }
-        ManagedServerKind::Gopls => {
-            install_gopls()?;
-        }
-        ManagedServerKind::KotlinLsp => {
-            install_kotlin_lsp()?;
-        }
-        ManagedServerKind::Jdtls => {
-            ensure_jdtls_installed()?;
-        }
-        ManagedServerKind::Roslyn => {
-            install_roslyn()?;
-        }
-    }
+        Ok(())
+    })();
+
+    result.map_err(|error| sanitize_managed_server_message(&error))?;
 
     Ok(inspect_managed_server(kind))
 }
@@ -839,17 +843,12 @@ fn inspect_command_record(kind: ManagedServerKind) -> ManagedServerInstallStatus
         Ok(Some(record)) => {
             let command = PathBuf::from(&record.command_path);
             if command.is_file() {
-                installed_status(
-                    &record,
-                    format!("Installed and ready at '{}'.", command.display()),
-                )
+                installed_status(&record, "Installed and ready.".to_string())
             } else {
                 broken_status(
                     &record,
-                    format!(
-                        "Managed install metadata exists, but '{}' is missing.",
-                        command.display()
-                    ),
+                    "Managed install metadata exists, but the server executable is missing."
+                        .to_string(),
                 )
             }
         }
@@ -869,10 +868,8 @@ fn inspect_node_hosted_record(
             if !entrypoint.is_file() {
                 return broken_status(
                     &record,
-                    format!(
-                        "Managed install metadata exists, but '{}' is missing.",
-                        entrypoint.display()
-                    ),
+                    "Managed install metadata exists, but the server files are missing."
+                        .to_string(),
                 );
             }
 
@@ -882,7 +879,8 @@ fn inspect_node_hosted_record(
                     match node_runtime_paths_for_install_dir(&node_install_dir) {
                         Ok(_) => installed_status(
                             &record,
-                            format!("Installed with app-managed Node.js at '{}'.", install_dir.display()),
+                            "Installed and ready with the app-managed Node.js runtime."
+                                .to_string(),
                         ),
                         Err(error) => broken_status(
                             &record,
@@ -915,18 +913,13 @@ fn inspect_jdtls_record() -> ManagedServerInstallStatus {
             if !install_dir.is_dir() {
                 return broken_status(
                     &record,
-                    format!(
-                        "Managed install metadata exists, but '{}' is missing.",
-                        install_dir.display()
-                    ),
+                    "Managed install metadata exists, but the JDTLS files are missing."
+                        .to_string(),
                 );
             }
 
             match find_jdtls_launcher_jar(&install_dir) {
-                Ok(_) => installed_status(
-                    &record,
-                    format!("Installed and ready at '{}'.", install_dir.display()),
-                ),
+                Ok(_) => installed_status(&record, "Installed and ready.".to_string()),
                 Err(error) => broken_status(&record, error),
             }
         }
@@ -939,7 +932,6 @@ fn not_installed_status(detail: String) -> ManagedServerInstallStatus {
     ManagedServerInstallStatus {
         state: ManagedServerInstallState::NotInstalled,
         version: None,
-        install_dir: None,
         detail,
     }
 }
@@ -948,8 +940,7 @@ fn installed_status(record: &InstalledServerRecord, detail: String) -> ManagedSe
     ManagedServerInstallStatus {
         state: ManagedServerInstallState::Installed,
         version: Some(record.version.clone()),
-        install_dir: Some(record.install_dir.clone()),
-        detail,
+        detail: sanitize_managed_server_message(&detail),
     }
 }
 
@@ -957,8 +948,7 @@ fn broken_status(record: &InstalledServerRecord, detail: String) -> ManagedServe
     ManagedServerInstallStatus {
         state: ManagedServerInstallState::Broken,
         version: Some(record.version.clone()),
-        install_dir: Some(record.install_dir.clone()),
-        detail,
+        detail: sanitize_managed_server_message(&detail),
     }
 }
 
@@ -966,9 +956,39 @@ fn broken_status_without_record(detail: String) -> ManagedServerInstallStatus {
     ManagedServerInstallStatus {
         state: ManagedServerInstallState::Broken,
         version: None,
-        install_dir: None,
-        detail,
+        detail: sanitize_managed_server_message(&detail),
     }
+}
+
+fn sanitize_managed_server_message(message: &str) -> String {
+    let storage_root = app_storage::data_dir_root().display().to_string();
+    if storage_root.is_empty() {
+        return message.to_string();
+    }
+
+    let mut sanitized = String::with_capacity(message.len());
+    let mut index = 0usize;
+
+    while let Some(start_offset) = message[index..].find('\'') {
+        let start = index + start_offset;
+        let Some(end_offset) = message[start + 1..].find('\'') else {
+            sanitized.push_str(&message[index..]);
+            return sanitized.replace(&storage_root, "app storage");
+        };
+        let end = start + 1 + end_offset;
+        let segment = &message[start + 1..end];
+
+        sanitized.push_str(&message[index..start]);
+        if segment.contains(&storage_root) {
+            sanitized.push_str("'app storage'");
+        } else {
+            sanitized.push_str(&message[start..=end]);
+        }
+        index = end + 1;
+    }
+
+    sanitized.push_str(&message[index..]);
+    sanitized.replace(&storage_root, "app storage")
 }
 
 fn resolve_roslyn_command_path(install_dir: &Path, rid: &str) -> Result<PathBuf, String> {
@@ -1173,11 +1193,7 @@ fn node_runtime_paths_for_install_dir(install_dir: &Path) -> Result<NodeRuntimeP
         install_dir.join("bin").join("node")
     };
     if !node.is_file() {
-        return Err(format!(
-            "Managed Node.js installed to '{}', but '{}' is missing.",
-            install_dir.display(),
-            node.display()
-        ));
+        return Err("Managed Node.js runtime is missing the node executable.".to_string());
     }
 
     let npm = if env::consts::OS == "windows" {
@@ -1186,11 +1202,7 @@ fn node_runtime_paths_for_install_dir(install_dir: &Path) -> Result<NodeRuntimeP
         install_dir.join("bin").join("npm")
     };
     if !npm.is_file() {
-        return Err(format!(
-            "Managed Node.js installed to '{}', but '{}' is missing.",
-            install_dir.display(),
-            npm.display()
-        ));
+        return Err("Managed Node.js runtime is missing the npm executable.".to_string());
     }
 
     Ok(NodeRuntimePaths {
@@ -1253,10 +1265,7 @@ fn find_file_in_tree(root: &Path, file_name: &str) -> Option<PathBuf> {
 fn find_jdtls_launcher_jar(install_dir: &Path) -> Result<PathBuf, String> {
     let plugins_dir = install_dir.join("plugins");
     if !plugins_dir.is_dir() {
-        return Err(format!(
-            "JDTLS plugins directory '{}' does not exist.",
-            plugins_dir.display()
-        ));
+        return Err("JDTLS is missing its plugins directory.".to_string());
     }
 
     let exact = plugins_dir.join("org.eclipse.equinox.launcher.jar");
@@ -1265,7 +1274,7 @@ fn find_jdtls_launcher_jar(install_dir: &Path) -> Result<PathBuf, String> {
     }
 
     fs::read_dir(&plugins_dir)
-        .map_err(|error| format!("Failed to read '{}': {error}", plugins_dir.display()))?
+        .map_err(|error| format!("Failed to read the JDTLS plugins directory: {error}"))?
         .filter_map(Result::ok)
         .map(|entry| entry.path())
         .find(|path| {
@@ -1277,12 +1286,7 @@ fn find_jdtls_launcher_jar(install_dir: &Path) -> Result<PathBuf, String> {
                         name.starts_with("org.eclipse.equinox.launcher_") && name.ends_with(".jar")
                     })
         })
-        .ok_or_else(|| {
-            format!(
-                "Could not find an Equinox launcher jar in '{}'.",
-                plugins_dir.display()
-            )
-        })
+        .ok_or_else(|| "Could not find an Equinox launcher jar for JDTLS.".to_string())
 }
 
 fn jdtls_config_dir_name() -> &'static str {
@@ -1381,12 +1385,7 @@ fn roslyn_rid() -> &'static str {
 }
 
 fn managed_servers_root() -> PathBuf {
-    if let Some(data_dir) = dirs::data_local_dir() {
-        return data_dir.join(APP_DATA_DIR).join(MANAGED_LSP_DIR);
-    }
-    env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".gh-ui-tool-lsp-servers")
+    app_storage::managed_servers_root()
 }
 
 fn managed_install_lock() -> &'static Mutex<()> {
@@ -1424,20 +1423,12 @@ fn read_installed_record(path: &Path) -> Result<Option<InstalledServerRecord>, S
     let bytes = match fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(format!(
-                "Failed to read managed server metadata '{}': {error}",
-                path.display()
-            ))
-        }
+        Err(error) => return Err(format!("Failed to read managed server metadata: {error}")),
     };
 
-    serde_json::from_slice(&bytes).map(Some).map_err(|error| {
-        format!(
-            "Failed to parse managed server metadata '{}': {error}",
-            path.display()
-        )
-    })
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| format!("Failed to parse managed server metadata: {error}"))
 }
 
 fn write_installed_server_record(
@@ -1450,21 +1441,14 @@ fn write_installed_server_record(
 fn write_installed_record(path: &Path, record: &InstalledServerRecord) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| {
-            format!(
-                "Failed to create managed server metadata directory '{}': {error}",
-                parent.display()
-            )
+            format!("Failed to create the managed server metadata directory: {error}")
         })?;
     }
 
     let json = serde_json::to_vec_pretty(record)
         .map_err(|error| format!("Failed to serialize managed server metadata: {error}"))?;
-    fs::write(&path, json).map_err(|error| {
-        format!(
-            "Failed to write managed server metadata '{}': {error}",
-            path.display()
-        )
-    })
+    fs::write(&path, json)
+        .map_err(|error| format!("Failed to write managed server metadata: {error}"))
 }
 
 fn cleanup_other_versions(kind: ManagedServerKind, keep_name: Option<&str>) -> Result<(), String> {

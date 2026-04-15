@@ -31,6 +31,7 @@ use super::sections::{
 pub fn enter_tour_surface(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
     state.update(cx, |s, cx| {
         s.active_surface = PullRequestSurface::Tour;
+        s.pr_header_compact = false;
         s.active_tour_outline_id = "overview".to_string();
         s.collapsed_tour_panels.clear();
         cx.notify();
@@ -1216,6 +1217,7 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
                         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                             state.update(cx, |state, cx| {
                                 state.active_tour_outline_id = id.clone();
+                                state.pr_header_compact = target_index > 0;
                                 cx.notify();
                             });
                             scroll_handle.scroll_to_top_of_item(target_index);
@@ -1266,8 +1268,12 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
                                 return;
                             }
 
-                            if state.active_tour_outline_id != active_id {
+                            let compact = top_item > 0;
+                            if state.active_tour_outline_id != active_id
+                                || state.pr_header_compact != compact
+                            {
                                 state.active_tour_outline_id = active_id.clone();
+                                state.pr_header_compact = compact;
                                 cx.notify();
                             }
                         });
@@ -1637,7 +1643,7 @@ fn render_tour_progress_panel(
         })
 }
 
-fn render_tour_log_location(log_file_path: &str) -> impl IntoElement {
+fn render_tour_log_location(_log_file_path: &str) -> impl IntoElement {
     div()
         .mt(px(12.0))
         .flex()
@@ -1655,8 +1661,7 @@ fn render_tour_log_location(log_file_path: &str) -> impl IntoElement {
             div()
                 .text_size(px(12.0))
                 .text_color(fg_muted())
-                .font_family("Fira Code")
-                .child(log_file_path.to_string()),
+                .child("A detailed debug log is available in app storage."),
         )
 }
 

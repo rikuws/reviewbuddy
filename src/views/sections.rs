@@ -1086,6 +1086,7 @@ pub fn open_pull_request(
         s.review_body.clear();
         s.review_message = None;
         s.review_success = false;
+        s.pr_header_compact = false;
         s.active_tour_outline_id = "overview".to_string();
         s.collapsed_tour_panels.clear();
 

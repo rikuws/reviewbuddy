@@ -418,15 +418,13 @@ fn render_prepared_code_line_content(
             })
             .tooltip(move |index, _window, cx| {
                 let query = tooltip_context.query_for_index(index, tooltip_tokens.as_ref())?;
-                Some(AnyView::from(cx.new(move |cx| {
-                    PreparedFileLspHoverTooltipView::new(
-                        query.state.clone(),
-                        query.detail_key.clone(),
-                        query.query_key.clone(),
-                        query.token_label.clone(),
-                        cx,
-                    )
-                })))
+                Some(build_lsp_hover_tooltip_view(
+                    query.state.clone(),
+                    query.detail_key.clone(),
+                    query.query_key.clone(),
+                    query.token_label.clone(),
+                    cx,
+                ))
             });
 
         return code_div.child(interactive);
@@ -673,14 +671,26 @@ fn navigate_to_prepared_file_lsp_definition(
         .detach();
 }
 
-struct PreparedFileLspHoverTooltipView {
+pub fn build_lsp_hover_tooltip_view(
+    state: Entity<AppState>,
+    detail_key: String,
+    query_key: String,
+    token_label: String,
+    cx: &mut App,
+) -> AnyView {
+    AnyView::from(cx.new(move |cx| {
+        SharedLspHoverTooltipView::new(state, detail_key, query_key, token_label, cx)
+    }))
+}
+
+struct SharedLspHoverTooltipView {
     state: Entity<AppState>,
     detail_key: String,
     query_key: String,
     token_label: String,
 }
 
-impl PreparedFileLspHoverTooltipView {
+impl SharedLspHoverTooltipView {
     fn new(
         state: Entity<AppState>,
         detail_key: String,
@@ -702,7 +712,7 @@ impl PreparedFileLspHoverTooltipView {
     }
 }
 
-impl Render for PreparedFileLspHoverTooltipView {
+impl Render for SharedLspHoverTooltipView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let app_state = self.state.read(cx);
         let symbol_state = app_state
@@ -711,8 +721,9 @@ impl Render for PreparedFileLspHoverTooltipView {
             .and_then(|detail_state| detail_state.lsp_symbol_states.get(&self.query_key));
 
         div()
-            .w(px(360.0))
-            .max_w(px(420.0))
+            .w(px(440.0))
+            .max_w(px(560.0))
+            .min_w(px(360.0))
             .rounded(radius())
             .border_1()
             .border_color(border_default())
@@ -731,9 +742,14 @@ impl Render for PreparedFileLspHoverTooltipView {
                     .gap(px(8.0))
                     .child(
                         div()
+                            .flex_grow()
+                            .min_w_0()
                             .font_family("Fira Code")
                             .text_size(px(12.0))
                             .text_color(fg_emphasis())
+                            .text_ellipsis()
+                            .whitespace_nowrap()
+                            .overflow_x_hidden()
                             .child(self.token_label.clone()),
                     )
                     .child(
@@ -750,7 +766,11 @@ impl Render for PreparedFileLspHoverTooltipView {
             )
             .child(
                 div()
-                    .max_h(px(320.0))
+                    .id("lsp-hover-scroll")
+                    .max_h(px(480.0))
+                    .overflow_y_scroll()
+                    .w_full()
+                    .min_w_0()
                     .px(px(12.0))
                     .py(px(10.0))
                     .flex()
@@ -799,28 +819,28 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails) -> AnyElement {
     }
 
     div()
+        .w_full()
+        .min_w_0()
         .flex()
         .flex_col()
-        .gap(px(10.0))
+        .gap(px(12.0))
         .when_some(details.hover.as_ref(), |el, hover| {
             el.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .font_family("Fira Code")
-                            .text_color(accent())
-                            .child("HOVER"),
-                    )
-                    .child(render_markdown(&hover.markdown)),
+                    .child(render_lsp_section_label("HOVER"))
+                    .child(div().w_full().min_w_0().child(render_markdown(&hover.markdown))),
             )
         })
         .when_some(details.signature_help.as_ref(), |el, signature| {
             el.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .gap(px(8.0))
@@ -829,13 +849,7 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails) -> AnyElement {
                             .flex()
                             .items_center()
                             .gap(px(8.0))
-                            .child(
-                                div()
-                                    .text_size(px(11.0))
-                                    .font_family("Fira Code")
-                                    .text_color(accent())
-                                    .child("SIGNATURE"),
-                            )
+                            .child(render_lsp_section_label("SIGNATURE"))
                             .when_some(signature.active_parameter.as_ref(), |el, parameter| {
                                 el.child(
                                     div()
@@ -851,39 +865,49 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails) -> AnyElement {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .font_family("Fira Code")
                             .text_size(px(12.0))
                             .text_color(fg_default())
+                            .whitespace_normal()
                             .child(signature.label.clone()),
                     )
                     .when_some(signature.documentation.as_deref(), |el, documentation| {
-                        el.child(render_markdown(documentation))
+                        el.child(div().w_full().min_w_0().child(render_markdown(documentation)))
                     }),
             )
         })
         .when(!details.definition_targets.is_empty(), |el| {
             el.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .gap(px(6.0))
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .font_family("Fira Code")
-                            .text_color(accent())
-                            .child("DEFINITION"),
-                    )
+                    .child(render_lsp_section_label("DEFINITION"))
                     .children(details.definition_targets.iter().map(|target| {
                         div()
+                            .w_full()
+                            .min_w_0()
                             .font_family("Fira Code")
                             .text_size(px(12.0))
                             .text_color(fg_default())
+                            .whitespace_normal()
                             .child(format!("{}:{}", target.path, target.line))
                     })),
             )
         })
         .into_any_element()
+}
+
+fn render_lsp_section_label(label: &str) -> impl IntoElement {
+    div()
+        .text_size(px(11.0))
+        .font_family("Fira Code")
+        .text_color(accent())
+        .child(label.to_string())
 }
 
 fn prepared_excerpt_range(

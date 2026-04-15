@@ -1,6 +1,7 @@
 use gpui::prelude::*;
 use gpui::*;
 
+use crate::app_storage;
 use crate::managed_lsp::{
     self, ManagedServerInstallState, ManagedServerInstallStatus, ManagedServerKind,
 };
@@ -138,6 +139,7 @@ pub fn render_settings_view(state: &Entity<AppState>, cx: &App) -> impl IntoElem
     let settings = &s.managed_lsp_settings;
     let loading = settings.loading;
     let loaded = settings.loaded;
+    let storage_root = app_storage::data_dir_root();
 
     div()
         .p(px(40.0))
@@ -201,6 +203,36 @@ pub fn render_settings_view(state: &Entity<AppState>, cx: &App) -> impl IntoElem
             ))
         })
         .child(
+            panel().child(
+                div()
+                    .p(px(24.0))
+                    .px(px(32.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg_emphasis())
+                            .child("Storage"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(fg_muted())
+                            .child("App-managed files are stored here."),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_family("Fira Code")
+                            .text_color(fg_subtle())
+                            .child(storage_root.display().to_string()),
+                    ),
+            ),
+        )
+        .child(
             div()
                 .flex()
                 .flex_col()
@@ -227,7 +259,6 @@ fn render_managed_lsp_card(
             .unwrap_or_else(|| ManagedServerInstallStatus {
                 state: ManagedServerInstallState::NotInstalled,
                 version: None,
-                install_dir: None,
                 detail: "Status has not been checked yet.".to_string(),
             });
     let installing = settings.installing.contains(&kind);
@@ -280,15 +311,6 @@ fn render_managed_lsp_card(
                             .text_color(fg_muted())
                             .child(status.detail),
                     )
-                    .when_some(status.install_dir.clone(), |el, install_dir| {
-                        el.child(
-                            div()
-                                .text_size(px(11.0))
-                                .font_family("Fira Code")
-                                .text_color(fg_subtle())
-                                .child(install_dir),
-                        )
-                    })
                     .when_some(kind.runtime_note(), |el, note| {
                         el.child(
                             div()
