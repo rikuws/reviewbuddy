@@ -91,10 +91,25 @@ pub fn ensure_local_repository_for_pull_request(
     )?;
 
     if status.ready_for_local_features {
-        Ok(status)
-    } else {
-        Err(status.message.clone())
+        return Ok(status);
     }
+
+    if status.source == "linked" {
+        let managed_status = load_or_prepare_managed_repository_for_pull_request(
+            cache,
+            repository,
+            pull_request_number,
+            head_ref_oid,
+        )?;
+
+        if managed_status.ready_for_local_features {
+            return Ok(managed_status);
+        }
+
+        return Err(managed_status.message.clone());
+    }
+
+    Err(status.message.clone())
 }
 
 fn resolve_local_repository_status(
@@ -266,6 +281,26 @@ fn prepare_local_repository_for_pull_request(
     head_ref_oid: Option<&str>,
 ) -> Result<PathBuf, String> {
     ensure_managed_repository_for_pull_request(repository, pull_request_number, head_ref_oid)
+}
+
+fn load_or_prepare_managed_repository_for_pull_request(
+    cache: &CacheStore,
+    repository: &str,
+    pull_request_number: i64,
+    head_ref_oid: Option<&str>,
+) -> Result<LocalRepositoryStatus, String> {
+    let status = inspect_managed_repository_candidate(repository, head_ref_oid)?;
+    if status.ready_for_local_features {
+        return Ok(status);
+    }
+
+    prepare_local_repository_for_pull_request(
+        cache,
+        repository,
+        pull_request_number,
+        head_ref_oid,
+    )?;
+    inspect_managed_repository_candidate(repository, head_ref_oid)
 }
 
 fn inspect_managed_repository_candidate(
@@ -578,8 +613,9 @@ mod tests {
     use crate::cache::CacheStore;
 
     use super::{
-        load_local_repository_status_for_pull_request, local_repo_link_key,
-        managed_repository_directory_name, normalized_remote_repository, LocalRepositoryLink,
+        ensure_local_repository_for_pull_request, load_local_repository_status_for_pull_request,
+        local_repo_link_key, managed_repository_directory_name, managed_repository_path,
+        normalized_remote_repository, LocalRepositoryLink,
     };
 
     static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
@@ -682,6 +718,37 @@ mod tests {
         }
 
         String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn create_managed_clone(repository: &str, source: &Path) -> PathBuf {
+        let managed_path = managed_repository_path(repository).expect("failed to resolve path");
+        if managed_path.exists() {
+            fs::remove_dir_all(&managed_path).expect("failed to remove existing managed repo");
+        }
+        if let Some(parent) = managed_path.parent() {
+            fs::create_dir_all(parent).expect("failed to create managed repo parent");
+        }
+
+        let output = Command::new("git")
+            .arg("clone")
+            .arg(source)
+            .arg(&managed_path)
+            .output()
+            .expect("failed to clone managed repo");
+
+        if !output.status.success() {
+            panic!(
+                "git clone failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let remote_url = format!("git@github.com:{repository}.git");
+        run_git(
+            &managed_path,
+            ["remote", "set-url", "origin", remote_url.as_str()],
+        );
+        managed_path
     }
 
     #[test]
@@ -800,5 +867,46 @@ mod tests {
         assert!(!status
             .message
             .contains(&repository.root.display().to_string()));
+    }
+
+    #[test]
+    fn ensure_local_repository_falls_back_to_managed_checkout_when_linked_repo_is_dirty() {
+        let repository_name = format!(
+            "openai/example-fallback-{}",
+            NEXT_TEST_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let linked_repository = GitTestRepository::new(&repository_name);
+        linked_repository.write_file("src/lib.rs", "pub fn value() -> i32 { 1 }\n");
+        let head = linked_repository.commit_all("initial");
+        linked_repository.write_file("src/lib.rs", "pub fn value() -> i32 { 2 }\n");
+
+        let managed_path = create_managed_clone(&repository_name, &linked_repository.root);
+        let cache =
+            CacheStore::new(unique_test_directory("local-repo-cache").join("cache.sqlite3"))
+                .expect("failed to create cache");
+        cache
+            .put(
+                &local_repo_link_key(&repository_name),
+                &LocalRepositoryLink {
+                    path: linked_repository.root.display().to_string(),
+                },
+                0,
+            )
+            .expect("failed to write link");
+
+        let status =
+            ensure_local_repository_for_pull_request(&cache, &repository_name, 42, Some(&head))
+                .expect("failed to ensure repository");
+
+        assert_eq!(status.source, "managed");
+        assert!(status.ready_for_local_features);
+        assert!(status.is_worktree_clean);
+        assert_eq!(status.current_head_oid.as_deref(), Some(head.as_str()));
+        assert_eq!(
+            status.path.as_deref(),
+            Some(managed_path.to_string_lossy().as_ref())
+        );
+
+        let _ = fs::remove_dir_all(managed_path);
     }
 }

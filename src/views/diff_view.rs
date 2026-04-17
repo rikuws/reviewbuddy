@@ -2718,9 +2718,20 @@ fn render_tour_diff_preview(
     let rows = diff_view_state.rows;
     let parsed_file_index = diff_view_state.parsed_file_index;
     let highlighted_hunks = diff_view_state.highlighted_hunks;
-    let items = build_diff_view_items(file, Some(parsed_file), prepared_file, &rows);
+    let preview_items = {
+        let app_state = state.read(cx);
+        build_tour_diff_preview_items(
+            app_state.active_detail(),
+            file,
+            parsed_file,
+            prepared_file,
+            &rows,
+            selected_anchor,
+        )
+    };
 
-    let elements: Vec<AnyElement> = items
+    let elements: Vec<AnyElement> = preview_items
+        .items
         .iter()
         .map(|item| match item {
             DiffViewItem::Gap(gap) => render_diff_gap_row(*gap).into_any_element(),
@@ -2745,6 +2756,29 @@ fn render_tour_diff_preview(
         .border_color(border_default())
         .bg(bg_surface())
         .overflow_hidden()
+        .when(preview_items.focused_excerpt, |el| {
+            el.child(
+                div()
+                    .px(px(14.0))
+                    .py(px(10.0))
+                    .border_b(px(1.0))
+                    .border_color(border_muted())
+                    .bg(bg_overlay())
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .flex_wrap()
+                    .child(badge("focused excerpt"))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(fg_muted())
+                            .child(
+                                "Showing the diff slice relevant to this guide step. Open in Files for the full changeset.",
+                            ),
+                    ),
+            )
+        })
         .child(div().flex().flex_col().bg(bg_inset()).children(elements))
 }
 
@@ -2775,6 +2809,171 @@ fn render_full_tour_diff_preview(
     }
 
     div().flex().flex_col().children(elements)
+}
+
+const TOUR_PREVIEW_MAX_ITEMS: usize = 96;
+const TOUR_PREVIEW_CONTEXT_ITEMS: usize = 24;
+
+struct TourDiffPreviewItems {
+    items: Vec<DiffViewItem>,
+    focused_excerpt: bool,
+}
+
+fn build_tour_diff_preview_items(
+    detail: Option<&PullRequestDetail>,
+    file: &PullRequestFile,
+    parsed_file: &ParsedDiffFile,
+    prepared_file: Option<&PreparedFileContent>,
+    rows: &[DiffRenderRow],
+    selected_anchor: Option<&DiffAnchor>,
+) -> TourDiffPreviewItems {
+    let full_items = build_diff_view_items(file, Some(parsed_file), prepared_file, rows);
+    if full_items.len() <= TOUR_PREVIEW_MAX_ITEMS {
+        return TourDiffPreviewItems {
+            items: full_items,
+            focused_excerpt: false,
+        };
+    }
+
+    let focused_rows = selected_anchor
+        .and_then(|anchor| find_tour_preview_focus_rows(detail, parsed_file, rows, anchor))
+        .unwrap_or_else(|| (0..rows.len().min(TOUR_PREVIEW_MAX_ITEMS)).collect());
+
+    let items = focused_rows
+        .into_iter()
+        .map(DiffViewItem::Row)
+        .collect::<Vec<_>>();
+    let focused_excerpt = items.len() < full_items.len();
+
+    TourDiffPreviewItems {
+        items,
+        focused_excerpt,
+    }
+}
+
+fn find_tour_preview_focus_rows(
+    detail: Option<&PullRequestDetail>,
+    parsed_file: &ParsedDiffFile,
+    rows: &[DiffRenderRow],
+    anchor: &DiffAnchor,
+) -> Option<Vec<usize>> {
+    if let Some(detail) = detail.filter(|_| anchor.thread_id.is_some()) {
+        if let Some((row_ix, row)) = rows.iter().enumerate().find(|(_, row)| match row {
+            DiffRenderRow::FileCommentThread { thread_index }
+            | DiffRenderRow::InlineThread { thread_index }
+            | DiffRenderRow::OutdatedThread { thread_index } => detail
+                .review_threads
+                .get(*thread_index)
+                .map(|thread| thread_matches_diff_anchor(thread, Some(anchor)))
+                .unwrap_or(false),
+            _ => false,
+        }) {
+            return Some(match row {
+                DiffRenderRow::InlineThread { .. } => preview_rows_for_hunk(rows, row_ix)
+                    .unwrap_or_else(|| preview_rows_for_window(rows, row_ix)),
+                DiffRenderRow::FileCommentThread { .. } => preview_rows_for_header_and_row(
+                    rows,
+                    row_ix,
+                    matches!(row, DiffRenderRow::FileCommentThread { .. }),
+                ),
+                DiffRenderRow::OutdatedThread { .. } => {
+                    preview_rows_for_header_and_row(rows, row_ix, false)
+                }
+                _ => preview_rows_for_window(rows, row_ix),
+            });
+        }
+    }
+
+    if let Some((row_ix, _)) = rows.iter().enumerate().find(|(_, row)| match row {
+        DiffRenderRow::HunkHeader { hunk_index } => {
+            anchor.line.is_none()
+                && anchor
+                    .hunk_header
+                    .as_deref()
+                    .map(|header| {
+                        parsed_file
+                            .hunks
+                            .get(*hunk_index)
+                            .map(|hunk| hunk.header == header)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+        }
+        DiffRenderRow::Line {
+            hunk_index,
+            line_index,
+        } => parsed_file
+            .hunks
+            .get(*hunk_index)
+            .and_then(|hunk| hunk.lines.get(*line_index))
+            .map(|line| line_matches_diff_anchor(line, Some(anchor)))
+            .unwrap_or(false),
+        _ => false,
+    }) {
+        return preview_rows_for_hunk(rows, row_ix)
+            .or_else(|| Some(preview_rows_for_window(rows, row_ix)));
+    }
+
+    None
+}
+
+fn preview_rows_for_hunk(rows: &[DiffRenderRow], focus_row_ix: usize) -> Option<Vec<usize>> {
+    let hunk_start = (0..=focus_row_ix)
+        .rev()
+        .find(|ix| matches!(rows[*ix], DiffRenderRow::HunkHeader { .. }))?;
+    let hunk_end = rows
+        .iter()
+        .enumerate()
+        .skip(focus_row_ix + 1)
+        .find_map(|(ix, row)| {
+            matches!(
+                row,
+                DiffRenderRow::HunkHeader { .. } | DiffRenderRow::OutdatedCommentsHeader { .. }
+            )
+            .then_some(ix.saturating_sub(1))
+        })
+        .unwrap_or_else(|| rows.len().saturating_sub(1));
+
+    let hunk_len = hunk_end.saturating_sub(hunk_start).saturating_add(1);
+    if hunk_len <= TOUR_PREVIEW_MAX_ITEMS {
+        return Some((hunk_start..=hunk_end).collect());
+    }
+
+    let excerpt_start = focus_row_ix
+        .saturating_sub(TOUR_PREVIEW_CONTEXT_ITEMS)
+        .max(hunk_start.saturating_add(1));
+    let excerpt_end = (focus_row_ix + TOUR_PREVIEW_CONTEXT_ITEMS).min(hunk_end);
+    let mut rows_to_render = Vec::with_capacity(excerpt_end.saturating_sub(excerpt_start) + 2);
+    rows_to_render.push(hunk_start);
+    rows_to_render.extend(excerpt_start..=excerpt_end);
+    Some(rows_to_render)
+}
+
+fn preview_rows_for_header_and_row(
+    rows: &[DiffRenderRow],
+    row_ix: usize,
+    file_comment_thread: bool,
+) -> Vec<usize> {
+    let header = (0..row_ix).rev().find(|ix| {
+        if file_comment_thread {
+            matches!(rows[*ix], DiffRenderRow::FileCommentsHeader { .. })
+        } else {
+            matches!(rows[*ix], DiffRenderRow::OutdatedCommentsHeader { .. })
+        }
+    });
+
+    let mut rows_to_render = Vec::with_capacity(2);
+    if let Some(header) = header {
+        rows_to_render.push(header);
+    }
+    rows_to_render.push(row_ix);
+    rows_to_render
+}
+
+fn preview_rows_for_window(rows: &[DiffRenderRow], focus_row_ix: usize) -> Vec<usize> {
+    let start = focus_row_ix.saturating_sub(TOUR_PREVIEW_CONTEXT_ITEMS);
+    let end = (focus_row_ix + TOUR_PREVIEW_CONTEXT_ITEMS).min(rows.len().saturating_sub(1));
+    (start..=end).collect()
 }
 
 fn find_threads_for_line<'a>(

@@ -11,7 +11,7 @@ use codex_codes::protocol::{
     CommandExecutionApprovalResponse, ErrorNotification, FileChangeApprovalDecision,
     FileChangeApprovalResponse, ItemCompletedNotification, ItemStartedNotification,
     ReasoningDeltaNotification, ServerMessage, ThreadStartParams, ThreadStartedNotification,
-    TurnCompletedNotification, TurnStartParams, TurnStartedNotification, TurnStatus, UserInput,
+    TurnCompletedNotification, TurnStartedNotification, TurnStatus,
 };
 use codex_codes::{CommandExecutionStatus, McpToolCallStatus, ThreadItem};
 use serde_json::{json, Value};
@@ -90,7 +90,7 @@ impl CodingAgentBackend for CodexBackend {
 
         if !std::path::Path::new(&input.working_directory).is_dir() {
             return Err(format!(
-                "The linked local repository '{}' does not exist.",
+                "The local checkout '{}' does not exist.",
                 input.working_directory
             ));
         }
@@ -98,7 +98,7 @@ impl CodingAgentBackend for CodexBackend {
         on_progress(make_progress(
             "startup",
             "Starting Codex",
-            Some("Launching the Codex app-server in the linked checkout.".to_string()),
+            Some("Launching the Codex app-server in the prepared local checkout.".to_string()),
             Some("Starting Codex app-server".to_string()),
         ));
 
@@ -231,16 +231,10 @@ async fn run_codex_turn(
     let thread_id = thread_response.thread_id().to_string();
     let model = thread_response.model.clone();
 
-    let sandbox_policy: Value = json!({ "mode": "read-only" });
+    let turn_start_params = build_turn_start_params(&thread_id, &prompt);
 
     client
-        .turn_start(&TurnStartParams {
-            thread_id: thread_id.clone(),
-            input: vec![UserInput::Text { text: prompt }],
-            model: None,
-            reasoning_effort: Some("low".to_string()),
-            sandbox_policy: Some(sandbox_policy),
-        })
+        .request::<_, Value>(methods::TURN_START, &turn_start_params)
         .await
         .map_err(|error| format!("Failed to start a Codex turn: {error}"))?;
 
@@ -341,7 +335,7 @@ fn handle_notification(
             let _ = progress_tx.send(make_progress(
                 "thread",
                 "Codex started a new thread",
-                Some("The agent is ready to inspect the linked checkout.".to_string()),
+                Some("The agent is ready to inspect the prepared local checkout.".to_string()),
                 Some("Started Codex thread".to_string()),
             ));
             outcome.last_visible_activity = Some("Started Codex thread".to_string());
@@ -616,4 +610,58 @@ fn short_text(value: &str, limit: usize) -> String {
     }
     let truncated: String = trimmed.chars().take(limit.saturating_sub(1)).collect();
     format!("{}…", truncated.trim_end())
+}
+
+fn build_turn_start_params(thread_id: &str, prompt: &str) -> Value {
+    json!({
+        "threadId": thread_id,
+        "input": [
+            {
+                "type": "text",
+                "text": prompt,
+            }
+        ],
+        // Newer Codex app-server builds use `effort`; older ones still expect
+        // `reasoningEffort`. Sending both keeps this request compatible across
+        // the CLI versions we have seen in the wild.
+        "effort": "low",
+        "reasoningEffort": "low",
+        "sandboxPolicy": compatible_read_only_sandbox_policy(),
+    })
+}
+
+fn compatible_read_only_sandbox_policy() -> Value {
+    json!({
+        // Current app-server builds require a tagged sandbox policy object.
+        "type": "readOnly",
+        "networkAccess": false,
+        // Older app-server builds accepted the legacy `mode` field.
+        "mode": "read-only",
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_turn_start_params, compatible_read_only_sandbox_policy};
+
+    #[test]
+    fn compatible_read_only_sandbox_policy_includes_new_and_legacy_fields() {
+        let policy = compatible_read_only_sandbox_policy();
+
+        assert_eq!(policy["type"], "readOnly");
+        assert_eq!(policy["mode"], "read-only");
+        assert_eq!(policy["networkAccess"], false);
+    }
+
+    #[test]
+    fn turn_start_params_cover_old_and_new_codex_field_names() {
+        let params = build_turn_start_params("thread-123", "hello");
+
+        assert_eq!(params["threadId"], "thread-123");
+        assert_eq!(params["effort"], "low");
+        assert_eq!(params["reasoningEffort"], "low");
+        assert_eq!(params.pointer("/input/0/type").unwrap(), "text");
+        assert_eq!(params.pointer("/input/0/text").unwrap(), "hello");
+        assert_eq!(params.pointer("/sandboxPolicy/type").unwrap(), "readOnly");
+    }
 }

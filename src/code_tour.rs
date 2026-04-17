@@ -267,12 +267,12 @@ where
     F: FnMut(CodeTourProgressUpdate),
 {
     if input.working_directory.trim().is_empty() {
-        return Err("Code tours require a linked local repository path.".to_string());
+        return Err("Code tours require a local checkout path.".to_string());
     }
 
     if !Path::new(&input.working_directory).exists() {
         return Err(format!(
-            "The linked local repository path '{}' does not exist.",
+            "The local checkout path '{}' does not exist.",
             input.working_directory
         ));
     }

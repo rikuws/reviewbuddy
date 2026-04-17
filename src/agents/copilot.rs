@@ -109,7 +109,7 @@ impl CodingAgentBackend for CopilotBackend {
 
         if !Path::new(&input.working_directory).is_dir() {
             return Err(format!(
-                "The linked local repository '{}' does not exist.",
+                "The local checkout '{}' does not exist.",
                 input.working_directory
             ));
         }
@@ -118,7 +118,7 @@ impl CodingAgentBackend for CopilotBackend {
             "startup",
             "Starting GitHub Copilot",
             Some(
-                "Launching the local Copilot CLI with streamed progress in the linked checkout."
+                "Launching the local Copilot CLI with streamed progress in the prepared local checkout."
                     .to_string(),
             ),
             Some("Starting Copilot CLI".to_string()),

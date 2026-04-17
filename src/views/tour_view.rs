@@ -482,12 +482,17 @@ async fn generate_tour_flow(
                 detail_state.local_repository_status = Some(local_repo_status.clone());
                 detail_state.local_repository_error = None;
                 let tour_state = detail_state.tour_states.entry(provider).or_default();
+                let checkout_label = match local_repo_status.source.as_str() {
+                    "linked" => "linked checkout",
+                    _ => "app-managed checkout",
+                };
                 apply_tour_progress_message(
                     tour_state,
                     format!("Starting {}", provider.label()),
                     Some(format!(
-                        "Launching {} in the linked checkout and sending the pull request context.",
-                        provider.label()
+                        "Launching {} in the {} and sending the pull request context.",
+                        provider.label(),
+                        checkout_label,
                     )),
                     Some(format!("Starting {}", provider.label())),
                     None,
@@ -804,7 +809,14 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
     let local_repo_loading = detail_state
         .map(|state| state.local_repository_loading)
         .unwrap_or(false);
-    let local_repo_error = detail_state.and_then(|state| state.local_repository_error.clone());
+    let local_repo_error = detail_state
+        .and_then(|state| state.local_repository_error.clone())
+        .filter(|error| {
+            local_repo_status
+                .as_ref()
+                .map(|status| status.message.as_str())
+                != Some(error.as_str())
+        });
     let tour_loading = tour_state.map(|state| state.loading).unwrap_or(false);
     let tour_generating = tour_state.map(|state| state.generating).unwrap_or(false);
     let tour_progress_summary = tour_state.and_then(|state| state.progress_summary.clone());
@@ -1964,22 +1976,6 @@ fn render_tour_step_row(
     let open_state = open_state.clone();
     let toggle_state = toggle_state.clone();
     let open_step = step.clone();
-    let diff_file = toggle_state
-        .read(cx)
-        .active_detail()
-        .map(|detail| {
-            render_tour_diff_file(
-                &toggle_state,
-                detail,
-                &step.id,
-                step.file_path.as_deref(),
-                step.snippet.as_deref(),
-                step.anchor.as_ref(),
-                cx,
-            )
-            .into_any_element()
-        })
-        .unwrap_or_else(|| div().into_any_element());
 
     div()
         .when(show_divider, |el| {
@@ -2084,7 +2080,24 @@ fn render_tour_step_row(
                         }
                     ))),
             )
-            .child(diff_file)
+            .child(
+                toggle_state
+                    .read(cx)
+                    .active_detail()
+                    .map(|detail| {
+                        render_tour_diff_file(
+                            &toggle_state,
+                            detail,
+                            &step.id,
+                            step.file_path.as_deref(),
+                            step.snippet.as_deref(),
+                            step.anchor.as_ref(),
+                            cx,
+                        )
+                        .into_any_element()
+                    })
+                    .unwrap_or_else(|| div().into_any_element()),
+            )
         })
 }
 
