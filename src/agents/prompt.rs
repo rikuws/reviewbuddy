@@ -229,6 +229,7 @@ mod tests {
             working_directory: "/tmp/repo".to_string(),
             repository: "owner/name".to_string(),
             number: 42,
+            code_version_key: "head-abc".to_string(),
             title: "Add widget".to_string(),
             body: "Implements the widget feature.".to_string(),
             url: "https://example.com".to_string(),

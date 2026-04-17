@@ -6,6 +6,7 @@ use crate::state::*;
 use crate::theme::*;
 
 use super::sections::{badge, open_pull_request, panel_state_text};
+use super::settings::prepare_settings_view;
 use super::workspace_sync::trigger_sync_workspace;
 
 pub fn render_palette(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
@@ -386,6 +387,9 @@ fn apply_command_action(
 ) {
     match action {
         CommandAction::GoToSection(section) => {
+            if section == SectionId::Settings {
+                prepare_settings_view(state, window, cx);
+            }
             state.update(cx, |s, cx| {
                 s.active_section = section;
                 s.active_pr_key = None;

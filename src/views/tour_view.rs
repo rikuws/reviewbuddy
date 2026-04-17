@@ -26,7 +26,6 @@ use super::diff_view::{
     enter_files_surface, load_local_source_file_content_flow, load_pull_request_file_content_flow,
     render_tour_diff_file,
 };
-use super::pr_detail::surface_tab;
 use super::sections::{
     badge, error_text, eyebrow, ghost_button, nested_panel, panel_state_text, review_button,
     success_text,
@@ -36,24 +35,6 @@ pub fn enter_tour_surface(state: &Entity<AppState>, window: &mut Window, cx: &mu
     state.update(cx, |s, cx| {
         s.active_surface = PullRequestSurface::Tour;
         s.pr_header_compact = false;
-        s.active_tour_outline_id = "overview".to_string();
-        s.collapsed_tour_panels.clear();
-        cx.notify();
-    });
-
-    refresh_active_tour(state, window, cx, true);
-}
-
-pub fn select_tour_provider(
-    state: &Entity<AppState>,
-    provider: CodeTourProvider,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    state.update(cx, |s, cx| {
-        s.selected_tour_provider = Some(provider);
-        s.tour_provider_manually_selected = true;
-        s.code_tour_provider_error = None;
         s.active_tour_outline_id = "overview".to_string();
         s.collapsed_tour_panels.clear();
         cx.notify();
@@ -89,8 +70,8 @@ pub async fn refresh_active_tour_flow(
                 state.cache.clone(),
                 detail_key,
                 detail,
-                state.selected_tour_provider,
-                state.tour_provider_manually_selected,
+                state.code_tour_settings.loaded,
+                state.code_tour_settings.settings.clone(),
                 state.code_tour_provider_statuses_loaded,
                 state.code_tour_provider_statuses.clone(),
             ))
@@ -102,14 +83,24 @@ pub async fn refresh_active_tour_flow(
         cache,
         detail_key,
         detail,
-        current_provider,
-        provider_manually_selected,
+        settings_loaded,
+        existing_settings,
         statuses_loaded,
         existing_statuses,
     )) = initial
     else {
         return;
     };
+
+    if !settings_loaded {
+        model
+            .update(cx, |state, cx| {
+                state.code_tour_settings.loading = true;
+                state.code_tour_settings.error = None;
+                cx.notify();
+            })
+            .ok();
+    }
 
     if !statuses_loaded {
         model
@@ -121,6 +112,17 @@ pub async fn refresh_active_tour_flow(
             .ok();
     }
 
+    let settings_result = if settings_loaded {
+        Ok(existing_settings.clone())
+    } else {
+        cx.background_executor()
+            .spawn({
+                let cache = cache.clone();
+                async move { code_tour::load_code_tour_settings(&cache) }
+            })
+            .await
+    };
+
     let provider_statuses_result = if statuses_loaded {
         Ok(existing_statuses)
     } else {
@@ -130,51 +132,50 @@ pub async fn refresh_active_tour_flow(
     };
 
     let provider_statuses = provider_statuses_result.clone().unwrap_or_default();
-    let provider = resolve_preferred_provider(
-        &provider_statuses,
-        current_provider,
-        provider_manually_selected,
-    );
-    let preserve_manual_selection =
-        provider_manually_selected && provider.is_some() && provider == current_provider;
+    let settings = settings_result
+        .clone()
+        .unwrap_or_else(|_| existing_settings.clone());
+    let provider = settings.provider;
+    let automatic_generation_enabled = settings.automatically_generates_for(&detail.repository);
 
     model
         .update(cx, |state, cx| {
+            state.code_tour_settings.loading = false;
+            if let Ok(settings) = &settings_result {
+                state.code_tour_settings.settings = settings.clone();
+                state.code_tour_settings.loaded = true;
+                state.code_tour_settings.error = None;
+            } else if let Err(error) = &settings_result {
+                state.code_tour_settings.error = Some(error.clone());
+            }
+
             state.code_tour_provider_loading = false;
             state.code_tour_provider_statuses_loaded = true;
             if let Ok(statuses) = &provider_statuses_result {
                 state.code_tour_provider_statuses = statuses.clone();
                 state.code_tour_provider_error = None;
-                state.selected_tour_provider = provider;
-                state.tour_provider_manually_selected = preserve_manual_selection;
             } else if let Err(error) = &provider_statuses_result {
                 state.code_tour_provider_error = Some(error.clone());
             }
 
             if let Some(detail_state) = state.detail_states.get_mut(&detail_key) {
-                detail_state.local_repository_loading = provider.is_some();
+                detail_state.local_repository_loading = true;
                 detail_state.local_repository_error = None;
 
-                if let Some(provider) = provider {
-                    let request_key = build_tour_request_key(&detail, provider);
-                    let tour_state = detail_state.tour_states.entry(provider).or_default();
-                    clear_tour_progress(tour_state);
-                    tour_state.loading = true;
-                    tour_state.generating = false;
-                    tour_state.request_key = Some(request_key);
-                    tour_state.error = None;
-                    tour_state.message = None;
-                    tour_state.success = false;
-                }
+                let request_key = build_tour_request_key(&detail, provider);
+                let tour_state = detail_state.tour_states.entry(provider).or_default();
+                clear_tour_progress(tour_state);
+                tour_state.loading = true;
+                tour_state.generating = false;
+                tour_state.request_key = Some(request_key);
+                tour_state.error = None;
+                tour_state.message = None;
+                tour_state.success = false;
             }
 
             cx.notify();
         })
         .ok();
-
-    let Some(provider) = provider else {
-        return;
-    };
 
     let request_key = build_tour_request_key(&detail, provider);
 
@@ -198,19 +199,8 @@ pub async fn refresh_active_tour_flow(
         .background_executor()
         .spawn({
             let cache = cache.clone();
-            let repository = detail.repository.clone();
-            let head_ref_oid = detail.head_ref_oid.clone();
-            let updated_at = detail.updated_at.clone();
-            async move {
-                code_tour::load_code_tour(
-                    &cache,
-                    &repository,
-                    detail.number,
-                    provider,
-                    head_ref_oid,
-                    updated_at,
-                )
-            }
+            let detail = detail.clone();
+            async move { code_tour::load_code_tour(&cache, &detail, provider) }
         })
         .await;
 
@@ -227,6 +217,7 @@ pub async fn refresh_active_tour_flow(
         .unwrap_or(false);
     let cached_tour_error = cached_tour_result.as_ref().err().cloned();
     let should_auto_generate = allow_automatic_generation
+        && automatic_generation_enabled
         && provider_ready
         && missing_cached_tour
         && cached_tour_error.is_none()
@@ -328,74 +319,31 @@ async fn generate_tour_flow(
     automatic: bool,
     cx: &mut AsyncWindowContext,
 ) {
-    enum GenerateTourInitial {
-        Ready(
-            (
-                std::sync::Arc<crate::cache::CacheStore>,
-                (String, github::PullRequestDetail, CodeTourProvider, String),
-            ),
-        ),
-        MissingProvider(String),
-    }
-
     let initial = if let Some(context) = context {
         let cache = model.read_with(cx, |state, _| state.cache.clone()).ok();
-        cache.map(|cache| GenerateTourInitial::Ready((cache, context)))
+        cache.map(|cache| (cache, context))
     } else {
         model
             .read_with(cx, |state, _| {
                 let detail = state.active_detail()?.clone();
                 let detail_key = state.active_pr_key.clone()?;
-                let provider = state.selected_tour_provider;
-                let provider_loading = state.code_tour_provider_loading;
-                let statuses = state.code_tour_provider_statuses.clone();
+                let provider = state.selected_tour_provider();
                 Some((
                     state.cache.clone(),
-                    detail_key,
-                    detail,
-                    provider,
-                    provider_loading,
-                    statuses,
+                    (
+                        detail_key,
+                        detail.clone(),
+                        provider,
+                        build_tour_request_key(&detail, provider),
+                    ),
                 ))
             })
             .ok()
             .flatten()
-            .map(
-                |(cache, detail_key, detail, provider, provider_loading, statuses)| match provider {
-                    Some(provider) => GenerateTourInitial::Ready((
-                        cache,
-                        (
-                            detail_key,
-                            detail.clone(),
-                            provider,
-                            build_tour_request_key(&detail, provider),
-                        ),
-                    )),
-                    None => GenerateTourInitial::MissingProvider(provider_selection_message(
-                        &statuses,
-                        provider_loading,
-                    )),
-                },
-            )
     };
 
-    let Some(initial) = initial else {
+    let Some((cache, (detail_key, detail, provider, request_key))) = initial else {
         return;
-    };
-
-    let (cache, (detail_key, detail, provider, request_key)) = match initial {
-        GenerateTourInitial::Ready(values) => values,
-        GenerateTourInitial::MissingProvider(message) => {
-            if !automatic {
-                model
-                    .update(cx, |state, cx| {
-                        state.code_tour_provider_error = Some(message);
-                        cx.notify();
-                    })
-                    .ok();
-            }
-            return;
-        }
     };
 
     let provider_status = model
@@ -834,71 +782,6 @@ fn detail_request_matches(
         .unwrap_or(false)
 }
 
-pub(super) fn resolve_preferred_provider(
-    statuses: &[CodeTourProviderStatus],
-    current_provider: Option<CodeTourProvider>,
-    provider_manually_selected: bool,
-) -> Option<CodeTourProvider> {
-    if statuses.is_empty() {
-        return current_provider;
-    }
-
-    let available = available_providers(statuses);
-    let ready = ready_providers(statuses);
-
-    if provider_manually_selected {
-        if let Some(provider) = current_provider {
-            if available.contains(&provider) {
-                return Some(provider);
-            }
-        }
-    }
-
-    if ready.len() == 1 {
-        return ready.first().copied();
-    }
-
-    if available.len() == 1 {
-        return available.first().copied();
-    }
-
-    None
-}
-
-fn available_providers(statuses: &[CodeTourProviderStatus]) -> Vec<CodeTourProvider> {
-    statuses
-        .iter()
-        .filter(|status| status.available)
-        .map(|status| status.provider)
-        .collect()
-}
-
-fn ready_providers(statuses: &[CodeTourProviderStatus]) -> Vec<CodeTourProvider> {
-    statuses
-        .iter()
-        .filter(|status| status.available && status.authenticated)
-        .map(|status| status.provider)
-        .collect()
-}
-
-fn provider_selection_message(
-    statuses: &[CodeTourProviderStatus],
-    provider_loading: bool,
-) -> String {
-    let available = available_providers(statuses);
-    let ready = ready_providers(statuses);
-
-    if provider_loading {
-        "Still checking provider status.".to_string()
-    } else if ready.len() > 1 || available.len() > 1 {
-        "Choose a provider before generating a guide.".to_string()
-    } else if available.is_empty() {
-        "No supported guide provider is available in this workspace.".to_string()
-    } else {
-        "Still preparing the detected provider.".to_string()
-    }
-}
-
 pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let s = state.read(cx);
     let detail = s.active_detail();
@@ -914,7 +797,7 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
     let provider_statuses = s.code_tour_provider_statuses.clone();
     let provider_loading = s.code_tour_provider_loading;
     let provider_error = s.code_tour_provider_error.clone();
-    let provider = s.selected_tour_provider;
+    let provider = Some(s.selected_tour_provider());
     let provider_status = s.selected_tour_provider_status().cloned();
     let tour_state = s.active_tour_state();
     let local_repo_status = detail_state.and_then(|state| state.local_repository_status.clone());
@@ -987,7 +870,7 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
     } else if let Some(provider) = provider {
         format!("Generate with {}", provider.label())
     } else {
-        "Choose a provider".to_string()
+        "Generate guide".to_string()
     };
     let scroll_handle = s.tour_content_scroll_handle.clone();
     let tour_list_state = s.tour_content_list_state.clone();
@@ -1303,8 +1186,14 @@ fn render_provider_bar(
             format!("Generate with {}", selected_provider.label())
         }
     } else {
-        "Choose a provider".to_string()
+        "Generate guide".to_string()
     };
+    let configured_provider_status = selected_provider.and_then(|provider| {
+        statuses
+            .iter()
+            .find(|status| status.provider == provider)
+            .cloned()
+    });
 
     div()
         .flex()
@@ -1342,7 +1231,7 @@ fn render_provider_bar(
                             generated_tour
                                 .map(|tour| tour.summary.clone())
                                 .unwrap_or_else(|| {
-                                    "Generate a guided walkthrough of the pull request. If more than one provider is ready, pick the one you want to use for this guide.".to_string()
+                                    "Generate a guided walkthrough of the pull request with the provider configured in Settings.".to_string()
                                 }),
                         ),
                 ),
@@ -1353,26 +1242,17 @@ fn render_provider_bar(
                 .items_center()
                 .gap(px(8.0))
                 .flex_wrap()
-                .child(
-                    div().flex().gap(px(4.0)).children(CodeTourProvider::all().iter().map(|candidate| {
-                        let status = statuses.iter().find(|status| status.provider == *candidate);
-                        let label = if status.map(|status| status.authenticated).unwrap_or(false) {
-                            format!("{} • ready", candidate.label())
-                        } else {
-                            candidate.label().to_string()
-                        };
-                        let state = state.clone();
-                        let provider = *candidate;
-
-                        surface_tab(
-                            &label,
-                            selected_provider == Some(provider),
-                            move |_, window, cx| {
-                                select_tour_provider(&state, provider, window, cx);
-                            },
-                        )
-                    })),
-                )
+                .when_some(selected_provider, |el, provider| el.child(badge(provider.label())))
+                .child(badge("configured in settings"))
+                .when_some(configured_provider_status, |el, status| {
+                    el.child(badge(if status.available && status.authenticated {
+                        "ready"
+                    } else if status.available {
+                        "needs auth"
+                    } else {
+                        "unavailable"
+                    }))
+                })
                 .child(review_button(
                     &generate_label,
                     {
@@ -1387,7 +1267,7 @@ fn render_provider_bar(
 fn render_pending_panel(
     provider: Option<CodeTourProvider>,
     provider_status: Option<&CodeTourProviderStatus>,
-    statuses: &[CodeTourProviderStatus],
+    _statuses: &[CodeTourProviderStatus],
     provider_loading: bool,
     tour_loading: bool,
     generating: bool,
@@ -1398,12 +1278,10 @@ fn render_pending_panel(
     local_repo_status: Option<&local_repo::LocalRepositoryStatus>,
     local_repo_loading: bool,
 ) -> impl IntoElement {
-    let available_count = available_providers(statuses).len();
-    let ready_count = ready_providers(statuses).len();
     let (title, body) = if provider_loading {
         (
             "Checking guide provider status".to_string(),
-            "Inspecting the detected providers before the guide can run.".to_string(),
+            "Checking the provider configured in Settings before the guide can run.".to_string(),
         )
     } else if tour_loading {
         (
@@ -1447,22 +1325,15 @@ fn render_pending_panel(
                 "No cached guide is available for this pull request head yet. The app can generate one in the background and store it in the local cache.".to_string(),
             )
         }
-    } else if ready_count > 1 || available_count > 1 {
+    } else if provider.is_none() {
         (
-            "Choose guide provider".to_string(),
-            "Multiple providers are available. Pick the one you want to use for this guided review."
-                .to_string(),
-        )
-    } else if available_count == 0 {
-        (
-            "No guide provider detected".to_string(),
-            "Install or expose GitHub Copilot CLI or Codex CLI to enable guided review generation."
-                .to_string(),
+            "Guide provider unavailable".to_string(),
+            "Choose a guide provider in Settings to enable guided review generation.".to_string(),
         )
     } else {
         (
             "Preparing guide".to_string(),
-            "Waiting for the detected provider to finish loading.".to_string(),
+            "Waiting for the configured provider to finish loading.".to_string(),
         )
     };
 
@@ -1498,18 +1369,16 @@ fn render_pending_panel(
                 .flex_wrap()
                 .mt(px(12.0))
                 .when_some(provider, |el, provider| el.child(badge(provider.label())))
-                .when(
-                    provider.is_none() && (ready_count > 1 || available_count > 1),
-                    |el| el.child(badge("choose provider")),
-                )
-                .when(provider.is_none() && available_count == 0, |el| {
-                    el.child(badge("no provider detected"))
+                .when(provider.is_none(), |el| {
+                    el.child(badge("configure provider"))
                 })
                 .when_some(provider_status, |el, status| {
-                    el.child(badge(if status.authenticated {
-                        "authenticated"
-                    } else {
+                    el.child(badge(if status.available && status.authenticated {
+                        "ready"
+                    } else if status.available {
                         "needs auth"
+                    } else {
+                        "unavailable"
                     }))
                 })
                 .when(local_repo_loading, |el| {

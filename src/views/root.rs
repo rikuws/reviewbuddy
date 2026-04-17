@@ -9,7 +9,7 @@ use crate::theme::*;
 use super::palette::render_palette;
 use super::pr_detail::render_pr_workspace;
 use super::sections::{badge, ghost_button, render_section_workspace};
-use super::settings::ensure_managed_lsp_statuses_loaded;
+use super::settings::prepare_settings_view;
 use super::workspace_sync::{
     sync_workspace_flow, trigger_sync_workspace, wait_for_workspace_poll_interval,
 };
@@ -210,9 +210,7 @@ fn render_topbar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                             is_active,
                                             move |_, window, cx| {
                                                 if section == SectionId::Settings {
-                                                    ensure_managed_lsp_statuses_loaded(
-                                                        &state, window, cx,
-                                                    );
+                                                    prepare_settings_view(&state, window, cx);
                                                 }
                                                 state.update(cx, |s, cx| {
                                                     s.active_section = section;

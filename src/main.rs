@@ -4,6 +4,7 @@ mod app_storage;
 mod cache;
 mod code_display;
 mod code_tour;
+mod code_tour_background;
 mod diff;
 mod gh;
 mod github;

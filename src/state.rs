@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use crate::cache::CacheStore;
 use crate::code_tour::{
-    build_tour_request_key, CodeTourProvider, CodeTourProviderStatus, DiffAnchor, GeneratedCodeTour,
+    build_tour_request_key, CodeTourProvider, CodeTourProviderStatus, CodeTourSettings, DiffAnchor,
+    GeneratedCodeTour,
 };
 use crate::diff::DiffRenderRow;
 use crate::github::{
@@ -183,6 +184,31 @@ pub struct ManagedLspSettingsState {
 }
 
 #[derive(Clone, Debug)]
+pub struct CodeTourSettingsState {
+    pub settings: CodeTourSettings,
+    pub loading: bool,
+    pub loaded: bool,
+    pub error: Option<String>,
+    pub background_syncing: bool,
+    pub background_message: Option<String>,
+    pub background_error: Option<String>,
+}
+
+impl Default for CodeTourSettingsState {
+    fn default() -> Self {
+        Self {
+            settings: CodeTourSettings::default(),
+            loading: false,
+            loaded: false,
+            error: None,
+            background_syncing: false,
+            background_message: None,
+            background_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct PreparedFileContent {
     pub path: String,
     pub reference: String,
@@ -275,13 +301,13 @@ pub struct AppState {
     pub code_tour_provider_statuses_loaded: bool,
     pub code_tour_provider_loading: bool,
     pub code_tour_provider_error: Option<String>,
-    pub selected_tour_provider: Option<CodeTourProvider>,
-    pub tour_provider_manually_selected: bool,
     pub automatic_tour_request_keys: std::collections::HashSet<String>,
     pub active_tour_outline_id: String,
     pub collapsed_tour_panels: std::collections::HashSet<String>,
+    pub settings_scroll_handle: ScrollHandle,
     pub tour_content_scroll_handle: ScrollHandle,
     pub tour_content_list_state: ListState,
+    pub code_tour_settings: CodeTourSettingsState,
     pub managed_lsp_settings: ManagedLspSettingsState,
 }
 
@@ -323,13 +349,13 @@ impl AppState {
             code_tour_provider_statuses_loaded: false,
             code_tour_provider_loading: false,
             code_tour_provider_error: None,
-            selected_tour_provider: None,
-            tour_provider_manually_selected: false,
             automatic_tour_request_keys: std::collections::HashSet::new(),
             active_tour_outline_id: "overview".to_string(),
             collapsed_tour_panels: std::collections::HashSet::new(),
+            settings_scroll_handle: ScrollHandle::new(),
             tour_content_scroll_handle: ScrollHandle::new(),
             tour_content_list_state: ListState::new(0, ListAlignment::Top, px(600.0)),
+            code_tour_settings: CodeTourSettingsState::default(),
             managed_lsp_settings: ManagedLspSettingsState::default(),
         }
     }
@@ -367,7 +393,9 @@ impl AppState {
 
     pub fn active_tour_state(&self) -> Option<&CodeTourState> {
         let detail_state = self.active_detail_state()?;
-        detail_state.tour_states.get(&self.selected_tour_provider?)
+        detail_state
+            .tour_states
+            .get(&self.code_tour_settings.settings.provider)
     }
 
     pub fn active_local_repository_status(&self) -> Option<&LocalRepositoryStatus> {
@@ -375,15 +403,21 @@ impl AppState {
     }
 
     pub fn selected_tour_provider_status(&self) -> Option<&CodeTourProviderStatus> {
-        let selected_provider = self.selected_tour_provider?;
         self.code_tour_provider_statuses
             .iter()
-            .find(|status| status.provider == selected_provider)
+            .find(|status| status.provider == self.code_tour_settings.settings.provider)
     }
 
     pub fn active_tour_request_key(&self) -> Option<String> {
         let detail = self.active_detail()?;
-        Some(build_tour_request_key(detail, self.selected_tour_provider?))
+        Some(build_tour_request_key(
+            detail,
+            self.code_tour_settings.settings.provider,
+        ))
+    }
+
+    pub fn selected_tour_provider(&self) -> CodeTourProvider {
+        self.code_tour_settings.settings.provider
     }
 
     pub fn section_count(&self, section: SectionId) -> i64 {

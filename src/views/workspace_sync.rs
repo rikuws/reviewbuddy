@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use gpui::*;
 
-use crate::{notifications, state::AppState};
+use crate::{code_tour, code_tour_background, notifications, state::AppState};
 
 pub const WORKSPACE_SYNC_POLL_INTERVAL: Duration = Duration::from_secs(90);
 
@@ -44,6 +44,7 @@ pub async fn sync_workspace_flow(model: Entity<AppState>, cx: &mut AsyncWindowCo
     match result {
         Ok(outcome) => {
             let notifications = outcome.notifications.clone();
+            let workspace = outcome.workspace.clone();
             model
                 .update(cx, |state, cx| {
                     state.workspace_syncing = false;
@@ -54,6 +55,88 @@ pub async fn sync_workspace_flow(model: Entity<AppState>, cx: &mut AsyncWindowCo
                 })
                 .ok();
             notifications::deliver_system_notifications(&notifications);
+
+            let should_sync_background_tours = model
+                .read_with(cx, |state, _| !state.code_tour_settings.background_syncing)
+                .ok()
+                .unwrap_or(false);
+
+            if should_sync_background_tours {
+                model
+                    .update(cx, |state, cx| {
+                        state.code_tour_settings.background_syncing = true;
+                        state.code_tour_settings.background_error = None;
+                        state.code_tour_settings.background_message =
+                            Some("Refreshing automatic background guides...".to_string());
+                        cx.notify();
+                    })
+                    .ok();
+
+                let settings_result = cx
+                    .background_executor()
+                    .spawn({
+                        let cache = cache.clone();
+                        async move { code_tour::load_code_tour_settings(&cache) }
+                    })
+                    .await;
+
+                match settings_result {
+                    Ok(settings) => {
+                        model
+                            .update(cx, |state, cx| {
+                                state.code_tour_settings.settings = settings.clone();
+                                state.code_tour_settings.loaded = true;
+                                state.code_tour_settings.loading = false;
+                                state.code_tour_settings.error = None;
+                                cx.notify();
+                            })
+                            .ok();
+
+                        let sync_result = cx
+                            .background_executor()
+                            .spawn({
+                                let cache = cache.clone();
+                                let workspace = workspace.clone();
+                                let settings = settings.clone();
+                                async move {
+                                    code_tour_background::sync_workspace_code_tours(
+                                        &cache, &workspace, &settings,
+                                    )
+                                }
+                            })
+                            .await;
+
+                        model
+                            .update(cx, |state, cx| {
+                                state.code_tour_settings.background_syncing = false;
+                                match sync_result {
+                                    Ok(outcome) => {
+                                        state.code_tour_settings.background_message =
+                                            Some(outcome.summary());
+                                        state.code_tour_settings.background_error = None;
+                                    }
+                                    Err(error) => {
+                                        state.code_tour_settings.background_message = None;
+                                        state.code_tour_settings.background_error = Some(error);
+                                    }
+                                }
+                                cx.notify();
+                            })
+                            .ok();
+                    }
+                    Err(error) => {
+                        model
+                            .update(cx, |state, cx| {
+                                state.code_tour_settings.background_syncing = false;
+                                state.code_tour_settings.background_message = None;
+                                state.code_tour_settings.background_error = Some(error.clone());
+                                state.code_tour_settings.error = Some(error);
+                                cx.notify();
+                            })
+                            .ok();
+                    }
+                }
+            }
         }
         Err(error) => {
             model

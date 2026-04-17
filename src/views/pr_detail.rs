@@ -927,16 +927,12 @@ fn render_review_snapshot_panel(
                     danger(),
                 )),
         )
-        .child(
-            div()
-                .mt(px(18.0))
-                .child(render_thread_focus_panel(
-                    own_pr_feedback,
-                    thread_digest,
-                    is_own_pull_request,
-                    state,
-                )),
-        )
+        .child(div().mt(px(18.0)).child(render_thread_focus_panel(
+            own_pr_feedback,
+            thread_digest,
+            is_own_pull_request,
+            state,
+        )))
 }
 
 fn render_snapshot_stat(value: String, label: &str, hint: &str, color: Rgba) -> impl IntoElement {

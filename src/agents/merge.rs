@@ -661,6 +661,7 @@ mod tests {
             working_directory: "/tmp/repo".to_string(),
             repository: "owner/name".to_string(),
             number: 1,
+            code_version_key: "diff-123".to_string(),
             title: "Test".to_string(),
             body: "body".to_string(),
             url: "url".to_string(),

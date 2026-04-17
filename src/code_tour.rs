@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use sha1::{Digest, Sha1};
 
 use crate::{
     agents,
@@ -10,7 +11,8 @@ use crate::{
     github::{PullRequestDetail, PullRequestFile, PullRequestReviewThread},
 };
 
-const CODE_TOUR_CACHE_KEY_PREFIX: &str = "code-tour-v2";
+const CODE_TOUR_CACHE_KEY_PREFIX: &str = "code-tour-v3";
+const CODE_TOUR_SETTINGS_CACHE_KEY: &str = "code-tour-settings-v1";
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -37,6 +39,29 @@ impl CodeTourProvider {
 
     pub fn all() -> &'static [CodeTourProvider] {
         &[CodeTourProvider::Codex, CodeTourProvider::Copilot]
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodeTourSettings {
+    #[serde(default)]
+    pub provider: CodeTourProvider,
+    #[serde(default)]
+    pub automatic_repositories: BTreeSet<String>,
+}
+
+impl CodeTourSettings {
+    pub fn automatically_generates_for(&self, repository: &str) -> bool {
+        self.automatic_repositories.contains(repository)
+    }
+
+    pub fn set_automatic_generation_for(&mut self, repository: &str, enabled: bool) {
+        if enabled {
+            self.automatic_repositories.insert(repository.to_string());
+        } else {
+            self.automatic_repositories.remove(repository);
+        }
     }
 }
 
@@ -182,6 +207,7 @@ pub struct GenerateCodeTourInput {
     pub working_directory: String,
     pub repository: String,
     pub number: i64,
+    pub code_version_key: String,
     pub title: String,
     pub body: String,
     pub url: String,
@@ -206,21 +232,26 @@ pub fn load_code_tour_provider_statuses() -> Result<Vec<CodeTourProviderStatus>,
     Ok(agents::load_all_statuses())
 }
 
+pub fn load_code_tour_settings(cache: &CacheStore) -> Result<CodeTourSettings, String> {
+    Ok(cache
+        .get::<CodeTourSettings>(CODE_TOUR_SETTINGS_CACHE_KEY)?
+        .map(|document| document.value)
+        .unwrap_or_default())
+}
+
+pub fn save_code_tour_settings(
+    cache: &CacheStore,
+    settings: &CodeTourSettings,
+) -> Result<(), String> {
+    cache.put(CODE_TOUR_SETTINGS_CACHE_KEY, settings, now_ms())
+}
+
 pub fn load_code_tour(
     cache: &CacheStore,
-    repository: &str,
-    number: i64,
+    detail: &PullRequestDetail,
     provider: CodeTourProvider,
-    head_ref_oid: Option<String>,
-    updated_at: String,
 ) -> Result<Option<GeneratedCodeTour>, String> {
-    let cache_key = code_tour_cache_key(
-        repository,
-        number,
-        provider,
-        head_ref_oid.as_deref(),
-        &updated_at,
-    );
+    let cache_key = code_tour_cache_key(detail, provider);
 
     Ok(cache
         .get::<GeneratedCodeTour>(&cache_key)?
@@ -255,12 +286,11 @@ where
         Box::new(|progress| on_progress(progress));
     let tour = backend.generate(&input, progress_sink.as_mut())?;
 
-    let cache_key = code_tour_cache_key(
+    let cache_key = code_tour_cache_key_from_parts(
         &input.repository,
         input.number,
         input.provider,
-        input.head_ref_oid.as_deref(),
-        &input.updated_at,
+        &input.code_version_key,
     );
 
     cache.put(&cache_key, &tour, now_ms())?;
@@ -283,6 +313,7 @@ pub fn build_code_tour_generation_input(
         working_directory: working_directory.to_string(),
         repository: detail.repository.clone(),
         number: detail.number,
+        code_version_key: tour_code_version_key(detail),
         title: detail.title.clone(),
         body: trim_text(&detail.body, 2_500),
         url: detail.url.clone(),
@@ -324,14 +355,23 @@ pub fn build_code_tour_generation_input(
 }
 
 pub fn build_tour_request_key(detail: &PullRequestDetail, provider: CodeTourProvider) -> String {
-    let head = detail.head_ref_oid.as_deref().unwrap_or("no-head");
+    let code_version = tour_code_version_key(detail);
     format!(
-        "{}:{}:{}:{head}:{}",
+        "{}:{}:{}:{code_version}",
         provider.slug(),
         detail.repository,
         detail.number,
-        detail.updated_at
     )
+}
+
+pub fn tour_code_version_key(detail: &PullRequestDetail) -> String {
+    detail
+        .head_ref_oid
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("head-{value}"))
+        .unwrap_or_else(|| format!("diff-{}", hash_text(&detail.raw_diff)))
 }
 
 pub fn line_matches_diff_anchor(line: &ParsedDiffLine, anchor: Option<&DiffAnchor>) -> bool {
@@ -862,26 +902,35 @@ fn trim_text(value: &str, max_length: usize) -> String {
     format!("{}…", truncated.trim_end())
 }
 
-fn code_tour_cache_key(
+fn code_tour_cache_key(detail: &PullRequestDetail, provider: CodeTourProvider) -> String {
+    code_tour_cache_key_from_parts(
+        &detail.repository,
+        detail.number,
+        provider,
+        &tour_code_version_key(detail),
+    )
+}
+
+fn code_tour_cache_key_from_parts(
     repository: &str,
     number: i64,
     provider: CodeTourProvider,
-    head_ref_oid: Option<&str>,
-    updated_at: &str,
+    code_version: &str,
 ) -> String {
-    let head_key = head_ref_oid
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("no-head");
-
     format!(
-        "{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}",
         CODE_TOUR_CACHE_KEY_PREFIX,
         provider.slug(),
         repository,
         number,
-        head_key,
-        updated_at
+        code_version,
     )
+}
+
+fn hash_text(value: &str) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(value.as_bytes());
+    format!("{:x}", hasher.finalize())
 }
 
 fn now_ms() -> i64 {
@@ -889,4 +938,88 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as i64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::github::PullRequestDetail;
+
+    fn detail(updated_at: &str, head_ref_oid: Option<&str>, raw_diff: &str) -> PullRequestDetail {
+        PullRequestDetail {
+            id: "pr1".to_string(),
+            repository: "acme/api".to_string(),
+            number: 42,
+            title: "Test PR".to_string(),
+            body: String::new(),
+            url: "https://example.com/pr/42".to_string(),
+            author_login: "octocat".to_string(),
+            state: "OPEN".to_string(),
+            is_draft: false,
+            review_decision: None,
+            base_ref_name: "main".to_string(),
+            head_ref_name: "feature/test".to_string(),
+            base_ref_oid: Some("base123".to_string()),
+            head_ref_oid: head_ref_oid.map(str::to_string),
+            additions: 1,
+            deletions: 1,
+            changed_files: 1,
+            comments_count: 0,
+            commits_count: 1,
+            created_at: "2026-04-17T00:00:00Z".to_string(),
+            updated_at: updated_at.to_string(),
+            labels: Vec::new(),
+            reviewers: Vec::new(),
+            comments: Vec::new(),
+            latest_reviews: Vec::new(),
+            review_threads: Vec::new(),
+            files: Vec::new(),
+            raw_diff: raw_diff.to_string(),
+            parsed_diff: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn build_tour_request_key_ignores_metadata_only_updates_when_head_matches() {
+        let first = detail(
+            "2026-04-17T10:00:00Z",
+            Some("head123"),
+            "diff --git a/a b/a\n+one\n",
+        );
+        let second = detail(
+            "2026-04-17T11:00:00Z",
+            Some("head123"),
+            "diff --git a/a b/a\n+one\n",
+        );
+
+        assert_eq!(
+            build_tour_request_key(&first, CodeTourProvider::Copilot),
+            build_tour_request_key(&second, CodeTourProvider::Copilot),
+        );
+    }
+
+    #[test]
+    fn build_tour_request_key_falls_back_to_diff_hash_without_head_oid() {
+        let first = detail("2026-04-17T10:00:00Z", None, "diff --git a/a b/a\n+one\n");
+        let second = detail("2026-04-17T11:00:00Z", None, "diff --git a/a b/a\n+one\n");
+        let changed = detail("2026-04-17T11:00:00Z", None, "diff --git a/a b/a\n+two\n");
+
+        assert_eq!(
+            build_tour_request_key(&first, CodeTourProvider::Codex),
+            build_tour_request_key(&second, CodeTourProvider::Codex),
+        );
+        assert_ne!(
+            build_tour_request_key(&first, CodeTourProvider::Codex),
+            build_tour_request_key(&changed, CodeTourProvider::Codex),
+        );
+    }
+
+    #[test]
+    fn code_tour_settings_default_to_disabled_repositories() {
+        let settings = CodeTourSettings::default();
+
+        assert_eq!(settings.provider, CodeTourProvider::Codex);
+        assert!(settings.automatic_repositories.is_empty());
+        assert!(!settings.automatically_generates_for("acme/api"));
+    }
 }
