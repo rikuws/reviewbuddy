@@ -1,28 +1,16 @@
-use std::{
-    collections::{HashMap, HashSet},
-    env,
-    io::{BufRead, BufReader, Read, Write},
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    sync::mpsc,
-    thread,
-    time::Duration,
-};
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::{
+    agents,
     cache::CacheStore,
     diff::{DiffLineKind, ParsedDiffFile, ParsedDiffLine},
     github::{PullRequestDetail, PullRequestFile, PullRequestReviewThread},
 };
 
 const CODE_TOUR_CACHE_KEY_PREFIX: &str = "code-tour-v2";
-const BUNDLED_BRIDGE_SCRIPT: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/code-tour-bridge.bundle.mjs"));
-const CODE_TOUR_PROJECT_ROOT_ENV: &str = "GH_UI_CODE_TOUR_PROJECT_ROOT";
-const CODE_TOUR_LOG_DIR_ENV: &str = "GH_UI_CODE_TOUR_LOG_DIR";
-const CODE_TOUR_BRIDGE_PROGRESS_PREFIX: &str = "__GH_UI_PROGRESS__";
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -214,35 +202,8 @@ pub struct GenerateCodeTourInput {
     pub candidate_groups: Vec<CodeTourCandidateGroup>,
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct CodeTourBridgeRequest<'a> {
-    action: &'a str,
-    provider: Option<CodeTourProvider>,
-    context: Option<&'a GenerateCodeTourInput>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodeTourProviderStatusesResponse {
-    providers: Vec<CodeTourProviderStatus>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct CodeTourGenerationResponse {
-    tour: GeneratedCodeTour,
-}
-
 pub fn load_code_tour_provider_statuses() -> Result<Vec<CodeTourProviderStatus>, String> {
-    let response =
-        run_code_tour_bridge::<_, CodeTourProviderStatusesResponse>(&CodeTourBridgeRequest {
-            action: "status",
-            provider: None,
-            context: None,
-        })?;
-
-    Ok(response.providers)
+    Ok(agents::load_all_statuses())
 }
 
 pub fn load_code_tour(
@@ -289,14 +250,11 @@ where
         return Err("Code tour generation needs at least one candidate step.".to_string());
     }
 
-    let response = run_code_tour_bridge_with_progress::<_, CodeTourGenerationResponse, _>(
-        &CodeTourBridgeRequest {
-            action: "generate",
-            provider: Some(input.provider),
-            context: Some(&input),
-        },
-        |progress| on_progress(progress),
-    )?;
+    let backend = agents::backend_for(input.provider);
+    let mut progress_sink: Box<dyn FnMut(CodeTourProgressUpdate)> =
+        Box::new(|progress| on_progress(progress));
+    let tour = backend.generate(&input, progress_sink.as_mut())?;
+
     let cache_key = code_tour_cache_key(
         &input.repository,
         input.number,
@@ -305,9 +263,9 @@ where
         &input.updated_at,
     );
 
-    cache.put(&cache_key, &response.tour, now_ms())?;
+    cache.put(&cache_key, &tour, now_ms())?;
 
-    Ok(response.tour)
+    Ok(tour)
 }
 
 pub fn build_code_tour_generation_input(
@@ -904,230 +862,6 @@ fn trim_text(value: &str, max_length: usize) -> String {
     format!("{}…", truncated.trim_end())
 }
 
-fn run_code_tour_bridge<T, R>(request: &T) -> Result<R, String>
-where
-    T: Serialize,
-    R: DeserializeOwned,
-{
-    run_code_tour_bridge_with_progress(request, |_| {})
-}
-
-fn run_code_tour_bridge_with_progress<T, R, F>(request: &T, mut on_progress: F) -> Result<R, String>
-where
-    T: Serialize,
-    R: DeserializeOwned,
-    F: FnMut(CodeTourProgressUpdate),
-{
-    let node = find_node_binary().ok_or_else(|| {
-        "Node.js is not installed. Install Node.js (https://nodejs.org) to use AI-powered code tours.".to_string()
-    })?;
-    let script_path = ensure_bridge_script()?;
-    let project_root = find_code_tour_project_root();
-    let request_json = serde_json::to_vec(request)
-        .map_err(|error| format!("Failed to serialize the code tour request: {error}"))?;
-    let mut command = Command::new(node);
-    command
-        .arg(&script_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if let Some(root) = project_root.as_ref() {
-        command.current_dir(root);
-        command.env(CODE_TOUR_PROJECT_ROOT_ENV, root);
-    } else {
-        command.current_dir(script_path.parent().unwrap_or(Path::new("/")));
-    }
-    command.env(CODE_TOUR_LOG_DIR_ENV, code_tour_log_directory());
-
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("Failed to launch the code tour bridge: {error}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(&request_json)
-            .map_err(|error| format!("Failed to write the code tour request: {error}"))?;
-    }
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "Failed to capture the code tour bridge stdout.".to_string())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "Failed to capture the code tour bridge stderr.".to_string())?;
-    let (progress_tx, progress_rx) = mpsc::channel::<CodeTourProgressUpdate>();
-    let stdout_handle = thread::spawn(move || -> Result<Vec<u8>, String> {
-        let mut output = Vec::new();
-        let mut reader = BufReader::new(stdout);
-        reader
-            .read_to_end(&mut output)
-            .map_err(|error| format!("Failed to read the code tour bridge stdout: {error}"))?;
-        Ok(output)
-    });
-    let stderr_handle = thread::spawn(move || -> Result<Vec<String>, String> {
-        let mut stderr_lines = Vec::new();
-        let reader = BufReader::new(stderr);
-
-        for line_result in reader.lines() {
-            let line = line_result
-                .map_err(|error| format!("Failed to read the code tour bridge stderr: {error}"))?;
-            if let Some(progress) = parse_bridge_progress_line(&line) {
-                let _ = progress_tx.send(progress);
-            } else if !line.trim().is_empty() {
-                stderr_lines.push(line);
-            }
-        }
-
-        Ok(stderr_lines)
-    });
-
-    let exit_status = loop {
-        while let Ok(progress) = progress_rx.try_recv() {
-            on_progress(progress);
-        }
-
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("Failed to wait for the code tour bridge: {error}"))?
-        {
-            break status;
-        }
-
-        thread::sleep(Duration::from_millis(40));
-    };
-
-    while let Ok(progress) = progress_rx.try_recv() {
-        on_progress(progress);
-    }
-
-    let stdout = stdout_handle
-        .join()
-        .map_err(|_| "Failed to join the code tour bridge stdout reader.".to_string())??;
-    let stderr_lines = stderr_handle
-        .join()
-        .map_err(|_| "Failed to join the code tour bridge stderr reader.".to_string())??;
-    let stderr = stderr_lines.join("\n").trim().to_string();
-
-    if !exit_status.success() {
-        let stdout = String::from_utf8_lossy(&stdout).trim().to_string();
-
-        return Err(if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            "The code tour bridge failed without an error message.".to_string()
-        });
-    }
-
-    serde_json::from_slice::<R>(&stdout).map_err(|error| {
-        let stderr_suffix = if stderr.is_empty() {
-            String::new()
-        } else {
-            format!(" Stderr: {stderr}")
-        };
-        format!(
-            "Failed to parse the code tour bridge response: {error}. Output: {}{}",
-            String::from_utf8_lossy(&stdout),
-            stderr_suffix
-        )
-    })
-}
-
-fn parse_bridge_progress_line(line: &str) -> Option<CodeTourProgressUpdate> {
-    let payload = line.strip_prefix(CODE_TOUR_BRIDGE_PROGRESS_PREFIX)?;
-    serde_json::from_str::<CodeTourProgressUpdate>(payload).ok()
-}
-
-fn ensure_bridge_script() -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join("gh-ui");
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| format!("Failed to create bridge script directory: {error}"))?;
-    let path = dir.join("code-tour-bridge.bundle.mjs");
-    std::fs::write(&path, BUNDLED_BRIDGE_SCRIPT)
-        .map_err(|error| format!("Failed to write the code tour bridge script: {error}"))?;
-    Ok(path)
-}
-
-fn code_tour_log_directory() -> PathBuf {
-    if let Some(data_dir) = dirs::data_local_dir() {
-        return data_dir.join("gh-ui-tool").join("logs").join("code-tours");
-    }
-
-    env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".gh-ui-tool")
-        .join("logs")
-        .join("code-tours")
-}
-
-fn find_code_tour_project_root() -> Option<PathBuf> {
-    if let Ok(path) = env::var(CODE_TOUR_PROJECT_ROOT_ENV) {
-        let candidate = PathBuf::from(path);
-        if is_code_tour_project_root(&candidate) {
-            return Some(candidate);
-        }
-    }
-
-    if let Ok(current_dir) = env::current_dir() {
-        if is_code_tour_project_root(&current_dir) {
-            return Some(current_dir);
-        }
-    }
-
-    if let Ok(current_exe) = env::current_exe() {
-        for ancestor in current_exe.ancestors() {
-            if is_code_tour_project_root(ancestor) {
-                return Some(ancestor.to_path_buf());
-            }
-        }
-    }
-
-    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if is_code_tour_project_root(manifest_dir) {
-        return Some(manifest_dir.to_path_buf());
-    }
-
-    None
-}
-
-fn is_code_tour_project_root(path: &Path) -> bool {
-    path.join("package.json").is_file() && path.join("scripts/code-tour-bridge.mjs").is_file()
-}
-
-fn find_node_binary() -> Option<String> {
-    if let Ok(binary) = std::env::var("GH_UI_TOOL_NODE_BINARY") {
-        let binary = binary.trim().to_string();
-        if !binary.is_empty() {
-            return Some(binary);
-        }
-    }
-
-    for candidate in [
-        "/opt/homebrew/bin/node",
-        "/usr/local/bin/node",
-        "/usr/bin/node",
-    ] {
-        if Path::new(candidate).exists() {
-            return Some(candidate.to_string());
-        }
-    }
-
-    match Command::new("node")
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => Some("node".to_string()),
-        _ => None,
-    }
-}
-
 fn code_tour_cache_key(
     repository: &str,
     number: i64,
@@ -1157,48 +891,3 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provider_status_bridge_smoke_test() {
-        if find_node_binary().is_none() {
-            return;
-        }
-
-        let statuses = load_code_tour_provider_statuses()
-            .expect("Expected the bundled code tour bridge to return provider statuses.");
-
-        assert_eq!(statuses.len(), CodeTourProvider::all().len());
-        assert!(statuses
-            .iter()
-            .any(|status| status.provider == CodeTourProvider::Codex));
-        assert!(statuses
-            .iter()
-            .any(|status| status.provider == CodeTourProvider::Copilot));
-    }
-
-    #[test]
-    fn parses_bridge_progress_lines() {
-        let progress = CodeTourProgressUpdate {
-            stage: "tool".to_string(),
-            summary: "Running search".to_string(),
-            detail: Some("rg src/views".to_string()),
-            log: Some("rg src/views".to_string()),
-            log_file_path: Some("/tmp/gh-ui-tool/logs/code-tours/run.log".to_string()),
-        };
-        let line = format!(
-            "{}{}",
-            CODE_TOUR_BRIDGE_PROGRESS_PREFIX,
-            serde_json::to_string(&progress).expect("serialize progress")
-        );
-
-        assert_eq!(parse_bridge_progress_line(&line), Some(progress));
-    }
-
-    #[test]
-    fn ignores_non_progress_lines() {
-        assert_eq!(parse_bridge_progress_line("plain stderr line"), None);
-    }
-}

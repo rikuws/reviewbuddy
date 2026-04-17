@@ -1,3 +1,4 @@
+mod agents;
 mod app_assets;
 mod app_storage;
 mod cache;
