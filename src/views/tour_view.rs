@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, sync::mpsc, time::Duration};
+use std::{
+    collections::BTreeSet,
+    sync::{mpsc, Arc},
+    time::Duration,
+};
 
 use gpui::prelude::*;
 use gpui::*;
@@ -912,19 +916,27 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
     let provider_error = s.code_tour_provider_error.clone();
     let provider = s.selected_tour_provider;
     let provider_status = s.selected_tour_provider_status().cloned();
-    let tour_state = s.active_tour_state().cloned().unwrap_or_default();
+    let tour_state = s.active_tour_state();
     let local_repo_status = detail_state.and_then(|state| state.local_repository_status.clone());
     let local_repo_loading = detail_state
         .map(|state| state.local_repository_loading)
         .unwrap_or(false);
     let local_repo_error = detail_state.and_then(|state| state.local_repository_error.clone());
-    let tour_progress_summary = tour_state.progress_summary.clone();
-    let tour_progress_detail = tour_state.progress_detail.clone();
-    let tour_progress_log = tour_state.progress_log.clone();
-    let tour_progress_log_file_path = tour_state.progress_log_file_path.clone();
+    let tour_loading = tour_state.map(|state| state.loading).unwrap_or(false);
+    let tour_generating = tour_state.map(|state| state.generating).unwrap_or(false);
+    let tour_progress_summary = tour_state.and_then(|state| state.progress_summary.clone());
+    let tour_progress_detail = tour_state.and_then(|state| state.progress_detail.clone());
+    let tour_progress_log = tour_state
+        .map(|state| state.progress_log.clone())
+        .unwrap_or_default();
+    let tour_progress_log_file_path =
+        tour_state.and_then(|state| state.progress_log_file_path.clone());
+    let tour_error = tour_state.and_then(|state| state.error.clone());
+    let tour_message = tour_state.and_then(|state| state.message.clone());
+    let tour_success = tour_state.map(|state| state.success).unwrap_or(false);
 
-    let generated_tour = tour_state.document.clone();
-    let overview_step = generated_tour.as_ref().and_then(|tour| {
+    let generated_tour = tour_state.and_then(|state| state.document.as_ref());
+    let overview_step = generated_tour.and_then(|tour| {
         tour.steps
             .iter()
             .find(|step| step.kind == "overview")
@@ -968,7 +980,7 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
 
     let state_for_provider = state.clone();
     let state_for_generate = state.clone();
-    let pending_generate_label = if tour_state.generating {
+    let pending_generate_label = if tour_generating {
         provider
             .map(|provider| format!("Generating with {}...", provider.label()))
             .unwrap_or_else(|| "Generating guide...".to_string())
@@ -978,6 +990,7 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
         "Choose a provider".to_string()
     };
     let scroll_handle = s.tour_content_scroll_handle.clone();
+    let tour_list_state = s.tour_content_list_state.clone();
 
     if generated_tour.is_none() {
         let scroll_handle_for_pending = scroll_handle.clone();
@@ -1015,16 +1028,16 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
                         provider,
                         &provider_statuses,
                         provider_loading,
-                        tour_state.generating,
-                        generated_tour.as_ref(),
+                        tour_generating,
+                        generated_tour,
                     ))
                     .child(render_pending_panel(
                         provider,
                         provider_status.as_ref(),
                         &provider_statuses,
                         provider_loading,
-                        tour_state.loading,
-                        tour_state.generating,
+                        tour_loading,
+                        tour_generating,
                         tour_progress_summary.as_deref(),
                         tour_progress_detail.as_deref(),
                         &tour_progress_log,
@@ -1052,11 +1065,11 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
                     .when_some(local_repo_error, |el, error| {
                         el.child(div().mt(px(12.0)).child(error_text(&error)))
                     })
-                    .when_some(tour_state.error, |el, error| {
+                    .when_some(tour_error.clone(), |el, error| {
                         el.child(div().mt(px(12.0)).child(error_text(&error)))
                     })
-                    .when_some(tour_state.message, |el, message| {
-                        if tour_state.success {
+                    .when_some(tour_message.clone(), |el, message| {
+                        if tour_success {
                             el.child(div().mt(px(12.0)).child(success_text(&message)))
                         } else {
                             el.child(div().mt(px(12.0)).child(error_text(&message)))
@@ -1066,121 +1079,100 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
             .into_any_element();
     }
 
-    let generated_tour = generated_tour.unwrap();
+    let generated_tour = Arc::new(generated_tour.unwrap().clone());
+    let overview_meta = TourOverviewMeta {
+        author_login: detail.author_login.clone(),
+        base_ref_name: detail.base_ref_name.clone(),
+        head_ref_name: detail.head_ref_name.clone(),
+    };
     let state_for_outline = state.clone();
     let tour_request_key = s
         .active_tour_request_key()
         .unwrap_or_else(|| format!("detached:{}", generated_tour.generated_at));
-    let mut content_children = Vec::<AnyElement>::new();
+    let tour_shared = TourRenderShared {
+        state: state.clone(),
+        provider,
+        provider_statuses: provider_statuses.clone(),
+        provider_loading,
+        tour_generating,
+        tour_progress_summary: tour_progress_summary.clone(),
+        tour_progress_detail: tour_progress_detail.clone(),
+        tour_progress_log: tour_progress_log.clone(),
+        tour_progress_log_file_path: tour_progress_log_file_path.clone(),
+        local_repo_status: local_repo_status.clone(),
+        local_repo_loading,
+        provider_error: provider_error.clone(),
+        local_repo_error: local_repo_error.clone(),
+        tour_error: tour_error.clone(),
+        tour_message: tour_message.clone(),
+        tour_success,
+        overview_step: overview_step.clone(),
+        overview_meta,
+        generated_tour: generated_tour.clone(),
+    };
+    let mut content_items = Vec::<TourContentItem>::new();
     let mut scroll_targets = Vec::<(String, usize)>::new();
 
-    content_children.push(
-        render_provider_bar(
-            &state_for_provider,
-            provider,
-            &provider_statuses,
-            provider_loading,
-            tour_state.generating,
-            Some(&generated_tour),
-        )
-        .into_any_element(),
-    );
-    content_children.push(
-        div()
-            .flex()
-            .gap(px(8.0))
-            .flex_wrap()
-            .text_size(px(12.0))
-            .text_color(fg_muted())
-            .child(badge(&format!(
-                "{} sections",
-                generated_tour.sections.len()
-            )))
-            .child(badge(&format!(
-                "{} changed files covered",
-                generated_tour.steps.len().saturating_sub(1)
-            )))
-            .child(badge(&count_tour_callsites(&generated_tour)))
-            .when(local_repo_loading, |el| {
-                el.child(badge("Preparing checkout"))
-            })
-            .when_some(local_repo_status.clone(), |el, status| {
-                let status_badge = if !status.is_valid_repository {
-                    if status.exists {
-                        "needs repair"
-                    } else {
-                        "checkout pending"
-                    }
-                } else if status.ready_for_local_features {
-                    "PR head ready"
-                } else if !status.matches_expected_head {
-                    "needs sync"
-                } else if !status.is_worktree_clean {
-                    "dirty checkout"
-                } else {
-                    "checkout pending"
-                };
+    content_items.push(TourContentItem::ProviderBar);
+    content_items.push(TourContentItem::Summary);
+    if tour_generating {
+        content_items.push(TourContentItem::Progress);
+    }
+    if provider_error.is_some() {
+        content_items.push(TourContentItem::ProviderError);
+    }
+    if local_repo_error.is_some() {
+        content_items.push(TourContentItem::LocalRepoError);
+    }
+    if tour_error.is_some() {
+        content_items.push(TourContentItem::TourError);
+    }
+    if tour_message.is_some() {
+        content_items.push(TourContentItem::TourMessage);
+    }
+    scroll_targets.push(("overview".to_string(), content_items.len()));
+    content_items.push(TourContentItem::Overview);
+    for (section_ix, section) in generated_tour.sections.iter().enumerate() {
+        scroll_targets.push((section.id.clone(), content_items.len()));
+        content_items.push(TourContentItem::Section(section_ix));
+    }
+    content_items.push(TourContentItem::Spacer);
 
-                el.child(badge(match status.source.as_str() {
-                    "linked" => "linked checkout",
-                    _ => "managed checkout",
-                }))
-                .child(badge(status_badge))
-            })
-            .into_any_element(),
-    );
-
-    if tour_state.generating {
-        content_children.push(
-            render_tour_progress_panel(
-                provider,
-                tour_progress_summary.as_deref(),
-                tour_progress_detail.as_deref(),
-                &tour_progress_log,
-                tour_progress_log_file_path.as_deref(),
-            )
-            .into_any_element(),
-        );
-    }
-    if let Some(error) = provider_error.clone() {
-        content_children.push(error_text(&error).into_any_element());
-    }
-    if let Some(error) = local_repo_error.clone() {
-        content_children.push(error_text(&error).into_any_element());
-    }
-    if let Some(error) = tour_state.error.clone() {
-        content_children.push(error_text(&error).into_any_element());
-    }
-    if let Some(message) = tour_state.message.clone() {
-        content_children.push(if tour_state.success {
-            success_text(&message).into_any_element()
-        } else {
-            error_text(&message).into_any_element()
-        });
-    }
-    scroll_targets.push(("overview".to_string(), content_children.len()));
-    content_children.push(
-        render_overview_card(
-            detail,
-            overview_step.as_ref(),
-            &generated_tour.open_questions,
-            &generated_tour.warnings,
-        )
-        .into_any_element(),
-    );
-
-    for section in &generated_tour.sections {
-        scroll_targets.push((section.id.clone(), content_children.len()));
-        content_children.push(
-            render_section_card(state, detail, &generated_tour, section, cx).into_any_element(),
-        );
+    if tour_list_state.item_count() != content_items.len() {
+        tour_list_state.reset(content_items.len());
     }
 
-    content_children.push(div().h(px(28.0)).w_full().into_any_element());
+    let content_items = Arc::new(content_items);
     let section_targets_for_scroll = scroll_targets.clone();
     let section_targets_for_sidebar = scroll_targets.clone();
-    let scroll_handle_for_wheel = scroll_handle.clone();
+    let list_state_for_scroll = tour_list_state.clone();
     let state_for_scroll = state.clone();
+    list_state_for_scroll.set_scroll_handler(move |event, window, _| {
+        let state = state_for_scroll.clone();
+        let request_key = tour_request_key.clone();
+        let targets = section_targets_for_scroll.clone();
+        let active_id = targets
+            .iter()
+            .take_while(|(_, index)| *index <= event.visible_range.start)
+            .last()
+            .map(|(id, _)| id.clone())
+            .unwrap_or_else(|| "overview".to_string());
+        let compact = event.is_scrolled;
+
+        window.on_next_frame(move |_, cx| {
+            state.update(cx, |state, cx| {
+                if state.active_tour_request_key().as_deref() != Some(&request_key) {
+                    return;
+                }
+
+                if state.active_tour_outline_id != active_id || state.pr_header_compact != compact {
+                    state.active_tour_outline_id = active_id.clone();
+                    state.pr_header_compact = compact;
+                    cx.notify();
+                }
+            });
+        });
+    });
 
     div()
         .flex()
@@ -1216,7 +1208,7 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
                 .children(outline_items.into_iter().map(|(id, title, meta)| {
                     let is_active = id == active_outline_id;
                     let state = state_for_outline.clone();
-                    let scroll_handle = scroll_handle.clone();
+                    let list_state = tour_list_state.clone();
                     let target_index = section_targets_for_sidebar
                         .iter()
                         .find(|(target_id, _)| target_id == &id)
@@ -1245,7 +1237,10 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
                                 state.pr_header_compact = target_index > 0;
                                 cx.notify();
                             });
-                            scroll_handle.scroll_to_top_of_item(target_index);
+                            list_state.scroll_to(ListOffset {
+                                item_ix: target_index,
+                                offset_in_item: px(0.0),
+                            });
                         })
                         .child(
                             div()
@@ -1265,49 +1260,23 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
         )
         .child(
             div()
+                .flex()
+                .flex_col()
                 .flex_grow()
                 .min_h_0()
                 .min_w_0()
                 .px(px(32.0))
                 .pb(px(28.0))
-                .id("tour-content-scroll")
-                .overflow_y_scroll()
-                .track_scroll(&scroll_handle_for_wheel)
-                .on_scroll_wheel(move |_, window, _cx| {
-                    let scroll_handle = scroll_handle_for_wheel.clone();
-                    let state = state_for_scroll.clone();
-                    let request_key = tour_request_key.clone();
-                    let targets = section_targets_for_scroll.clone();
-
-                    window.on_next_frame(move |_, cx| {
-                        let top_item = scroll_handle.top_item();
-                        let active_id = targets
-                            .iter()
-                            .take_while(|(_, index)| *index <= top_item)
-                            .last()
-                            .map(|(id, _)| id.clone())
-                            .unwrap_or_else(|| "overview".to_string());
-
-                        state.update(cx, |state, cx| {
-                            if state.active_tour_request_key().as_deref() != Some(&request_key) {
-                                return;
-                            }
-
-                            let compact = scroll_handle.offset().y < px(0.0);
-                            if state.active_tour_outline_id != active_id
-                                || state.pr_header_compact != compact
-                            {
-                                state.active_tour_outline_id = active_id.clone();
-                                state.pr_header_compact = compact;
-                                cx.notify();
-                            }
-                        });
-                    });
-                })
-                .flex()
-                .flex_col()
-                .gap(px(16.0))
-                .children(content_children),
+                .child(
+                    list(tour_list_state.clone(), {
+                        let shared = tour_shared.clone();
+                        let items = content_items.clone();
+                        move |ix, _window, cx| render_tour_content_item(&shared, items[ix], cx)
+                    })
+                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                    .flex_grow()
+                    .min_h_0(),
+                ),
         )
         .into_any_element()
 }
@@ -1702,6 +1671,164 @@ fn render_tour_progress_log(progress_log: &[String]) -> impl IntoElement {
         }))
 }
 
+#[derive(Clone, Copy)]
+enum TourContentItem {
+    ProviderBar,
+    Summary,
+    Progress,
+    ProviderError,
+    LocalRepoError,
+    TourError,
+    TourMessage,
+    Overview,
+    Section(usize),
+    Spacer,
+}
+
+#[derive(Clone)]
+struct TourOverviewMeta {
+    author_login: String,
+    base_ref_name: String,
+    head_ref_name: String,
+}
+
+#[derive(Clone)]
+struct TourRenderShared {
+    state: Entity<AppState>,
+    provider: Option<CodeTourProvider>,
+    provider_statuses: Vec<CodeTourProviderStatus>,
+    provider_loading: bool,
+    tour_generating: bool,
+    tour_progress_summary: Option<String>,
+    tour_progress_detail: Option<String>,
+    tour_progress_log: Vec<String>,
+    tour_progress_log_file_path: Option<String>,
+    local_repo_status: Option<local_repo::LocalRepositoryStatus>,
+    local_repo_loading: bool,
+    provider_error: Option<String>,
+    local_repo_error: Option<String>,
+    tour_error: Option<String>,
+    tour_message: Option<String>,
+    tour_success: bool,
+    overview_step: Option<TourStep>,
+    overview_meta: TourOverviewMeta,
+    generated_tour: Arc<GeneratedCodeTour>,
+}
+
+fn render_tour_content_item(
+    shared: &TourRenderShared,
+    item: TourContentItem,
+    cx: &App,
+) -> AnyElement {
+    let content = match item {
+        TourContentItem::ProviderBar => render_provider_bar(
+            &shared.state,
+            shared.provider,
+            &shared.provider_statuses,
+            shared.provider_loading,
+            shared.tour_generating,
+            Some(shared.generated_tour.as_ref()),
+        )
+        .into_any_element(),
+        TourContentItem::Summary => div()
+            .flex()
+            .gap(px(8.0))
+            .flex_wrap()
+            .text_size(px(12.0))
+            .text_color(fg_muted())
+            .child(badge(&format!(
+                "{} sections",
+                shared.generated_tour.sections.len()
+            )))
+            .child(badge(&format!(
+                "{} changed files covered",
+                shared.generated_tour.steps.len().saturating_sub(1)
+            )))
+            .child(badge(&count_tour_callsites(shared.generated_tour.as_ref())))
+            .when(shared.local_repo_loading, |el| {
+                el.child(badge("Preparing checkout"))
+            })
+            .when_some(shared.local_repo_status.clone(), |el, status| {
+                let status_badge = if !status.is_valid_repository {
+                    if status.exists {
+                        "needs repair"
+                    } else {
+                        "checkout pending"
+                    }
+                } else if status.ready_for_local_features {
+                    "PR head ready"
+                } else if !status.matches_expected_head {
+                    "needs sync"
+                } else if !status.is_worktree_clean {
+                    "dirty checkout"
+                } else {
+                    "checkout pending"
+                };
+
+                el.child(badge(match status.source.as_str() {
+                    "linked" => "linked checkout",
+                    _ => "managed checkout",
+                }))
+                .child(badge(status_badge))
+            })
+            .into_any_element(),
+        TourContentItem::Progress => render_tour_progress_panel(
+            shared.provider,
+            shared.tour_progress_summary.as_deref(),
+            shared.tour_progress_detail.as_deref(),
+            &shared.tour_progress_log,
+            shared.tour_progress_log_file_path.as_deref(),
+        )
+        .into_any_element(),
+        TourContentItem::ProviderError => shared
+            .provider_error
+            .as_deref()
+            .map(|error| error_text(error).into_any_element())
+            .unwrap_or_else(|| div().into_any_element()),
+        TourContentItem::LocalRepoError => shared
+            .local_repo_error
+            .as_deref()
+            .map(|error| error_text(error).into_any_element())
+            .unwrap_or_else(|| div().into_any_element()),
+        TourContentItem::TourError => shared
+            .tour_error
+            .as_deref()
+            .map(|error| error_text(error).into_any_element())
+            .unwrap_or_else(|| div().into_any_element()),
+        TourContentItem::TourMessage => shared
+            .tour_message
+            .as_deref()
+            .map(|message| {
+                if shared.tour_success {
+                    success_text(message).into_any_element()
+                } else {
+                    error_text(message).into_any_element()
+                }
+            })
+            .unwrap_or_else(|| div().into_any_element()),
+        TourContentItem::Overview => render_overview_card(
+            &shared.overview_meta,
+            shared.overview_step.as_ref(),
+            &shared.generated_tour.open_questions,
+            &shared.generated_tour.warnings,
+        )
+        .into_any_element(),
+        TourContentItem::Section(section_ix) => render_section_card(
+            &shared.state,
+            shared.generated_tour.as_ref(),
+            &shared.generated_tour.sections[section_ix],
+            cx,
+        )
+        .into_any_element(),
+        TourContentItem::Spacer => div().h(px(28.0)).w_full().into_any_element(),
+    };
+
+    match item {
+        TourContentItem::Spacer => content,
+        _ => div().pb(px(16.0)).child(content).into_any_element(),
+    }
+}
+
 fn render_note_section(title: &str, items: &[String]) -> impl IntoElement {
     div()
         .mt(px(16.0))
@@ -1756,7 +1883,7 @@ fn render_note_section(title: &str, items: &[String]) -> impl IntoElement {
 }
 
 fn render_overview_card(
-    detail: &github::PullRequestDetail,
+    meta: &TourOverviewMeta,
     overview_step: Option<&TourStep>,
     open_questions: &[String],
     warnings: &[String],
@@ -1807,9 +1934,9 @@ fn render_overview_card(
                     .gap(px(8.0))
                     .flex_wrap()
                     .mt(px(14.0))
-                    .child(badge(&detail.author_login))
-                    .child(badge(&detail.base_ref_name))
-                    .child(badge(&detail.head_ref_name))
+                    .child(badge(&meta.author_login))
+                    .child(badge(&meta.base_ref_name))
+                    .child(badge(&meta.head_ref_name))
                     .child(badge(&format!(
                         "+{} / -{}",
                         overview_step.additions, overview_step.deletions
@@ -1844,21 +1971,14 @@ fn render_overview_card(
 
 fn render_section_card(
     state: &Entity<AppState>,
-    detail: &github::PullRequestDetail,
     generated_tour: &GeneratedCodeTour,
     section: &TourSection,
     cx: &App,
 ) -> impl IntoElement {
-    let steps_by_id = generated_tour
-        .steps
-        .iter()
-        .map(|step| (step.id.clone(), step.clone()))
-        .collect::<std::collections::HashMap<_, _>>();
     let section_steps = section
         .step_ids
         .iter()
-        .filter_map(|step_id| steps_by_id.get(step_id))
-        .cloned()
+        .filter_map(|step_id| generated_tour.steps.iter().find(|step| step.id == *step_id))
         .collect::<Vec<_>>();
 
     let state_for_open = state.clone();
@@ -1938,7 +2058,6 @@ fn render_section_card(
                                     render_tour_step_row(
                                         &state_for_open,
                                         &state_for_toggle,
-                                        detail,
                                         step,
                                         index > 0,
                                         cx,
@@ -1957,8 +2076,7 @@ fn render_section_card(
 fn render_tour_step_row(
     open_state: &Entity<AppState>,
     toggle_state: &Entity<AppState>,
-    detail: &github::PullRequestDetail,
-    step: TourStep,
+    step: &TourStep,
     show_divider: bool,
     cx: &App,
 ) -> impl IntoElement {
@@ -1977,6 +2095,22 @@ fn render_tour_step_row(
     let open_state = open_state.clone();
     let toggle_state = toggle_state.clone();
     let open_step = step.clone();
+    let diff_file = toggle_state
+        .read(cx)
+        .active_detail()
+        .map(|detail| {
+            render_tour_diff_file(
+                &toggle_state,
+                detail,
+                &step.id,
+                step.file_path.as_deref(),
+                step.snippet.as_deref(),
+                step.anchor.as_ref(),
+                cx,
+            )
+            .into_any_element()
+        })
+        .unwrap_or_else(|| div().into_any_element());
 
     div()
         .when(show_divider, |el| {
@@ -2060,7 +2194,7 @@ fn render_tour_step_row(
                     .child(step.detail.clone()),
             )
         })
-        .when(!changeset_collapsed, |el| {
+        .when(!changeset_collapsed, move |el| {
             el.child(
                 div()
                     .flex()
@@ -2081,15 +2215,7 @@ fn render_tour_step_row(
                         }
                     ))),
             )
-            .child(render_tour_diff_file(
-                &toggle_state,
-                detail,
-                &step.id,
-                step.file_path.as_deref(),
-                step.snippet.as_deref(),
-                step.anchor.as_ref(),
-                cx,
-            ))
+            .child(diff_file)
         })
 }
 
@@ -2254,6 +2380,10 @@ fn toggle_tour_panel(state: &Entity<AppState>, panel_key: &str, cx: &mut App) {
         if !state.collapsed_tour_panels.insert(panel_key.to_string()) {
             state.collapsed_tour_panels.remove(panel_key);
         }
+        let item_count = state.tour_content_list_state.item_count();
+        state
+            .tour_content_list_state
+            .splice(0..item_count, item_count);
         cx.notify();
     });
 }

@@ -2745,13 +2745,7 @@ fn render_tour_diff_preview(
         .border_color(border_default())
         .bg(bg_surface())
         .overflow_hidden()
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .bg(bg_inset())
-                .children(elements),
-        )
+        .child(div().flex().flex_col().bg(bg_inset()).children(elements))
 }
 
 fn render_full_tour_diff_preview(

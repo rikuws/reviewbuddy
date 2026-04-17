@@ -281,6 +281,7 @@ pub struct AppState {
     pub active_tour_outline_id: String,
     pub collapsed_tour_panels: std::collections::HashSet<String>,
     pub tour_content_scroll_handle: ScrollHandle,
+    pub tour_content_list_state: ListState,
     pub managed_lsp_settings: ManagedLspSettingsState,
 }
 
@@ -328,6 +329,7 @@ impl AppState {
             active_tour_outline_id: "overview".to_string(),
             collapsed_tour_panels: std::collections::HashSet::new(),
             tour_content_scroll_handle: ScrollHandle::new(),
+            tour_content_list_state: ListState::new(0, ListAlignment::Top, px(600.0)),
             managed_lsp_settings: ManagedLspSettingsState::default(),
         }
     }
