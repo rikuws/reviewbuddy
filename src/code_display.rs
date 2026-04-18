@@ -13,6 +13,7 @@ use gpui::*;
 use crate::code_tour::DiffAnchor;
 use crate::lsp;
 use crate::markdown::render_markdown;
+use crate::selectable_text::SelectableText;
 use crate::state::{AppState, PreparedFileContent, PreparedFileLine};
 use crate::syntax::{self, SyntaxSpan};
 use crate::theme::*;
@@ -62,12 +63,11 @@ struct PreparedFileLspQuery {
     request: lsp::LspTextDocumentRequest,
 }
 
-pub fn styled_code_text(spans: &[SyntaxSpan]) -> Option<StyledText> {
+pub fn code_text_runs(spans: &[SyntaxSpan]) -> Option<Vec<TextRun>> {
     if spans.is_empty() {
         return None;
     }
 
-    let mut text = String::new();
     let mut runs = Vec::with_capacity(spans.len());
 
     for span in spans {
@@ -75,7 +75,6 @@ pub fn styled_code_text(spans: &[SyntaxSpan]) -> Option<StyledText> {
             continue;
         }
 
-        text.push_str(&span.text);
         runs.push(TextRun {
             len: span.text.len(),
             font: font("Fira Code"),
@@ -86,10 +85,19 @@ pub fn styled_code_text(spans: &[SyntaxSpan]) -> Option<StyledText> {
         });
     }
 
-    if text.is_empty() {
-        None
+    (!runs.is_empty()).then_some(runs)
+}
+
+fn styled_selectable_code_text(
+    id: impl Into<SharedString>,
+    text: &str,
+    spans: &[SyntaxSpan],
+) -> SelectableText {
+    let text = text.to_string();
+    if let Some(runs) = code_text_runs(spans) {
+        SelectableText::new(id, text).with_runs(runs)
     } else {
-        Some(StyledText::new(text).with_runs(runs))
+        SelectableText::new(id, text)
     }
 }
 
@@ -234,11 +242,9 @@ fn render_highlighted_code_lines(lines: Vec<HighlightedCodeLine>) -> impl IntoEl
                 .text_color(fg_default())
                 .flex()
                 .flex_col()
-                .children(
-                    lines
-                        .into_iter()
-                        .map(|line| render_code_line(line, show_line_numbers)),
-                ),
+                .children(lines.into_iter().enumerate().map(|(line_ix, line)| {
+                    render_code_line(block_id, line_ix, line, show_line_numbers)
+                })),
         )
 }
 
@@ -294,7 +300,12 @@ fn render_prepared_code_lines(
         )
 }
 
-fn render_code_line(line: HighlightedCodeLine, show_line_numbers: bool) -> Div {
+fn render_code_line(
+    block_id: usize,
+    line_ix: usize,
+    line: HighlightedCodeLine,
+    show_line_numbers: bool,
+) -> Div {
     let line_div = div()
         .w_full()
         .min_w_0()
@@ -302,7 +313,7 @@ fn render_code_line(line: HighlightedCodeLine, show_line_numbers: bool) -> Div {
         .flex()
         .items_start();
     let line_number = line.line_number;
-    let code = render_code_line_content(line.text, line.spans);
+    let code = render_code_line_content(block_id, line_ix, line.text, line.spans);
 
     if show_line_numbers {
         line_div
@@ -325,15 +336,26 @@ fn render_code_line(line: HighlightedCodeLine, show_line_numbers: bool) -> Div {
     }
 }
 
-fn render_code_line_content(line: String, spans: Vec<SyntaxSpan>) -> Div {
+fn render_code_line_content(
+    block_id: usize,
+    line_ix: usize,
+    line: String,
+    spans: Vec<SyntaxSpan>,
+) -> Div {
     let code_div = div().w_full().min_w_0().font_family("Fira Code");
 
-    if let Some(styled) = styled_code_text(&spans) {
-        code_div.child(styled)
+    if let Some(runs) = code_text_runs(&spans) {
+        code_div.child(
+            SelectableText::new(format!("code-block-{block_id}-line-{line_ix}"), line)
+                .with_runs(runs),
+        )
     } else if line.is_empty() {
         code_div.child("\u{00a0}".to_string())
     } else {
-        code_div.child(line)
+        code_div.child(SelectableText::new(
+            format!("code-block-{block_id}-line-{line_ix}"),
+            line,
+        ))
     }
 }
 
@@ -375,8 +397,6 @@ fn render_prepared_code_line_content(
         return code_div.child("\u{00a0}".to_string());
     }
 
-    let styled =
-        styled_code_text(&line.spans).unwrap_or_else(|| StyledText::new(line.text.clone()));
     let token_ranges = Arc::new(build_interactive_code_tokens(&line.text));
 
     if let Some(lsp_context) = lsp_context.filter(|_| !token_ranges.is_empty()) {
@@ -388,53 +408,51 @@ fn render_prepared_code_line_content(
         let click_tokens = token_ranges.clone();
         let click_ranges: Vec<std::ops::Range<usize>> =
             token_ranges.iter().map(|t| t.byte_range.clone()).collect();
-        let element_id = ElementId::Name(
+        let interactive = styled_selectable_code_text(
             format!(
                 "prepared-code-lsp:{}:{}:{}",
                 block_id, lsp_context.file.file_path, lsp_context.line_number
-            )
-            .into(),
-        );
-
-        let interactive = InteractiveText::new(element_id, styled)
-            .on_click(click_ranges, move |range_ix, window, cx| {
-                let token = &click_tokens[range_ix];
-                let Some(query) =
-                    click_context.query_for_index(token.byte_range.start, click_tokens.as_ref())
-                else {
-                    return;
-                };
-                navigate_to_prepared_file_lsp_definition(query, window, cx);
-            })
-            .on_hover(move |index, _event, window, cx| {
-                let Some(index) = index else {
-                    return;
-                };
-                let Some(query) = hover_context.query_for_index(index, hover_tokens.as_ref())
-                else {
-                    return;
-                };
-                request_prepared_file_lsp_details(query, window, cx);
-            })
-            .tooltip(move |index, _window, cx| {
-                let query = tooltip_context.query_for_index(index, tooltip_tokens.as_ref())?;
-                Some(build_lsp_hover_tooltip_view(
-                    query.state.clone(),
-                    query.detail_key.clone(),
-                    query.query_key.clone(),
-                    query.token_label.clone(),
-                    cx,
-                ))
-            });
+            ),
+            &line.text,
+            &line.spans,
+        )
+        .on_click(click_ranges, move |range_ix, window, cx| {
+            let token = &click_tokens[range_ix];
+            let Some(query) =
+                click_context.query_for_index(token.byte_range.start, click_tokens.as_ref())
+            else {
+                return;
+            };
+            navigate_to_prepared_file_lsp_definition(query, window, cx);
+        })
+        .on_hover(move |index, _event, window, cx| {
+            let Some(index) = index else {
+                return;
+            };
+            let Some(query) = hover_context.query_for_index(index, hover_tokens.as_ref()) else {
+                return;
+            };
+            request_prepared_file_lsp_details(query, window, cx);
+        })
+        .tooltip(move |index, _window, cx| {
+            let query = tooltip_context.query_for_index(index, tooltip_tokens.as_ref())?;
+            Some(build_lsp_hover_tooltip_view(
+                query.state.clone(),
+                query.detail_key.clone(),
+                query.query_key.clone(),
+                query.token_label.clone(),
+                cx,
+            ))
+        });
 
         return code_div.child(interactive);
     }
 
-    if line.spans.is_empty() {
-        code_div.child(line.text)
-    } else {
-        code_div.child(styled)
-    }
+    code_div.child(styled_selectable_code_text(
+        format!("prepared-code-{block_id}-line-{}", line.line_number),
+        &line.text,
+        &line.spans,
+    ))
 }
 
 fn split_code_lines(text: &str) -> Vec<String> {
@@ -790,7 +808,11 @@ impl Render for SharedLspHoverTooltipView {
                                     .child(error.to_string())
                                     .into_any_element()
                             } else if let Some(details) = state.details.as_ref() {
-                                render_lsp_symbol_details(details).into_any_element()
+                                render_lsp_symbol_details(
+                                    details,
+                                    &format!("lsp-symbol-details-{}", self.query_key),
+                                )
+                                .into_any_element()
                             } else {
                                 div()
                                     .text_size(px(12.0))
@@ -809,7 +831,7 @@ impl Render for SharedLspHoverTooltipView {
     }
 }
 
-fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails) -> AnyElement {
+fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails, id_prefix: &str) -> AnyElement {
     if details.is_empty() {
         return div()
             .text_size(px(12.0))
@@ -833,12 +855,10 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails) -> AnyElement {
                     .flex_col()
                     .gap(px(8.0))
                     .child(render_lsp_section_label("HOVER"))
-                    .child(
-                        div()
-                            .w_full()
-                            .min_w_0()
-                            .child(render_markdown(&hover.markdown)),
-                    ),
+                    .child(div().w_full().min_w_0().child(render_markdown(
+                        &format!("{id_prefix}-hover"),
+                        &hover.markdown,
+                    ))),
             )
         })
         .when_some(details.signature_help.as_ref(), |el, signature| {
@@ -879,12 +899,10 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails) -> AnyElement {
                             .child(signature.label.clone()),
                     )
                     .when_some(signature.documentation.as_deref(), |el, documentation| {
-                        el.child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .child(render_markdown(documentation)),
-                        )
+                        el.child(div().w_full().min_w_0().child(render_markdown(
+                            &format!("{id_prefix}-signature"),
+                            documentation,
+                        )))
                     }),
             )
         })

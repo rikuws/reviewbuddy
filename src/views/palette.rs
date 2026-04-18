@@ -2,6 +2,7 @@ use gpui::prelude::*;
 use gpui::*;
 
 use crate::app_assets::APP_LOGO_ASSET;
+use crate::selectable_text::{AppTextFieldKind, AppTextInput};
 use crate::state::*;
 use crate::theme::*;
 
@@ -98,12 +99,15 @@ pub fn render_palette(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                 } else {
                                     fg_emphasis()
                                 })
-                                .child(if query.is_empty() {
-                                    "Type to filter commands, sections, or open pull requests"
-                                        .to_string()
-                                } else {
-                                    query
-                                }),
+                                .child(
+                                    AppTextInput::new(
+                                        "palette-query-input",
+                                        state.clone(),
+                                        AppTextFieldKind::PaletteQuery,
+                                        "Type to filter commands, sections, or open pull requests",
+                                    )
+                                    .autofocus(true),
+                                ),
                         )
                         .child(
                             div()
@@ -185,32 +189,6 @@ pub fn close_palette(state: &Entity<AppState>, cx: &mut App) {
     state.update(cx, |s, cx| {
         s.palette_open = false;
         s.palette_query.clear();
-        s.palette_selected_index = 0;
-        cx.notify();
-    });
-}
-
-pub fn append_palette_query(state: &Entity<AppState>, text: &str, cx: &mut App) {
-    if text.is_empty() {
-        return;
-    }
-
-    state.update(cx, |s, cx| {
-        if !s.palette_open {
-            return;
-        }
-        s.palette_query.push_str(text);
-        s.palette_selected_index = 0;
-        cx.notify();
-    });
-}
-
-pub fn backspace_palette_query(state: &Entity<AppState>, cx: &mut App) {
-    state.update(cx, |s, cx| {
-        if !s.palette_open {
-            return;
-        }
-        s.palette_query.pop();
         s.palette_selected_index = 0;
         cx.notify();
     });

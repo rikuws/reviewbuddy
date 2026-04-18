@@ -4,8 +4,8 @@ use gpui::prelude::*;
 use gpui::*;
 
 use crate::code_display::{
-    build_interactive_code_tokens, build_lsp_hover_tooltip_view, render_highlighted_code_block,
-    render_highlighted_code_content, styled_code_text, InteractiveCodeToken,
+    build_interactive_code_tokens, build_lsp_hover_tooltip_view, code_text_runs,
+    render_highlighted_code_block, render_highlighted_code_content, InteractiveCodeToken,
 };
 use crate::code_tour::{line_matches_diff_anchor, thread_matches_diff_anchor, DiffAnchor};
 use crate::diff::{
@@ -21,6 +21,7 @@ use crate::local_documents;
 use crate::local_repo;
 use crate::lsp;
 use crate::markdown::render_markdown;
+use crate::selectable_text::SelectableText;
 use crate::state::*;
 use crate::syntax::{self, SyntaxSpan};
 use crate::theme::*;
@@ -2328,7 +2329,7 @@ fn render_diff_line(
         )
         .child(render_syntax_content(
             file_path,
-            &line.content,
+            line,
             syntax_spans,
             fallback_text_color,
             lsp_context,
@@ -2337,11 +2338,12 @@ fn render_diff_line(
 
 fn render_syntax_content(
     file_path: &str,
-    content: &str,
+    line: &ParsedDiffLine,
     syntax_spans: Option<&[SyntaxSpan]>,
     fallback_color: Rgba,
     lsp_context: Option<&DiffLineLspContext>,
 ) -> Div {
+    let content = line.content.as_str();
     let content_div = div()
         .flex_grow()
         .px(px(8.0))
@@ -2367,10 +2369,23 @@ fn render_syntax_content(
     if spans.is_empty() {
         return content_div
             .text_color(fallback_color)
-            .child(content.to_string());
+            .child(SelectableText::new(
+                format!(
+                    "diff-line:{}:{}:{}",
+                    file_path,
+                    line.left_line_number.unwrap_or_default(),
+                    line.right_line_number.unwrap_or_default()
+                ),
+                content.to_string(),
+            ));
     }
 
-    let styled = styled_code_text(spans).unwrap_or_else(|| StyledText::new(content.to_string()));
+    let selection_id = format!(
+        "diff-line:{}:{}:{}",
+        file_path,
+        line.left_line_number.unwrap_or_default(),
+        line.right_line_number.unwrap_or_default()
+    );
     let token_ranges = Arc::new(build_interactive_code_tokens(content));
 
     if let Some(lsp_context) = lsp_context.filter(|_| !token_ranges.is_empty()) {
@@ -2382,49 +2397,61 @@ fn render_syntax_content(
         let click_tokens = token_ranges.clone();
         let click_ranges: Vec<std::ops::Range<usize>> =
             token_ranges.iter().map(|t| t.byte_range.clone()).collect();
-        let element_id = ElementId::Name(
-            format!(
-                "diff-lsp:{}:{}",
-                lsp_context.file.file_path, lsp_context.line_number
+        let interactive = if let Some(runs) = code_text_runs(spans) {
+            SelectableText::new(
+                format!(
+                    "diff-lsp:{}:{}:{}",
+                    lsp_context.file.file_path,
+                    lsp_context.line_number,
+                    line.right_line_number.unwrap_or_default()
+                ),
+                content.to_string(),
             )
-            .into(),
-        );
-
-        let interactive = InteractiveText::new(element_id, styled)
-            .on_click(click_ranges, move |range_ix, window, cx| {
-                let token = &click_tokens[range_ix];
-                let Some(query) =
-                    click_context.query_for_index(token.byte_range.start, click_tokens.as_ref())
-                else {
-                    return;
-                };
-                navigate_to_diff_lsp_definition(query, window, cx);
-            })
-            .on_hover(move |index, _event, window, cx| {
-                let Some(index) = index else {
-                    return;
-                };
-                let Some(query) = hover_context.query_for_index(index, hover_tokens.as_ref())
-                else {
-                    return;
-                };
-                request_diff_line_lsp_details(query, window, cx);
-            })
-            .tooltip(move |index, _window, cx| {
-                let query = tooltip_context.query_for_index(index, tooltip_tokens.as_ref())?;
-                Some(build_lsp_hover_tooltip_view(
-                    query.state.clone(),
-                    query.detail_key.clone(),
-                    query.query_key.clone(),
-                    query.token_label.clone(),
-                    cx,
-                ))
-            });
+            .with_runs(runs)
+        } else {
+            SelectableText::new(selection_id.clone(), content.to_string())
+        }
+        .on_click(click_ranges, move |range_ix, window, cx| {
+            let token = &click_tokens[range_ix];
+            let Some(query) =
+                click_context.query_for_index(token.byte_range.start, click_tokens.as_ref())
+            else {
+                return;
+            };
+            navigate_to_diff_lsp_definition(query, window, cx);
+        })
+        .on_hover(move |index, _event, window, cx| {
+            let Some(index) = index else {
+                return;
+            };
+            let Some(query) = hover_context.query_for_index(index, hover_tokens.as_ref()) else {
+                return;
+            };
+            request_diff_line_lsp_details(query, window, cx);
+        })
+        .tooltip(move |index, _window, cx| {
+            let query = tooltip_context.query_for_index(index, tooltip_tokens.as_ref())?;
+            Some(build_lsp_hover_tooltip_view(
+                query.state.clone(),
+                query.detail_key.clone(),
+                query.query_key.clone(),
+                query.token_label.clone(),
+                cx,
+            ))
+        });
 
         return content_div.text_color(fallback_color).child(interactive);
     }
 
-    content_div.text_color(fallback_color).child(styled)
+    if let Some(runs) = code_text_runs(spans) {
+        content_div
+            .text_color(fallback_color)
+            .child(SelectableText::new(selection_id, content.to_string()).with_runs(runs))
+    } else {
+        content_div
+            .text_color(fallback_color)
+            .child(SelectableText::new(selection_id, content.to_string()))
+    }
 }
 
 fn build_diff_highlights(parsed_file: &ParsedDiffFile) -> Arc<Vec<Vec<Vec<SyntaxSpan>>>> {
@@ -2533,7 +2560,8 @@ fn render_thread_comment(comment: &PullRequestReviewComment) -> impl IntoElement
                 .child("No comment body.")
                 .into_any_element()
         } else {
-            render_markdown(&comment.body).into_any_element()
+            render_markdown(&format!("thread-comment-{}", comment.id), &comment.body)
+                .into_any_element()
         })
 }
 

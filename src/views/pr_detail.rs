@@ -10,6 +10,7 @@ use crate::github::{
     ReviewAction,
 };
 use crate::markdown::render_markdown;
+use crate::selectable_text::{AppTextFieldKind, AppTextInput, SelectableText};
 use crate::state::*;
 use crate::theme::*;
 
@@ -1124,7 +1125,13 @@ fn render_own_feedback_card(
                 .text_size(px(13.0))
                 .line_height(px(19.0))
                 .text_color(fg_default())
-                .child(render_markdown(&item.preview)),
+                .child(render_markdown(
+                    &format!(
+                        "own-pr-feedback-preview-{}-{}",
+                        item.file_path, item.updated_at
+                    ),
+                    &item.preview,
+                )),
         )
         .child(
             div()
@@ -1206,7 +1213,13 @@ fn render_thread_digest_card(
                 .text_size(px(13.0))
                 .line_height(px(19.0))
                 .text_color(fg_default())
-                .child(render_markdown(&item.preview)),
+                .child(render_markdown(
+                    &format!(
+                        "thread-digest-preview-{}-{}",
+                        item.file_path, item.updated_at
+                    ),
+                    &item.preview,
+                )),
         )
         .child(
             div()
@@ -1252,7 +1265,7 @@ fn render_pull_request_summary_panel(
                 .child("No PR description provided.")
                 .into_any_element()
         } else {
-            render_markdown(&detail.body).into_any_element()
+            render_markdown("pr-summary-body", &detail.body).into_any_element()
         }))
 }
 
@@ -1383,7 +1396,10 @@ fn render_activity_card(item: &ActivityItem, state: &Entity<AppState>) -> impl I
                     .line_height(px(21.0))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(fg_emphasis())
-                    .child(item.preview.clone()),
+                    .child(SelectableText::new(
+                        format!("activity-preview-{}-{}", item.author_login, item.timestamp),
+                        item.preview.clone(),
+                    )),
             )
         })
 }
@@ -1406,34 +1422,6 @@ pub fn blur_review_editor(state: &Entity<AppState>, cx: &mut App) {
             return;
         }
         s.review_editor_active = false;
-        cx.notify();
-    });
-}
-
-pub fn append_review_body(state: &Entity<AppState>, text: &str, cx: &mut App) {
-    if text.is_empty() {
-        return;
-    }
-
-    state.update(cx, |s, cx| {
-        if !s.review_editor_active || s.review_loading {
-            return;
-        }
-        s.review_body.push_str(text);
-        s.review_message = None;
-        s.review_success = false;
-        cx.notify();
-    });
-}
-
-pub fn backspace_review_body(state: &Entity<AppState>, cx: &mut App) {
-    state.update(cx, |s, cx| {
-        if !s.review_editor_active || s.review_loading {
-            return;
-        }
-        s.review_body.pop();
-        s.review_message = None;
-        s.review_success = false;
         cx.notify();
     });
 }
@@ -1651,26 +1639,19 @@ fn render_submit_review_panel(
                                 .child("cmd-enter submit • esc blur"),
                         ),
                 )
-                .child(if review_body.is_empty() {
+                .child(
                     div()
                         .mt(px(10.0))
-                        .child("Leave a review note...")
-                        .into_any_element()
-                } else {
-                    div()
-                        .mt(px(10.0))
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .children(review_body.lines().map(|line| {
-                            div().child(if line.is_empty() {
-                                " ".to_string()
-                            } else {
-                                line.to_string()
-                            })
-                        }))
-                        .into_any_element()
-                }),
+                        .child(
+                            AppTextInput::new(
+                                "review-body-input",
+                                state.clone(),
+                                AppTextFieldKind::ReviewBody,
+                                "Leave a review note...",
+                            )
+                            .autofocus(review_editor_active),
+                        ),
+                ),
         )
         .child(
             div()

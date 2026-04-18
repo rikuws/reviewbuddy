@@ -8,6 +8,7 @@ use crate::code_tour::{self, CodeTourProvider, CodeTourProviderStatus};
 use crate::managed_lsp::{
     self, ManagedServerInstallState, ManagedServerInstallStatus, ManagedServerKind,
 };
+use crate::selectable_text::SelectableText;
 use crate::state::{AppState, ManagedLspSettingsState};
 use crate::theme::*;
 
@@ -415,7 +416,10 @@ pub fn render_settings_view(state: &Entity<AppState>, cx: &App) -> impl IntoElem
                                         .text_size(px(12.0))
                                         .font_family("Fira Code")
                                         .text_color(fg_subtle())
-                                        .child(storage_root.display().to_string()),
+                                        .child(SelectableText::new(
+                                            "settings-storage-root",
+                                            storage_root.display().to_string(),
+                                        )),
                                 ),
                         ),
                     )

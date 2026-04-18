@@ -3,15 +3,16 @@ use gpui::*;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 
 use crate::code_display::render_highlighted_code_block;
+use crate::selectable_text::SelectableText;
 use crate::theme::*;
 
 /// Render a markdown string into GPUI elements.
-pub fn render_markdown(text: &str) -> impl IntoElement {
+pub fn render_markdown(id_prefix: &str, text: &str) -> impl IntoElement {
     let options =
         Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
     let parser = Parser::new_ext(text, options);
 
-    let mut builder = MarkdownBuilder::new();
+    let mut builder = MarkdownBuilder::new(id_prefix);
 
     for event in parser {
         builder.push_event(event);
@@ -39,6 +40,8 @@ struct MarkdownBuilder {
     list_items: Vec<AnyElement>,
     list_ordered: bool,
     list_counter: u64,
+    id_prefix: String,
+    block_id: usize,
     /// Table state.
     table_rows: Vec<Vec<String>>,
     table_current_row: Vec<String>,
@@ -66,7 +69,7 @@ enum BlockContext {
 }
 
 impl MarkdownBuilder {
-    fn new() -> Self {
+    fn new(id_prefix: &str) -> Self {
         Self {
             blocks: Vec::new(),
             bold: false,
@@ -80,10 +83,18 @@ impl MarkdownBuilder {
             list_items: Vec::new(),
             list_ordered: false,
             list_counter: 0,
+            id_prefix: id_prefix.to_string(),
+            block_id: 0,
             table_rows: Vec::new(),
             table_current_row: Vec::new(),
             in_table_head: false,
         }
+    }
+
+    fn next_block_id(&mut self, label: &str) -> String {
+        let id = format!("{}-{label}-{}", self.id_prefix, self.block_id);
+        self.block_id += 1;
+        id
     }
 
     fn push_event(&mut self, event: Event) {
@@ -220,24 +231,29 @@ impl MarkdownBuilder {
         match tag {
             TagEnd::Paragraph => {
                 self.block_stack.pop();
-                let el = self.flush_inline_paragraph();
+                let id = self.next_block_id("paragraph");
+                let el = self.flush_inline_paragraph(&id);
                 self.blocks.push(el);
             }
             TagEnd::Heading(level) => {
                 self.block_stack.pop();
-                let el = self.flush_inline_heading(level as u8);
+                let id = self.next_block_id("heading");
+                let el = self.flush_inline_heading(&id, level as u8);
                 self.blocks.push(el);
             }
             TagEnd::BlockQuote(_) => {
                 self.block_stack.pop();
-                let el = self.flush_inline_blockquote();
+                let id = self.next_block_id("blockquote");
+                let el = self.flush_inline_blockquote(&id);
                 self.blocks.push(el);
             }
             TagEnd::CodeBlock => {
                 self.block_stack.pop();
                 let text = std::mem::take(&mut self.code_block_text);
                 let lang = self.code_block_lang.take();
-                self.blocks.push(render_code_block(&text, lang.as_deref()));
+                let code_id = self.next_block_id("code");
+                self.blocks
+                    .push(render_code_block(&code_id, &text, lang.as_deref()));
             }
             TagEnd::List(_) => {
                 let items = std::mem::take(&mut self.list_items);
@@ -261,7 +277,9 @@ impl MarkdownBuilder {
                 } else {
                     "\u{2022} ".to_string()
                 };
-                self.list_items.push(render_list_item(&prefix, &spans));
+                let item_id = self.next_block_id("list-item");
+                self.list_items
+                    .push(render_list_item(&item_id, &prefix, &spans));
             }
             TagEnd::Emphasis => {
                 self.emphasis = false;
@@ -278,7 +296,8 @@ impl MarkdownBuilder {
             TagEnd::Table => {
                 self.block_stack.pop();
                 let rows = std::mem::take(&mut self.table_rows);
-                self.blocks.push(render_table(&rows));
+                let table_id = self.next_block_id("table");
+                self.blocks.push(render_table(&table_id, &rows));
             }
             TagEnd::TableHead => {
                 self.in_table_head = false;
@@ -323,12 +342,12 @@ impl MarkdownBuilder {
         });
     }
 
-    fn flush_inline_paragraph(&mut self) -> AnyElement {
+    fn flush_inline_paragraph(&mut self, id: &str) -> AnyElement {
         let spans = std::mem::take(&mut self.inline_buffer);
-        render_inline_block(&spans, px(13.0), fg_default(), false)
+        render_inline_block(id, &spans, px(13.0), fg_default(), false)
     }
 
-    fn flush_inline_heading(&mut self, level: u8) -> AnyElement {
+    fn flush_inline_heading(&mut self, id: &str, level: u8) -> AnyElement {
         let spans = std::mem::take(&mut self.inline_buffer);
         let size = match level {
             1 => px(22.0),
@@ -336,10 +355,10 @@ impl MarkdownBuilder {
             3 => px(16.0),
             _ => px(14.0),
         };
-        render_inline_block(&spans, size, fg_emphasis(), true)
+        render_inline_block(id, &spans, size, fg_emphasis(), true)
     }
 
-    fn flush_inline_blockquote(&mut self) -> AnyElement {
+    fn flush_inline_blockquote(&mut self, id: &str) -> AnyElement {
         let spans = std::mem::take(&mut self.inline_buffer);
         div()
             .w_full()
@@ -349,7 +368,7 @@ impl MarkdownBuilder {
             .bg(bg_subtle())
             .my(px(8.0))
             .child(
-                render_inline_div(&spans, px(13.0), fg_muted(), FontWeight::NORMAL)
+                render_inline_div(id, &spans, px(13.0), fg_muted(), FontWeight::NORMAL)
                     .w_full()
                     .min_w_0(),
             )
@@ -368,6 +387,7 @@ impl MarkdownBuilder {
 }
 
 fn render_inline_block(
+    id: &str,
     spans: &[InlineSpan],
     base_size: Pixels,
     base_color: Rgba,
@@ -378,7 +398,7 @@ fn render_inline_block(
     } else {
         FontWeight::NORMAL
     };
-    let mut el = render_inline_div(spans, base_size, base_color, base_weight)
+    let mut el = render_inline_div(id, spans, base_size, base_color, base_weight)
         .w_full()
         .min_w_0();
     if heading {
@@ -390,6 +410,7 @@ fn render_inline_block(
 }
 
 fn render_inline_div(
+    id: &str,
     spans: &[InlineSpan],
     base_size: Pixels,
     base_color: Rgba,
@@ -463,10 +484,10 @@ fn render_inline_div(
         .text_size(base_size)
         .text_color(base_color)
         .font_weight(base_weight)
-        .child(StyledText::new(text).with_runs(runs))
+        .child(SelectableText::new(id.to_string(), text).with_runs(runs))
 }
 
-fn render_code_block(text: &str, lang: Option<&str>) -> AnyElement {
+fn render_code_block(_id: &str, text: &str, lang: Option<&str>) -> AnyElement {
     div()
         .w_full()
         .min_w_0()
@@ -478,7 +499,7 @@ fn render_code_block(text: &str, lang: Option<&str>) -> AnyElement {
         .into_any_element()
 }
 
-fn render_list_item(prefix: &str, spans: &[InlineSpan]) -> AnyElement {
+fn render_list_item(id: &str, prefix: &str, spans: &[InlineSpan]) -> AnyElement {
     div()
         .flex()
         .items_start()
@@ -494,14 +515,14 @@ fn render_list_item(prefix: &str, spans: &[InlineSpan]) -> AnyElement {
                 .child(prefix.to_string()),
         )
         .child(
-            render_inline_div(spans, px(13.0), fg_default(), FontWeight::NORMAL)
+            render_inline_div(id, spans, px(13.0), fg_default(), FontWeight::NORMAL)
                 .flex_1()
                 .min_w_0(),
         )
         .into_any_element()
 }
 
-fn render_table(rows: &[Vec<String>]) -> AnyElement {
+fn render_table(id: &str, rows: &[Vec<String>]) -> AnyElement {
     if rows.is_empty() {
         return div().into_any_element();
     }
@@ -523,7 +544,7 @@ fn render_table(rows: &[Vec<String>]) -> AnyElement {
                     el.bg(bg_emphasis()).font_weight(FontWeight::SEMIBOLD)
                 })
                 .when(!is_header && i % 2 == 0, |el: Div| el.bg(bg_subtle()))
-                .children(row.iter().map(|cell| {
+                .children(row.iter().enumerate().map(|(column_ix, cell)| {
                     div()
                         .flex_1()
                         .min_w_0()
@@ -536,7 +557,10 @@ fn render_table(rows: &[Vec<String>]) -> AnyElement {
                         } else {
                             fg_default()
                         })
-                        .child(cell.clone())
+                        .child(SelectableText::new(
+                            format!("{id}-cell-{i}-{column_ix}"),
+                            cell.clone(),
+                        ))
                 }))
         }))
         .into_any_element()

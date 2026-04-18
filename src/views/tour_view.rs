@@ -18,6 +18,7 @@ use crate::code_tour::{
     TourStep,
 };
 use crate::local_repo;
+use crate::selectable_text::SelectableText;
 use crate::state::{AppState, CodeTourState, PullRequestSurface};
 use crate::theme::*;
 use crate::{code_tour, github};
@@ -1732,35 +1733,33 @@ fn render_note_section(title: &str, items: &[String]) -> impl IntoElement {
                 )
                 .child(badge(&items.len().to_string())),
         )
-        .child(
-            div()
-                .mt(px(12.0))
-                .flex()
-                .flex_col()
-                .gap(px(10.0))
-                .children(items.iter().map(|item| {
-                    div()
-                        .flex()
-                        .items_start()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .mt(px(6.0))
-                                .w(px(4.0))
-                                .h(px(4.0))
-                                .rounded(px(999.0))
-                                .bg(fg_subtle()),
-                        )
-                        .child(
-                            div()
-                                .flex_grow()
-                                .min_w_0()
-                                .text_size(px(13.0))
-                                .text_color(fg_default())
-                                .child(item.clone()),
-                        )
-                })),
-        )
+        .child(div().mt(px(12.0)).flex().flex_col().gap(px(10.0)).children(
+            items.iter().enumerate().map(|(item_ix, item)| {
+                div()
+                    .flex()
+                    .items_start()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .mt(px(6.0))
+                            .w(px(4.0))
+                            .h(px(4.0))
+                            .rounded(px(999.0))
+                            .bg(fg_subtle()),
+                    )
+                    .child(
+                        div()
+                            .flex_grow()
+                            .min_w_0()
+                            .text_size(px(13.0))
+                            .text_color(fg_default())
+                            .child(SelectableText::new(
+                                format!("tour-note-{title}-{item_ix}"),
+                                item.clone(),
+                            )),
+                    )
+            }),
+        ))
 }
 
 fn render_overview_card(
@@ -1772,57 +1771,61 @@ fn render_overview_card(
     let mut panel = nested_panel();
 
     if let Some(overview_step) = overview_step {
-        panel = panel
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .mb(px(14.0))
-                    .gap(px(12.0))
-                    .flex_wrap()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(eyebrow("Whole changeset"))
-                            .child(
-                                div()
-                                    .text_size(px(20.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(fg_emphasis())
-                                    .child(overview_step.title.clone()),
-                            ),
-                    )
-                    .child(badge(&overview_step.badge)),
-            )
-            .child(
-                div()
-                    .text_size(px(13.0))
-                    .text_color(fg_default())
-                    .child(overview_step.summary.clone()),
-            )
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(fg_muted())
-                    .mt(px(10.0))
-                    .child(overview_step.detail.clone()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .flex_wrap()
-                    .mt(px(14.0))
-                    .child(badge(&meta.author_login))
-                    .child(badge(&meta.base_ref_name))
-                    .child(badge(&meta.head_ref_name))
-                    .child(badge(&format!(
-                        "+{} / -{}",
-                        overview_step.additions, overview_step.deletions
-                    ))),
-            );
+        panel =
+            panel
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .mb(px(14.0))
+                        .gap(px(12.0))
+                        .flex_wrap()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(eyebrow("Whole changeset"))
+                                .child(
+                                    div()
+                                        .text_size(px(20.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(fg_emphasis())
+                                        .child(overview_step.title.clone()),
+                                ),
+                        )
+                        .child(badge(&overview_step.badge)),
+                )
+                .child(div().text_size(px(13.0)).text_color(fg_default()).child(
+                    SelectableText::new(
+                        format!("tour-overview-summary-{}", overview_step.id),
+                        overview_step.summary.clone(),
+                    ),
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(fg_muted())
+                        .mt(px(10.0))
+                        .child(SelectableText::new(
+                            format!("tour-overview-detail-{}", overview_step.id),
+                            overview_step.detail.clone(),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(8.0))
+                        .flex_wrap()
+                        .mt(px(14.0))
+                        .child(badge(&meta.author_login))
+                        .child(badge(&meta.base_ref_name))
+                        .child(badge(&meta.head_ref_name))
+                        .child(badge(&format!(
+                            "+{} / -{}",
+                            overview_step.additions, overview_step.deletions
+                        ))),
+                );
     } else {
         panel = panel
             .child(eyebrow("Whole changeset"))
@@ -1889,14 +1892,20 @@ fn render_section_card(
             div()
                 .text_size(px(13.0))
                 .text_color(fg_default())
-                .child(section.summary.clone()),
+                .child(SelectableText::new(
+                    format!("tour-section-summary-{}", section.id),
+                    section.summary.clone(),
+                )),
         )
         .child(
             div()
                 .text_size(px(12.0))
                 .text_color(fg_muted())
                 .mt(px(10.0))
-                .child(section.detail.clone()),
+                .child(SelectableText::new(
+                    format!("tour-section-detail-{}", section.id),
+                    section.detail.clone(),
+                )),
         )
         .when(!section.review_points.is_empty(), |el| {
             el.child(render_note_section("Review Focus", &section.review_points))
@@ -2049,14 +2058,20 @@ fn render_tour_step_row(
                 div()
                     .text_size(px(13.0))
                     .text_color(fg_default())
-                    .child(step.summary.clone()),
+                    .child(SelectableText::new(
+                        format!("tour-step-summary-{}", step.id),
+                        step.summary.clone(),
+                    )),
             )
             .child(
                 div()
                     .text_size(px(12.0))
                     .text_color(fg_muted())
                     .mt(px(8.0))
-                    .child(step.detail.clone()),
+                    .child(SelectableText::new(
+                        format!("tour-step-detail-{}", step.id),
+                        step.detail.clone(),
+                    )),
             )
         })
         .when(!changeset_collapsed, move |el| {
@@ -2169,7 +2184,10 @@ fn render_tour_callsite_row(
                 .text_size(px(12.0))
                 .text_color(fg_muted())
                 .mt(px(8.0))
-                .child(callsite.summary.clone()),
+                .child(SelectableText::new(
+                    format!("tour-callsite-summary-{}", callsite.path),
+                    callsite.summary.clone(),
+                )),
         )
         .when(
             callsite.snippet.is_some() || callsite.line.is_some(),
