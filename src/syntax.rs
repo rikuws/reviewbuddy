@@ -1,13 +1,14 @@
 use std::sync::OnceLock;
 
+use giallo::{HighlightOptions, HighlightedText, Registry, ThemeVariant};
 use gpui::{Hsla, Rgba};
-use syntect::easy::HighlightLines;
-use syntect::highlighting::ThemeSet;
-use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 use crate::theme::{active_theme, ActiveTheme};
 
 pub const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
+
+const LIGHT_THEME: &str = "vitesse-light";
+const DARK_THEME: &str = "vitesse-black";
 
 #[derive(Clone, Debug)]
 pub struct SyntaxSpan {
@@ -17,90 +18,194 @@ pub struct SyntaxSpan {
     pub column_end: usize,
 }
 
-fn syntax_set() -> &'static SyntaxSet {
-    static SET: OnceLock<SyntaxSet> = OnceLock::new();
-    SET.get_or_init(|| SyntaxSet::load_defaults_newlines())
-}
-
-fn theme_set() -> &'static ThemeSet {
-    static SET: OnceLock<ThemeSet> = OnceLock::new();
-    SET.get_or_init(ThemeSet::load_defaults)
+fn registry() -> Option<&'static Registry> {
+    static REGISTRY: OnceLock<Option<Registry>> = OnceLock::new();
+    REGISTRY
+        .get_or_init(|| {
+            let mut registry = Registry::builtin().ok()?;
+            registry.link_grammars();
+            Some(registry)
+        })
+        .as_ref()
 }
 
 fn syntax_theme_name() -> &'static str {
     match active_theme() {
-        ActiveTheme::Light => "base16-ocean.light",
-        ActiveTheme::Dark => "base16-ocean.dark",
+        ActiveTheme::Light => LIGHT_THEME,
+        ActiveTheme::Dark => DARK_THEME,
     }
 }
 
-fn find_syntax_by_hint<'a>(ss: &'a SyntaxSet, hint: &str) -> Option<&'a SyntaxReference> {
-    ss.find_syntax_by_token(hint)
-        .or_else(|| ss.find_syntax_by_name(hint))
-}
-
-fn syntax_aliases(hint: &str) -> &'static [&'static str] {
-    if hint.eq_ignore_ascii_case("ts")
-        || hint.eq_ignore_ascii_case("tsx")
-        || hint.eq_ignore_ascii_case("mts")
-        || hint.eq_ignore_ascii_case("cts")
-        || hint.eq_ignore_ascii_case("typescript")
-        || hint.eq_ignore_ascii_case("typescriptreact")
-        || hint.eq_ignore_ascii_case("jsx")
-        || hint.eq_ignore_ascii_case("javascriptreact")
-    {
-        &["JavaScript", "js"]
+fn language_aliases(hint: &str) -> &'static [&'static str] {
+    if hint.eq_ignore_ascii_case("tsx") || hint.eq_ignore_ascii_case("typescriptreact") {
+        &["tsx", "typescript"]
+    } else if hint.eq_ignore_ascii_case("jsx") || hint.eq_ignore_ascii_case("javascriptreact") {
+        &["jsx", "javascript"]
+    } else if hint.eq_ignore_ascii_case("patch") || hint.eq_ignore_ascii_case("diff.patch") {
+        &["diff"]
     } else {
         &[]
     }
 }
 
-fn find_syntax<'a>(ss: &'a SyntaxSet, file_path: &str) -> Option<&'a SyntaxReference> {
+fn push_candidate(candidates: &mut Vec<String>, candidate: impl Into<String>) {
+    let candidate = candidate.into();
+    if candidate.is_empty() || candidates.iter().any(|existing| existing == &candidate) {
+        return;
+    }
+    candidates.push(candidate);
+}
+
+fn find_language(registry: &Registry, file_path: &str) -> Option<String> {
     let filename = file_path.rsplit('/').next().unwrap_or(file_path);
+    let filename = filename.to_ascii_lowercase();
     let ext = filename
         .rsplit('.')
         .next()
         .filter(|ext| !ext.is_empty() && *ext != filename);
 
-    find_syntax_by_hint(ss, filename)
-        .or_else(|| ext.and_then(|ext| find_syntax_by_hint(ss, ext)))
-        .or_else(|| {
-            syntax_aliases(filename)
-                .iter()
-                .find_map(|alias| find_syntax_by_hint(ss, alias))
-        })
-        .or_else(|| {
-            ext.and_then(|ext| {
-                syntax_aliases(ext)
-                    .iter()
-                    .find_map(|alias| find_syntax_by_hint(ss, alias))
-            })
-        })
-        .filter(|s| s.name != "Plain Text")
+    let mut candidates = Vec::new();
+    push_candidate(&mut candidates, filename.clone());
+
+    if let Some(ext) = ext {
+        push_candidate(&mut candidates, ext.to_string());
+    }
+
+    for alias in language_aliases(filename.as_str()) {
+        push_candidate(&mut candidates, (*alias).to_string());
+    }
+
+    if let Some(ext) = ext {
+        for alias in language_aliases(ext) {
+            push_candidate(&mut candidates, (*alias).to_string());
+        }
+    }
+
+    candidates
+        .into_iter()
+        .find(|candidate| registry.contains_grammar(candidate))
+}
+
+fn parse_hex_color(hex: &str) -> Option<Rgba> {
+    let hex = hex.trim_start_matches('#');
+    let parse = |value: &str| u8::from_str_radix(value, 16).ok();
+
+    let (r, g, b, a) = match hex.len() {
+        3 => (
+            parse(&hex[0..1])? * 17,
+            parse(&hex[1..2])? * 17,
+            parse(&hex[2..3])? * 17,
+            255,
+        ),
+        4 => (
+            parse(&hex[0..1])? * 17,
+            parse(&hex[1..2])? * 17,
+            parse(&hex[2..3])? * 17,
+            parse(&hex[3..4])? * 17,
+        ),
+        6 => (
+            parse(&hex[0..2])?,
+            parse(&hex[2..4])?,
+            parse(&hex[4..6])?,
+            255,
+        ),
+        8 => (
+            parse(&hex[0..2])?,
+            parse(&hex[2..4])?,
+            parse(&hex[4..6])?,
+            parse(&hex[6..8])?,
+        ),
+        _ => return None,
+    };
+
+    Some(Rgba {
+        r: r as f32 / 255.0,
+        g: g as f32 / 255.0,
+        b: b as f32 / 255.0,
+        a: a as f32 / 255.0,
+    })
+}
+
+fn highlighted_text_to_span(token: HighlightedText) -> Option<SyntaxSpan> {
+    let text = token.text;
+    if text.is_empty() {
+        return None;
+    }
+
+    let color_hex = match token.style {
+        ThemeVariant::Single(style) => style.foreground.as_hex(),
+        ThemeVariant::Dual { light, dark } => match active_theme() {
+            ActiveTheme::Light => light.foreground.as_hex(),
+            ActiveTheme::Dark => dark.foreground.as_hex(),
+        },
+    };
+
+    Some(SyntaxSpan {
+        text,
+        color: parse_hex_color(&color_hex)?.into(),
+        column_start: 0,
+        column_end: 0,
+    })
+}
+
+fn annotate_columns(mut spans: Vec<SyntaxSpan>) -> Vec<SyntaxSpan> {
+    let mut next_column = 1usize;
+    for span in &mut spans {
+        let char_count = span.text.chars().count();
+        span.column_start = next_column;
+        span.column_end = next_column + char_count;
+        next_column = span.column_end;
+    }
+    spans
 }
 
 pub fn highlight_lines<'a, I>(file_path: &str, lines: I) -> Vec<Vec<SyntaxSpan>>
 where
     I: IntoIterator<Item = &'a str>,
 {
-    let ss = syntax_set();
-    let syntax = match find_syntax(ss, file_path) {
-        Some(syntax) => syntax,
-        None => {
-            return lines
-                .into_iter()
-                .map(|_| Vec::new())
-                .collect::<Vec<Vec<SyntaxSpan>>>()
-        }
+    let lines = lines.into_iter().collect::<Vec<_>>();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    if lines.iter().all(|line| line.is_empty()) {
+        return lines.iter().map(|_| Vec::new()).collect();
+    }
+
+    let Some(registry) = registry() else {
+        return lines.iter().map(|_| Vec::new()).collect();
     };
 
-    let theme = &theme_set().themes[syntax_theme_name()];
-    let mut highlighter = HighlightLines::new(syntax, theme);
+    let Some(language) = find_language(registry, file_path) else {
+        return lines.iter().map(|_| Vec::new()).collect();
+    };
 
-    lines
+    let joined = lines.join("\n");
+    let options =
+        HighlightOptions::new(language.as_str(), ThemeVariant::Single(syntax_theme_name()))
+            .merge_whitespace(false);
+
+    let Ok(highlighted) = registry.highlight(&joined, &options) else {
+        return lines.iter().map(|_| Vec::new()).collect();
+    };
+
+    let mut result = highlighted
+        .tokens
         .into_iter()
-        .map(|line| highlight_with_state(&mut highlighter, ss, line))
-        .collect()
+        .map(|line| {
+            annotate_columns(
+                line.into_iter()
+                    .filter_map(highlighted_text_to_span)
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    while result.len() < lines.len() {
+        result.push(Vec::new());
+    }
+    result.truncate(lines.len());
+    result
 }
 
 /// Highlight a single line of code, returning colored spans.
@@ -114,71 +219,6 @@ pub fn highlight_line(file_path: &str, content: &str) -> Vec<SyntaxSpan> {
         .unwrap_or_default()
 }
 
-fn highlight_with_state(
-    highlighter: &mut HighlightLines<'_>,
-    syntax_set: &SyntaxSet,
-    content: &str,
-) -> Vec<SyntaxSpan> {
-    if content.is_empty() {
-        return Vec::new();
-    }
-
-    let line = format!("{content}\n");
-
-    highlighter
-        .highlight_line(&line, syntax_set)
-        .map(|spans| {
-            let mut next_column = 1usize;
-            spans
-                .into_iter()
-                .filter_map(|(style, text)| {
-                    let text = text.trim_end_matches('\n').to_string();
-                    if text.is_empty() {
-                        return None;
-                    }
-
-                    let column_start = next_column;
-                    let column_end = column_start + text.chars().count();
-                    next_column = column_end;
-                    let rgba = Rgba {
-                        r: style.foreground.r as f32 / 255.0,
-                        g: style.foreground.g as f32 / 255.0,
-                        b: style.foreground.b as f32 / 255.0,
-                        a: style.foreground.a as f32 / 255.0,
-                    };
-                    let color = boost_saturation(rgba.into());
-                    Some(SyntaxSpan {
-                        text,
-                        color,
-                        column_start,
-                        column_end,
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Boost saturation of syntax colors to make highlighting more vivid.
-/// The base16-ocean.dark theme produces very muted colors (s: 0.12–0.42).
-/// This amplifies saturation while preserving the hue relationships, giving
-/// results closer to modern editor themes (IntelliJ, VS Code).
-fn boost_saturation(color: Hsla) -> Hsla {
-    // Don't touch near-gray text (comments, punctuation) — keep those subtle.
-    if color.s < 0.08 {
-        return color;
-    }
-    let multiplier = match active_theme() {
-        ActiveTheme::Light => 1.35,
-        ActiveTheme::Dark => 2.2,
-    };
-    let boosted_s = (color.s * multiplier).min(1.0);
-    Hsla {
-        s: boosted_s,
-        ..color
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,20 +226,12 @@ mod tests {
     #[test]
     fn test_rust_highlighting() {
         let spans = highlight_line("test.rs", "fn main() {");
-        eprintln!("Rust spans count: {}", spans.len());
-        for s in &spans {
-            eprintln!("  [{:?}] {:?}", s.text, s.color);
-        }
         assert!(!spans.is_empty(), "Should produce syntax spans for Rust");
     }
 
     #[test]
     fn test_javascript_highlighting() {
         let spans = highlight_line("app.js", "const x = 'hello';");
-        eprintln!("JS spans count: {}", spans.len());
-        for s in &spans {
-            eprintln!("  [{:?}] {:?}", s.text, s.color);
-        }
         assert!(!spans.is_empty(), "Should produce syntax spans for JS");
     }
 
@@ -221,6 +253,15 @@ mod tests {
         assert!(
             !tsx_spans.is_empty(),
             "Expected syntax spans for TSX language hints"
+        );
+    }
+
+    #[test]
+    fn test_patch_alias_highlighting() {
+        let spans = highlight_line("diff.patch", "@@ -1,1 +1,1 @@");
+        assert!(
+            !spans.is_empty(),
+            "Expected syntax spans for patch-style diffs"
         );
     }
 

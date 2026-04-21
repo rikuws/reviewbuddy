@@ -4946,7 +4946,7 @@ fn render_virtualized_diff_rows(
     semantic_sections: Option<Arc<Vec<SemanticDiffSection>>>,
     gutter_layout: DiffGutterLayout,
     parsed_file_index: Option<usize>,
-    highlighted_hunks: Option<Arc<Vec<Vec<Vec<SyntaxSpan>>>>>,
+    highlighted_hunks: Option<Arc<Vec<Vec<DiffLineHighlight>>>>,
     file_lsp_context: Option<DiffFileLspContext>,
     selected_anchor: Option<DiffAnchor>,
     list_state: ListState,
@@ -6250,7 +6250,7 @@ fn render_virtualized_diff_row(
     state: &Entity<AppState>,
     gutter_layout: DiffGutterLayout,
     parsed_file_index: Option<usize>,
-    highlighted_hunks: Option<&Vec<Vec<Vec<SyntaxSpan>>>>,
+    highlighted_hunks: Option<&Vec<Vec<DiffLineHighlight>>>,
     file_lsp_context: Option<&DiffFileLspContext>,
     row: &DiffRenderRow,
     selected_anchor: Option<&DiffAnchor>,
@@ -6320,10 +6320,11 @@ fn render_virtualized_diff_row(
                 parsed.hunks.get(*hunk_index).and_then(|hunk| {
                     hunk.lines.get(*line_index).map(|line| {
                         let hunk_header = hunk.header.as_str();
-                        let spans = highlighted_hunks
+                        let highlight = highlighted_hunks
                             .and_then(|hunks| hunks.get(*hunk_index))
                             .and_then(|lines| lines.get(*line_index))
-                            .map(|spans| spans.as_slice());
+                            .cloned()
+                            .unwrap_or_default();
                         let line_lsp_context = build_diff_line_lsp_context(file_lsp_context, line);
                         render_reviewable_diff_line(
                             state,
@@ -6331,7 +6332,8 @@ fn render_virtualized_diff_row(
                             path,
                             Some(hunk_header),
                             line,
-                            spans,
+                            Some(highlight.syntax_spans.as_slice()),
+                            Some(highlight.emphasis_ranges.as_slice()),
                             selected_anchor,
                             line_lsp_context.as_ref(),
                             cx,
@@ -6500,6 +6502,7 @@ fn render_reviewable_diff_line(
     hunk_header: Option<&str>,
     line: &ParsedDiffLine,
     syntax_spans: Option<&[SyntaxSpan]>,
+    emphasis_ranges: Option<&[DiffInlineRange]>,
     selected_anchor: Option<&DiffAnchor>,
     lsp_context: Option<&DiffLineLspContext>,
     cx: &App,
@@ -6531,6 +6534,7 @@ fn render_reviewable_diff_line(
         file_path,
         line,
         syntax_spans,
+        emphasis_ranges,
         selected_anchor,
         lsp_context,
         line_action_target.map(|target| (state.clone(), target)),
@@ -6900,6 +6904,7 @@ fn render_diff_line_with_threads(
             file_path,
             line,
             None,
+            None,
             selected_anchor,
             None,
             None,
@@ -6931,6 +6936,7 @@ fn render_diff_line(
     file_path: &str,
     line: &ParsedDiffLine,
     syntax_spans: Option<&[SyntaxSpan]>,
+    emphasis_ranges: Option<&[DiffInlineRange]>,
     selected_anchor: Option<&DiffAnchor>,
     lsp_context: Option<&DiffLineLspContext>,
     line_action: Option<(Entity<AppState>, ReviewLineActionTarget)>,
@@ -7093,6 +7099,7 @@ fn render_diff_line(
             file_path,
             line,
             syntax_spans,
+            emphasis_ranges,
             fallback_text_color,
             lsp_context,
             line_action,
@@ -7103,6 +7110,7 @@ fn render_syntax_content(
     file_path: &str,
     line: &ParsedDiffLine,
     syntax_spans: Option<&[SyntaxSpan]>,
+    emphasis_ranges: Option<&[DiffInlineRange]>,
     fallback_color: Rgba,
     lsp_context: Option<&DiffLineLspContext>,
     line_action: Option<(Entity<AppState>, ReviewLineActionTarget)>,
@@ -7131,7 +7139,16 @@ fn render_syntax_content(
         owned_spans.as_slice()
     };
 
-    if spans.is_empty() {
+    let rendered_runs = decorated_diff_text_runs(
+        content,
+        spans,
+        emphasis_ranges.unwrap_or(&[]),
+        line.kind.clone(),
+        fallback_color,
+    )
+    .or_else(|| code_text_runs(spans));
+
+    if spans.is_empty() && rendered_runs.is_none() {
         let mut selectable = SelectableText::new(
             format!(
                 "diff-line:{}:{}:{}",
@@ -7167,7 +7184,7 @@ fn render_syntax_content(
         let unmatched_click = line_action.clone();
         let click_ranges: Vec<std::ops::Range<usize>> =
             token_ranges.iter().map(|t| t.byte_range.clone()).collect();
-        let interactive = if let Some(runs) = code_text_runs(spans) {
+        let interactive = if let Some(runs) = rendered_runs.clone() {
             SelectableText::new(
                 format!(
                     "diff-lsp:{}:{}:{}",
@@ -7221,7 +7238,7 @@ fn render_syntax_content(
         return content_div.text_color(fallback_color).child(interactive);
     }
 
-    let mut selectable = if let Some(runs) = code_text_runs(spans) {
+    let mut selectable = if let Some(runs) = rendered_runs {
         SelectableText::new(selection_id, content.to_string()).with_runs(runs)
     } else {
         SelectableText::new(selection_id, content.to_string())
@@ -7329,16 +7346,430 @@ fn diff_gutter_layout_from_parsed(parsed_file: &ParsedDiffFile) -> DiffGutterLay
     }
 }
 
-fn build_diff_highlights(parsed_file: &ParsedDiffFile) -> Arc<Vec<Vec<Vec<SyntaxSpan>>>> {
+const MAX_INLINE_DIFF_LINE_CHARS: usize = 512;
+const MAX_INLINE_DIFF_TOKEN_CHARS: usize = 128;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineTokenKind {
+    Whitespace,
+    Word,
+    Punctuation,
+}
+
+#[derive(Clone, Debug)]
+struct InlineToken {
+    text: String,
+    column_start: usize,
+    column_end: usize,
+    kind: InlineTokenKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InlineDiffOp {
+    Equal(usize, usize),
+    Delete(usize),
+    Add(usize),
+}
+
+fn classify_inline_diff_char(ch: char) -> InlineTokenKind {
+    if ch.is_whitespace() {
+        InlineTokenKind::Whitespace
+    } else if ch == '_' || ch.is_alphanumeric() {
+        InlineTokenKind::Word
+    } else {
+        InlineTokenKind::Punctuation
+    }
+}
+
+fn tokenize_inline_diff_line(content: &str) -> Vec<InlineToken> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut current_kind = None;
+    let mut token_start = 1usize;
+    let mut next_column = 1usize;
+
+    for ch in content.chars() {
+        let kind = classify_inline_diff_char(ch);
+        if current_kind != Some(kind) && !current.is_empty() {
+            tokens.push(InlineToken {
+                text: std::mem::take(&mut current),
+                column_start: token_start,
+                column_end: next_column,
+                kind: current_kind.expect("non-empty token should have a kind"),
+            });
+            token_start = next_column;
+        }
+
+        if current.is_empty() {
+            token_start = next_column;
+        }
+
+        current_kind = Some(kind);
+        current.push(ch);
+        next_column += 1;
+    }
+
+    if !current.is_empty() {
+        tokens.push(InlineToken {
+            text: current,
+            column_start: token_start,
+            column_end: next_column,
+            kind: current_kind.expect("non-empty token should have a kind"),
+        });
+    }
+
+    tokens
+}
+
+fn diff_sequence_by<T, F>(left: &[T], right: &[T], eq: F) -> Vec<InlineDiffOp>
+where
+    F: Fn(&T, &T) -> bool + Copy,
+{
+    let mut lcs = vec![vec![0usize; right.len() + 1]; left.len() + 1];
+
+    for left_ix in 0..left.len() {
+        for right_ix in 0..right.len() {
+            lcs[left_ix + 1][right_ix + 1] = if eq(&left[left_ix], &right[right_ix]) {
+                lcs[left_ix][right_ix] + 1
+            } else {
+                lcs[left_ix + 1][right_ix].max(lcs[left_ix][right_ix + 1])
+            };
+        }
+    }
+
+    let mut left_ix = left.len();
+    let mut right_ix = right.len();
+    let mut ops = Vec::new();
+
+    while left_ix > 0 || right_ix > 0 {
+        if left_ix > 0
+            && right_ix > 0
+            && eq(&left[left_ix - 1], &right[right_ix - 1])
+        {
+            ops.push(InlineDiffOp::Equal(left_ix - 1, right_ix - 1));
+            left_ix -= 1;
+            right_ix -= 1;
+        } else if right_ix > 0
+            && (left_ix == 0 || lcs[left_ix][right_ix - 1] >= lcs[left_ix - 1][right_ix])
+        {
+            ops.push(InlineDiffOp::Add(right_ix - 1));
+            right_ix -= 1;
+        } else {
+            ops.push(InlineDiffOp::Delete(left_ix - 1));
+            left_ix -= 1;
+        }
+    }
+
+    ops.reverse();
+    ops
+}
+
+fn token_range(token: &InlineToken) -> DiffInlineRange {
+    DiffInlineRange {
+        column_start: token.column_start,
+        column_end: token.column_end,
+    }
+}
+
+fn diff_single_token_chars(
+    left: &InlineToken,
+    right: &InlineToken,
+) -> (Vec<DiffInlineRange>, Vec<DiffInlineRange>) {
+    if left.text == right.text
+        || left.text.chars().count() > MAX_INLINE_DIFF_TOKEN_CHARS
+        || right.text.chars().count() > MAX_INLINE_DIFF_TOKEN_CHARS
+    {
+        return (vec![token_range(left)], vec![token_range(right)]);
+    }
+
+    let left_chars = left.text.chars().collect::<Vec<_>>();
+    let right_chars = right.text.chars().collect::<Vec<_>>();
+    let ops = diff_sequence_by(&left_chars, &right_chars, |left, right| left == right);
+
+    let mut left_ranges = Vec::new();
+    let mut right_ranges = Vec::new();
+
+    for op in ops {
+        match op {
+            InlineDiffOp::Equal(_, _) => {}
+            InlineDiffOp::Delete(left_ix) => left_ranges.push(DiffInlineRange {
+                column_start: left.column_start + left_ix,
+                column_end: left.column_start + left_ix + 1,
+            }),
+            InlineDiffOp::Add(right_ix) => right_ranges.push(DiffInlineRange {
+                column_start: right.column_start + right_ix,
+                column_end: right.column_start + right_ix + 1,
+            }),
+        }
+    }
+
+    if left_ranges.is_empty() || right_ranges.is_empty() {
+        return (vec![token_range(left)], vec![token_range(right)]);
+    }
+
+    (
+        merge_inline_ranges(left_ranges),
+        merge_inline_ranges(right_ranges),
+    )
+}
+
+fn apply_inline_diff_group(
+    left_tokens: &[InlineToken],
+    right_tokens: &[InlineToken],
+    deleted_indices: &[usize],
+    added_indices: &[usize],
+    left_ranges: &mut Vec<DiffInlineRange>,
+    right_ranges: &mut Vec<DiffInlineRange>,
+) {
+    let deleted = deleted_indices
+        .iter()
+        .filter_map(|ix| left_tokens.get(*ix))
+        .filter(|token| token.kind != InlineTokenKind::Whitespace)
+        .collect::<Vec<_>>();
+    let added = added_indices
+        .iter()
+        .filter_map(|ix| right_tokens.get(*ix))
+        .filter(|token| token.kind != InlineTokenKind::Whitespace)
+        .collect::<Vec<_>>();
+
+    if deleted.is_empty() && added.is_empty() {
+        return;
+    }
+
+    if deleted.len() == 1 && added.len() == 1 {
+        let (deleted_chars, added_chars) = diff_single_token_chars(deleted[0], added[0]);
+        left_ranges.extend(deleted_chars);
+        right_ranges.extend(added_chars);
+        return;
+    }
+
+    left_ranges.extend(deleted.into_iter().map(token_range));
+    right_ranges.extend(added.into_iter().map(token_range));
+}
+
+fn merge_inline_ranges(mut ranges: Vec<DiffInlineRange>) -> Vec<DiffInlineRange> {
+    if ranges.len() <= 1 {
+        return ranges;
+    }
+
+    ranges.sort_by_key(|range| (range.column_start, range.column_end));
+    let mut merged: Vec<DiffInlineRange> = Vec::with_capacity(ranges.len());
+
+    for range in ranges {
+        match merged.last_mut() {
+            Some(previous) if previous.column_end >= range.column_start => {
+                previous.column_end = previous.column_end.max(range.column_end);
+            }
+            _ => merged.push(range),
+        }
+    }
+
+    merged
+}
+
+fn compute_inline_emphasis(
+    left: &str,
+    right: &str,
+) -> (Vec<DiffInlineRange>, Vec<DiffInlineRange>) {
+    if left == right
+        || left.chars().count() > MAX_INLINE_DIFF_LINE_CHARS
+        || right.chars().count() > MAX_INLINE_DIFF_LINE_CHARS
+    {
+        return (Vec::new(), Vec::new());
+    }
+
+    let left_tokens = tokenize_inline_diff_line(left);
+    let right_tokens = tokenize_inline_diff_line(right);
+    let ops = diff_sequence_by(&left_tokens, &right_tokens, |left, right| {
+        left.kind == right.kind && left.text == right.text
+    });
+
+    let mut left_ranges = Vec::new();
+    let mut right_ranges = Vec::new();
+    let mut deleted_indices = Vec::new();
+    let mut added_indices = Vec::new();
+
+    for op in ops {
+        match op {
+            InlineDiffOp::Equal(_, _) => {
+                apply_inline_diff_group(
+                    &left_tokens,
+                    &right_tokens,
+                    &deleted_indices,
+                    &added_indices,
+                    &mut left_ranges,
+                    &mut right_ranges,
+                );
+                deleted_indices.clear();
+                added_indices.clear();
+            }
+            InlineDiffOp::Delete(left_ix) => deleted_indices.push(left_ix),
+            InlineDiffOp::Add(right_ix) => added_indices.push(right_ix),
+        }
+    }
+
+    apply_inline_diff_group(
+        &left_tokens,
+        &right_tokens,
+        &deleted_indices,
+        &added_indices,
+        &mut left_ranges,
+        &mut right_ranges,
+    );
+
+    (
+        merge_inline_ranges(left_ranges),
+        merge_inline_ranges(right_ranges),
+    )
+}
+
+fn build_hunk_inline_emphasis(hunk: &ParsedDiffHunk) -> Vec<Vec<DiffInlineRange>> {
+    let mut emphasis = vec![Vec::new(); hunk.lines.len()];
+    let mut line_ix = 0usize;
+
+    while line_ix < hunk.lines.len() {
+        if !matches!(
+            hunk.lines[line_ix].kind,
+            DiffLineKind::Addition | DiffLineKind::Deletion
+        ) {
+            line_ix += 1;
+            continue;
+        }
+
+        let mut deletions = Vec::new();
+        let mut additions = Vec::new();
+        while line_ix < hunk.lines.len()
+            && matches!(
+                hunk.lines[line_ix].kind,
+                DiffLineKind::Addition | DiffLineKind::Deletion
+            )
+        {
+            match hunk.lines[line_ix].kind {
+                DiffLineKind::Deletion => deletions.push(line_ix),
+                DiffLineKind::Addition => additions.push(line_ix),
+                _ => {}
+            }
+            line_ix += 1;
+        }
+
+        for (deleted_ix, added_ix) in deletions.into_iter().zip(additions.into_iter()) {
+            let (deleted_ranges, added_ranges) = compute_inline_emphasis(
+                hunk.lines[deleted_ix].content.as_str(),
+                hunk.lines[added_ix].content.as_str(),
+            );
+            emphasis[deleted_ix].extend(deleted_ranges);
+            emphasis[added_ix].extend(added_ranges);
+        }
+    }
+
+    emphasis
+        .into_iter()
+        .map(merge_inline_ranges)
+        .collect::<Vec<_>>()
+}
+
+fn inline_emphasis_background(kind: DiffLineKind) -> Option<Hsla> {
+    match kind {
+        DiffLineKind::Addition => Some(diff_add_emphasis_bg().into()),
+        DiffLineKind::Deletion => Some(diff_remove_emphasis_bg().into()),
+        DiffLineKind::Context | DiffLineKind::Meta => None,
+    }
+}
+
+fn decorated_diff_text_runs(
+    content: &str,
+    spans: &[SyntaxSpan],
+    emphasis_ranges: &[DiffInlineRange],
+    kind: DiffLineKind,
+    fallback_color: Rgba,
+) -> Option<Vec<TextRun>> {
+    if emphasis_ranges.is_empty() {
+        return None;
+    }
+
+    let emphasis_background = inline_emphasis_background(kind)?;
+    let chars = content.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return None;
+    }
+
+    let mut colors = vec![Hsla::from(fallback_color); chars.len()];
+    for span in spans {
+        let start = span.column_start.saturating_sub(1).min(chars.len());
+        let end = span.column_end.saturating_sub(1).min(chars.len());
+        for color in colors.iter_mut().take(end).skip(start) {
+            *color = span.color;
+        }
+    }
+
+    let mut emphasized = vec![false; chars.len()];
+    for range in emphasis_ranges {
+        let start = range.column_start.saturating_sub(1).min(chars.len());
+        let end = range.column_end.saturating_sub(1).min(chars.len());
+        for flag in emphasized.iter_mut().take(end).skip(start) {
+            *flag = true;
+        }
+    }
+
+    let mut runs = Vec::new();
+    let mut segment = String::new();
+    let mut current_color = colors[0];
+    let mut current_emphasis = emphasized[0];
+
+    for (index, ch) in chars.into_iter().enumerate() {
+        if index > 0
+            && (colors[index] != current_color || emphasized[index] != current_emphasis)
+        {
+            runs.push(TextRun {
+                len: segment.len(),
+                font: font("Fira Code"),
+                color: current_color,
+                background_color: current_emphasis.then_some(emphasis_background),
+                underline: None,
+                strikethrough: None,
+            });
+            segment.clear();
+            current_color = colors[index];
+            current_emphasis = emphasized[index];
+        }
+
+        segment.push(ch);
+    }
+
+    if !segment.is_empty() {
+        runs.push(TextRun {
+            len: segment.len(),
+            font: font("Fira Code"),
+            color: current_color,
+            background_color: current_emphasis.then_some(emphasis_background),
+            underline: None,
+            strikethrough: None,
+        });
+    }
+
+    (!runs.is_empty()).then_some(runs)
+}
+
+fn build_diff_highlights(parsed_file: &ParsedDiffFile) -> Arc<Vec<Vec<DiffLineHighlight>>> {
     Arc::new(
         parsed_file
             .hunks
             .iter()
             .map(|hunk| {
-                syntax::highlight_lines(
+                let syntax_lines = syntax::highlight_lines(
                     parsed_file.path.as_str(),
                     hunk.lines.iter().map(|line| line.content.as_str()),
-                )
+                );
+                let emphasis_lines = build_hunk_inline_emphasis(hunk);
+
+                hunk.lines
+                    .iter()
+                    .enumerate()
+                    .map(|(line_ix, _)| DiffLineHighlight {
+                        syntax_spans: syntax_lines.get(line_ix).cloned().unwrap_or_default(),
+                        emphasis_ranges: emphasis_lines.get(line_ix).cloned().unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect(),
     )
@@ -7705,17 +8136,19 @@ fn render_full_tour_diff_preview(
         elements.push(render_hunk_header(hunk, anchor).into_any_element());
 
         for (line_idx, line) in hunk.lines.iter().enumerate() {
-            let spans = highlighted_hunks
+            let highlight = highlighted_hunks
                 .get(hunk_idx)
                 .and_then(|lines| lines.get(line_idx))
-                .map(|spans| spans.as_slice());
+                .cloned()
+                .unwrap_or_default();
             let line_lsp_context = build_diff_line_lsp_context(file_lsp_context, line);
             elements.push(
                 render_diff_line(
                     gutter_layout,
                     file_path,
                     line,
-                    spans,
+                    Some(highlight.syntax_spans.as_slice()),
+                    Some(highlight.emphasis_ranges.as_slice()),
                     anchor,
                     line_lsp_context.as_ref(),
                     None,
