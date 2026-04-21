@@ -5,6 +5,10 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
+use crate::theme::{active_theme, ActiveTheme};
+
+pub const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct SyntaxSpan {
     pub text: String,
@@ -21,6 +25,13 @@ fn syntax_set() -> &'static SyntaxSet {
 fn theme_set() -> &'static ThemeSet {
     static SET: OnceLock<ThemeSet> = OnceLock::new();
     SET.get_or_init(ThemeSet::load_defaults)
+}
+
+fn syntax_theme_name() -> &'static str {
+    match active_theme() {
+        ActiveTheme::Light => "base16-ocean.light",
+        ActiveTheme::Dark => "base16-ocean.dark",
+    }
 }
 
 fn find_syntax_by_hint<'a>(ss: &'a SyntaxSet, hint: &str) -> Option<&'a SyntaxReference> {
@@ -83,7 +94,7 @@ where
         }
     };
 
-    let theme = &theme_set().themes["base16-ocean.dark"];
+    let theme = &theme_set().themes[syntax_theme_name()];
     let mut highlighter = HighlightLines::new(syntax, theme);
 
     lines
@@ -157,8 +168,11 @@ fn boost_saturation(color: Hsla) -> Hsla {
     if color.s < 0.08 {
         return color;
     }
-    // Raise saturation towards ~0.65–0.85 range, capping at 1.0.
-    let boosted_s = (color.s * 2.2).min(1.0);
+    let multiplier = match active_theme() {
+        ActiveTheme::Light => 1.35,
+        ActiveTheme::Dark => 2.2,
+    };
+    let boosted_s = (color.s * multiplier).min(1.0);
     Hsla {
         s: boosted_s,
         ..color

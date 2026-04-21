@@ -20,6 +20,9 @@ thread_local! {
 pub enum AppTextFieldKind {
     PaletteQuery,
     ReviewBody,
+    WaymarkDraft,
+    InlineCommentDraft,
+    WaypointSpotlightQuery,
 }
 
 #[derive(Default)]
@@ -91,6 +94,7 @@ pub struct SelectableText {
     text: StyledText,
     click_listener:
         Option<Box<dyn Fn(&[Range<usize>], SelectableTextClickEvent, &mut Window, &mut App)>>,
+    unmatched_click_listener: Option<Box<dyn Fn(&mut Window, &mut App)>>,
     hover_listener: Option<Box<dyn Fn(Option<usize>, MouseMoveEvent, &mut Window, &mut App)>>,
     tooltip_builder: Option<Rc<dyn Fn(usize, &mut Window, &mut App) -> Option<AnyView>>>,
     clickable_ranges: Vec<Range<usize>>,
@@ -109,6 +113,7 @@ impl SelectableText {
             text: StyledText::new(raw_text.clone()),
             raw_text,
             click_listener: None,
+            unmatched_click_listener: None,
             hover_listener: None,
             tooltip_builder: None,
             clickable_ranges: Vec::new(),
@@ -135,6 +140,14 @@ impl SelectableText {
             }
         }));
         self.clickable_ranges = ranges;
+        self
+    }
+
+    pub fn on_click_unmatched(
+        mut self,
+        listener: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.unmatched_click_listener = Some(Box::new(listener));
         self
     }
 
@@ -346,6 +359,7 @@ impl Element for SelectableText {
                 let mouse_up_layout = text_layout.clone();
                 let click_ranges = mem::take(&mut self.clickable_ranges);
                 let click_listener = self.click_listener.take();
+                let unmatched_click_listener = self.unmatched_click_listener.take();
                 window.on_mouse_event(move |event: &MouseUpEvent, phase, window, cx| {
                     if phase != DispatchPhase::Capture || event.button != MouseButton::Left {
                         return;
@@ -366,6 +380,7 @@ impl Element for SelectableText {
                     }
                     state.selecting = false;
                     let mouse_down_index = state.mouse_down_index.take();
+                    let had_mouse_down = mouse_down_index.is_some();
                     let selection_range = state.selection_range();
                     drop(state);
 
@@ -377,6 +392,16 @@ impl Element for SelectableText {
                             .map(|range| range.is_empty())
                             .unwrap_or(false);
                         if collapsed {
+                            let mut matched_range = false;
+                            for range in &click_ranges {
+                                if range.contains(&mouse_down_index)
+                                    && range.contains(&mouse_up_index)
+                                {
+                                    matched_range = true;
+                                    break;
+                                }
+                            }
+
                             listener(
                                 &click_ranges,
                                 SelectableTextClickEvent {
@@ -386,6 +411,21 @@ impl Element for SelectableText {
                                 window,
                                 cx,
                             );
+
+                            if !matched_range {
+                                if let Some(listener) = unmatched_click_listener.as_ref() {
+                                    listener(window, cx);
+                                }
+                            }
+                        }
+                    } else if had_mouse_down
+                        && selection_range
+                            .as_ref()
+                            .map(|range| range.is_empty())
+                            .unwrap_or(false)
+                    {
+                        if let Some(listener) = unmatched_click_listener.as_ref() {
+                            listener(window, cx);
                         }
                     }
 
@@ -508,7 +548,10 @@ impl AppTextInput {
             raw_text: SharedString::new(""),
             display_text: placeholder,
             autofocus: false,
-            multiline: matches!(field, AppTextFieldKind::ReviewBody),
+            multiline: matches!(
+                field,
+                AppTextFieldKind::ReviewBody | AppTextFieldKind::InlineCommentDraft
+            ),
             selection_color: accent_muted(),
         }
     }
@@ -524,6 +567,11 @@ impl AppTextInput {
             match self.field {
                 AppTextFieldKind::PaletteQuery => app_state.palette_query.clone(),
                 AppTextFieldKind::ReviewBody => app_state.review_body.clone(),
+                AppTextFieldKind::WaymarkDraft => app_state.waymark_draft.clone(),
+                AppTextFieldKind::InlineCommentDraft => app_state.inline_comment_draft.clone(),
+                AppTextFieldKind::WaypointSpotlightQuery => {
+                    app_state.waypoint_spotlight_query.clone()
+                }
             }
         };
 
@@ -963,6 +1011,9 @@ fn input_text_for_field<'a>(state: &'a AppState, field: AppTextFieldKind) -> &'a
     match field {
         AppTextFieldKind::PaletteQuery => state.palette_query.as_str(),
         AppTextFieldKind::ReviewBody => state.review_body.as_str(),
+        AppTextFieldKind::WaymarkDraft => state.waymark_draft.as_str(),
+        AppTextFieldKind::InlineCommentDraft => state.inline_comment_draft.as_str(),
+        AppTextFieldKind::WaypointSpotlightQuery => state.waypoint_spotlight_query.as_str(),
     }
 }
 
@@ -974,6 +1025,16 @@ fn set_input_text_for_field(state: &mut AppState, field: AppTextFieldKind, value
         }
         AppTextFieldKind::ReviewBody => {
             state.review_body = value;
+        }
+        AppTextFieldKind::WaymarkDraft => {
+            state.waymark_draft = value;
+        }
+        AppTextFieldKind::InlineCommentDraft => {
+            state.inline_comment_draft = value;
+        }
+        AppTextFieldKind::WaypointSpotlightQuery => {
+            state.waypoint_spotlight_query = value;
+            state.waypoint_spotlight_selected_index = 0;
         }
     }
 }
@@ -1061,6 +1122,9 @@ fn normalize_paste(field: AppTextFieldKind, text: &str) -> String {
     match field {
         AppTextFieldKind::PaletteQuery => text.replace('\n', " "),
         AppTextFieldKind::ReviewBody => text.to_string(),
+        AppTextFieldKind::WaymarkDraft => text.replace('\n', " "),
+        AppTextFieldKind::InlineCommentDraft => text.to_string(),
+        AppTextFieldKind::WaypointSpotlightQuery => text.replace('\n', " "),
     }
 }
 

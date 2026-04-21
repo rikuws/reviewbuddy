@@ -6,6 +6,8 @@ use crate::app_assets::{
     OVERVIEW_REVIEW_REQUESTS_ASSET,
 };
 use crate::github;
+use crate::review_queue::default_review_file;
+use crate::review_session::load_review_session;
 use crate::state::*;
 use crate::theme::*;
 
@@ -1269,6 +1271,10 @@ pub fn open_pull_request(
     let key = pr_key(&summary.repository, summary.number);
     let repository = summary.repository.clone();
     let number = summary.number;
+    let cached_review_session = {
+        let cache = state.read(cx).cache.clone();
+        load_review_session(cache.as_ref(), &key).ok().flatten()
+    };
     let load_plan = {
         let s = state.read(cx);
         plan_pull_request_open(&s, &key)
@@ -1283,11 +1289,10 @@ pub fn open_pull_request(
             s.open_tabs.insert(0, summary);
         }
         s.active_section = SectionId::Pulls;
-        s.active_surface = PullRequestSurface::Overview;
+        s.active_surface = PullRequestSurface::Files;
         s.active_pr_key = Some(key.clone());
         s.palette_open = false;
         s.palette_selected_index = 0;
-        s.selected_diff_anchor = None;
         s.review_body.clear();
         s.review_editor_active = false;
         s.review_message = None;
@@ -1296,6 +1301,8 @@ pub fn open_pull_request(
         s.active_tour_outline_id = "overview".to_string();
         s.collapsed_tour_panels.clear();
 
+        s.detail_states.entry(key.clone()).or_default();
+        s.apply_review_session_document(&key, cached_review_session.clone());
         let detail_state = s.detail_states.entry(key.clone()).or_default();
         detail_state.loading = load_plan.show_loading;
         if load_plan.load_cached_snapshot || load_plan.sync_live {
@@ -1344,6 +1351,17 @@ pub fn open_pull_request(
                             Err(error) => {
                                 ds.loading = should_sync;
                                 ds.error = Some(error.clone());
+                            }
+                        }
+                        if s.selected_file_path.is_none() {
+                            if let Some(detail) =
+                                ds.snapshot.as_ref().and_then(|sn| sn.detail.as_ref())
+                            {
+                                s.selected_file_path = default_review_file(detail).or_else(|| {
+                                    detail.files.first().map(|file| file.path.clone()).or_else(
+                                        || detail.parsed_diff.first().map(|file| file.path.clone()),
+                                    )
+                                });
                             }
                         }
                         cx.notify();
@@ -1396,11 +1414,12 @@ pub fn open_pull_request(
                     if s.selected_file_path.is_none() {
                         if let Some(detail) = ds.snapshot.as_ref().and_then(|sn| sn.detail.as_ref())
                         {
-                            s.selected_file_path = detail
-                                .files
-                                .first()
-                                .map(|f| f.path.clone())
-                                .or_else(|| detail.parsed_diff.first().map(|f| f.path.clone()));
+                            s.selected_file_path =
+                                default_review_file(detail).or_else(|| {
+                                    detail.files.first().map(|file| file.path.clone()).or_else(
+                                        || detail.parsed_diff.first().map(|file| file.path.clone()),
+                                    )
+                                });
                         }
                     }
                     cx.notify();

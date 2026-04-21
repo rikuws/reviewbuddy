@@ -281,7 +281,7 @@ pub fn render_pr_workspace(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
     let syncing = detail_state.map(|d| d.syncing).unwrap_or(false);
     let error = detail_state.and_then(|d| d.error.clone());
     let show_loading_state = detail.is_none() && (loading || syncing);
-    let header_compact = surface != PullRequestSurface::Overview && s.pr_header_compact;
+    let header_compact = surface != PullRequestSurface::Overview || s.pr_header_compact;
 
     let state_for_surface = state.clone();
     let state_for_refresh = state.clone();
@@ -368,7 +368,7 @@ fn render_pr_header(
         .flex()
         .flex_col()
         .min_w_0()
-        .gap(if compact { px(0.0) } else { px(6.0) })
+        .gap(if compact { px(0.0) } else { px(4.0) })
         .child(
             div()
                 .h(if compact { px(0.0) } else { px(18.0) })
@@ -396,10 +396,10 @@ fn render_pr_header(
         )
         .child(
             div()
-                .text_size(if compact { px(18.0) } else { px(24.0) })
+                .text_size(if compact { px(16.0) } else { px(22.0) })
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(fg_emphasis())
-                .line_height(if compact { px(22.0) } else { px(30.0) })
+                .line_height(if compact { px(20.0) } else { px(28.0) })
                 .text_ellipsis()
                 .whitespace_nowrap()
                 .overflow_x_hidden()
@@ -409,8 +409,8 @@ fn render_pr_header(
                     Animation::new(Duration::from_millis(240)).with_easing(ease_in_out),
                     move |el, delta| {
                         let progress = header_animation_progress(compact, delta);
-                        el.text_size(lerp_px(24.0, 18.0, progress))
-                            .line_height(lerp_px(30.0, 22.0, progress))
+                        el.text_size(lerp_px(22.0, 16.0, progress))
+                            .line_height(lerp_px(28.0, 20.0, progress))
                             .text_color(fg_emphasis())
                     },
                 ),
@@ -463,42 +463,102 @@ fn render_pr_header(
         .flex()
         .items_center()
         .justify_between()
-        .mb(if compact { px(8.0) } else { px(20.0) })
-        .pb(if compact { px(8.0) } else { px(20.0) })
-        .gap(if compact { px(12.0) } else { px(16.0) })
-        .child(header_copy)
+        .mb(if compact { px(4.0) } else { px(14.0) })
+        .pb(if compact { px(4.0) } else { px(14.0) })
+        .gap(if compact { px(8.0) } else { px(14.0) })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(if compact { px(8.0) } else { px(12.0) })
+                .min_w_0()
+                .when(!compact, |el| el.child(header_copy))
+                .when(compact, |el| {
+                    el.child(render_pr_surface_tabs(
+                        surface,
+                        state_for_surface.clone(),
+                        true,
+                    ))
+                }),
+        )
         .child(
             div()
                 .flex()
                 .gap(px(6.0))
                 .flex_wrap()
-                .child(ghost_button("Open in browser", {
-                    let repository = repository.clone();
-                    move |_, window, cx| {
-                        open_pull_request_in_browser(&repository, number, window, cx)
-                    }
-                }))
-                .child(review_button("Refresh PR", {
-                    let state = state_for_refresh.clone();
-                    let repository = repository.clone();
-                    move |_, window, cx| trigger_sync_pr(&state, &repository, number, window, cx)
-                })),
+                .child(ghost_button(
+                    if compact {
+                        "Browser"
+                    } else {
+                        "Open in browser"
+                    },
+                    {
+                        let repository = repository.clone();
+                        move |_, window, cx| {
+                            open_pull_request_in_browser(&repository, number, window, cx)
+                        }
+                    },
+                ))
+                .child(if compact {
+                    ghost_button("Refresh", {
+                        let state = state_for_refresh.clone();
+                        let repository = repository.clone();
+                        move |_, window, cx| {
+                            trigger_sync_pr(&state, &repository, number, window, cx)
+                        }
+                    })
+                    .into_any_element()
+                } else {
+                    review_button("Refresh PR", {
+                        let state = state_for_refresh.clone();
+                        let repository = repository.clone();
+                        move |_, window, cx| {
+                            trigger_sync_pr(&state, &repository, number, window, cx)
+                        }
+                    })
+                    .into_any_element()
+                }),
         )
         .with_animation(
             ("pr-header-top-row", usize::from(compact)),
             Animation::new(Duration::from_millis(240)).with_easing(ease_in_out),
             move |el, delta| {
                 let progress = header_animation_progress(compact, delta);
-                el.mb(lerp_px(20.0, 8.0, progress))
-                    .pb(lerp_px(20.0, 8.0, progress))
-                    .gap(lerp_px(16.0, 12.0, progress))
+                el.mb(lerp_px(14.0, 4.0, progress))
+                    .pb(lerp_px(14.0, 4.0, progress))
+                    .gap(lerp_px(14.0, 8.0, progress))
             },
         );
 
-    let tabs = div()
+    div()
+        .flex_shrink_0()
+        .child(top_row)
+        .when(!compact, |el| {
+            el.child(render_pr_surface_tabs(
+                surface,
+                state_for_surface.clone(),
+                false,
+            ))
+        })
+        .with_animation(
+            ("pr-header-shell", usize::from(compact)),
+            Animation::new(Duration::from_millis(240)).with_easing(ease_in_out),
+            move |el, delta| {
+                let progress = header_animation_progress(compact, delta);
+                el.pt(lerp_px(18.0, 4.0, progress)).px(px(18.0)).pb(px(0.0))
+            },
+        )
+}
+
+fn render_pr_surface_tabs(
+    surface: PullRequestSurface,
+    state_for_surface: Entity<AppState>,
+    inline: bool,
+) -> impl IntoElement {
+    div()
         .flex()
         .gap(px(2.0))
-        .pb(if compact { px(8.0) } else { px(12.0) })
+        .when(!inline, |el| el.pb(px(10.0)))
         .children(PullRequestSurface::all().iter().map(|surface_id| {
             let is_active = surface == *surface_id;
             let target_surface = *surface_id;
@@ -517,29 +577,6 @@ fn render_pr_header(
                 }
             })
         }))
-        .with_animation(
-            ("pr-header-tabs", usize::from(compact)),
-            Animation::new(Duration::from_millis(240)).with_easing(ease_in_out),
-            move |el, delta| {
-                let progress = header_animation_progress(compact, delta);
-                el.pb(lerp_px(12.0, 8.0, progress))
-            },
-        );
-
-    div()
-        .flex_shrink_0()
-        .child(top_row)
-        .child(tabs)
-        .with_animation(
-            ("pr-header-shell", usize::from(compact)),
-            Animation::new(Duration::from_millis(240)).with_easing(ease_in_out),
-            move |el, delta| {
-                let progress = header_animation_progress(compact, delta);
-                el.pt(lerp_px(28.0, 14.0, progress))
-                    .px(px(32.0))
-                    .pb(px(0.0))
-            },
-        )
 }
 
 fn header_animation_progress(compact: bool, delta: f32) -> f32 {
@@ -677,9 +714,9 @@ fn render_overview_summary_strip(
 ) -> impl IntoElement {
     let state = state.clone();
     let action_label = if is_own_pull_request {
-        "Inspect changes"
+        "Open review workspace"
     } else {
-        "Review changes"
+        "Start review"
     };
 
     nested_panel().child(

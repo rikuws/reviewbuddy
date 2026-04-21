@@ -203,6 +203,40 @@ pub fn trigger_code_tour_provider_status_refresh(
         .detach();
 }
 
+pub fn update_theme_preference(
+    state: &Entity<AppState>,
+    preference: ThemePreference,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if state.read(cx).theme_preference == preference {
+        return;
+    }
+
+    let cache = state.read(cx).cache.clone();
+    state.update(cx, |state, cx| {
+        state.set_theme_preference(preference);
+        cx.notify();
+    });
+
+    window
+        .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+            let _ = cx
+                .background_executor()
+                .spawn({
+                    let cache = cache.clone();
+                    async move {
+                        crate::theme::save_theme_settings(
+                            &cache,
+                            &crate::theme::ThemeSettings { preference },
+                        )
+                    }
+                })
+                .await;
+        })
+        .detach();
+}
+
 fn trigger_managed_lsp_install(
     state: &Entity<AppState>,
     kind: ManagedServerKind,
@@ -335,6 +369,7 @@ pub fn render_settings_view(state: &Entity<AppState>, cx: &App) -> impl IntoElem
                     .flex()
                     .flex_col()
                     .gap(px(24.0))
+                    .child(render_theme_settings_panel(state, &s))
                     .child(render_code_tour_settings_panel(state, &s))
                     .child(
                         panel().child(
@@ -440,6 +475,77 @@ pub fn render_settings_view(state: &Entity<AppState>, cx: &App) -> impl IntoElem
                     ),
             ),
         )
+}
+
+fn render_theme_settings_panel(state: &Entity<AppState>, s: &AppState) -> impl IntoElement {
+    let theme_preference = s.theme_preference;
+    let resolved_theme = s.resolved_theme();
+    let system_appearance = appearance_label(s.window_appearance);
+    let summary_copy = match theme_preference {
+        ThemePreference::System => format!(
+            "ReviewBuddy follows the operating system by default. The current system appearance is {system_appearance}."
+        ),
+        ThemePreference::Light => {
+            "Manual override is active. Switch back to System to follow the operating system again."
+                .to_string()
+        }
+        ThemePreference::Dark => {
+            "Manual override is active. Switch back to System to follow the operating system again."
+                .to_string()
+        }
+    };
+
+    panel().child(
+        div()
+            .p(px(28.0))
+            .px(px(32.0))
+            .flex()
+            .flex_col()
+            .gap(px(18.0))
+            .child(eyebrow("Settings / Appearance"))
+            .child(
+                div()
+                    .text_size(px(24.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(fg_emphasis())
+                    .child("Theme"),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(fg_muted())
+                    .max_w(px(760.0))
+                    .child(summary_copy),
+            )
+            .child(div().flex().gap(px(4.0)).flex_wrap().children(
+                ThemePreference::all().iter().map(|candidate| {
+                    let candidate = *candidate;
+                    let state = state.clone();
+                    surface_tab(
+                        candidate.label(),
+                        theme_preference == candidate,
+                        move |_, window, cx| {
+                            update_theme_preference(&state, candidate, window, cx);
+                        },
+                    )
+                }),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .flex_wrap()
+                    .child(badge(&format!(
+                        "active {}",
+                        resolved_theme.label().to_lowercase()
+                    )))
+                    .child(badge(&format!(
+                        "system {}",
+                        system_appearance.to_lowercase()
+                    ))),
+            ),
+    )
 }
 
 fn render_code_tour_settings_panel(state: &Entity<AppState>, s: &AppState) -> impl IntoElement {

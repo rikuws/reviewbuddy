@@ -19,6 +19,7 @@ pub struct LspServerCapabilities {
     pub hover_supported: bool,
     pub signature_help_supported: bool,
     pub definition_supported: bool,
+    pub references_supported: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -137,11 +138,15 @@ pub struct LspSymbolDetails {
     pub hover: Option<LspHoverResult>,
     pub signature_help: Option<LspSignatureHelp>,
     pub definition_targets: Vec<LspDefinitionTarget>,
+    pub reference_targets: Vec<LspReferenceTarget>,
 }
 
 impl LspSymbolDetails {
     pub fn is_empty(&self) -> bool {
-        self.hover.is_none() && self.signature_help.is_none() && self.definition_targets.is_empty()
+        self.hover.is_none()
+            && self.signature_help.is_none()
+            && self.definition_targets.is_empty()
+            && self.reference_targets.is_empty()
     }
 }
 
@@ -164,6 +169,8 @@ pub struct LspDefinitionTarget {
     pub line: usize,
     pub column: usize,
 }
+
+pub type LspReferenceTarget = LspDefinitionTarget;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SessionKey {
@@ -238,6 +245,11 @@ impl LspSessionManager {
         if capabilities.definition_supported {
             if let Ok(targets) = session.definition_targets(request, &capabilities) {
                 details.definition_targets = targets;
+            }
+        }
+        if capabilities.references_supported {
+            if let Ok(targets) = session.reference_targets(request, &capabilities) {
+                details.reference_targets = targets;
             }
         }
         Ok(details)
@@ -411,6 +423,7 @@ impl LspSession {
                     "textDocument": {
                         "hover": {},
                         "definition": {},
+                        "references": {},
                         "signatureHelp": {},
                     }
                 }
@@ -477,6 +490,7 @@ impl LspSession {
             hover,
             signature_help,
             definition_targets: Vec::new(),
+            reference_targets: Vec::new(),
         })
     }
 
@@ -511,6 +525,42 @@ impl LspSession {
         )?;
 
         Ok(parse_definition_targets(&self.repo_root, &result))
+    }
+
+    fn reference_targets(
+        &self,
+        request: &LspTextDocumentRequest,
+        capabilities: &LspServerCapabilities,
+    ) -> Result<Vec<LspReferenceTarget>, String> {
+        if !capabilities.references_supported {
+            return Ok(Vec::new());
+        }
+
+        let document_path = resolve_repo_document_path(&self.repo_root, &request.file_path)?;
+        let document_uri = file_uri(&document_path)?;
+        let position =
+            lsp_position_for_text(request.document_text.as_ref(), request.line, request.column)?;
+
+        let mut io = self
+            .io
+            .lock()
+            .map_err(|_| "LSP session IO is unavailable.".to_string())?;
+        self.ensure_document_open(&mut io, &document_path, request.document_text.as_ref())?;
+
+        let result = send_request(
+            &mut io,
+            &self.next_request_id,
+            "textDocument/references",
+            json!({
+                "textDocument": { "uri": document_uri },
+                "position": position,
+                "context": {
+                    "includeDeclaration": false,
+                }
+            }),
+        )?;
+
+        Ok(parse_reference_targets(&self.repo_root, &result))
     }
 
     fn ensure_document_open(&self, io: &mut LspIo, path: &Path, text: &str) -> Result<(), String> {
@@ -582,6 +632,9 @@ fn capability_summary(capabilities: &LspServerCapabilities) -> String {
     }
     if capabilities.definition_supported {
         features.push("definition");
+    }
+    if capabilities.references_supported {
+        features.push("references");
     }
 
     if features.is_empty() {
@@ -802,6 +855,7 @@ fn parse_server_capabilities(result: &Value) -> LspServerCapabilities {
         hover_supported: capability_is_enabled(capabilities.get("hoverProvider")),
         signature_help_supported: capability_is_enabled(capabilities.get("signatureHelpProvider")),
         definition_supported: capability_is_enabled(capabilities.get("definitionProvider")),
+        references_supported: capability_is_enabled(capabilities.get("referencesProvider")),
     }
 }
 
@@ -877,6 +931,10 @@ fn parse_definition_targets(repo_root: &Path, result: &Value) -> Vec<LspDefiniti
             .into_iter()
             .collect(),
     }
+}
+
+fn parse_reference_targets(repo_root: &Path, result: &Value) -> Vec<LspReferenceTarget> {
+    parse_definition_targets(repo_root, result)
 }
 
 fn parse_definition_target(repo_root: &Path, value: &Value) -> Option<LspDefinitionTarget> {

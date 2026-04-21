@@ -10,14 +10,14 @@ use std::{
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::code_tour::DiffAnchor;
 use crate::lsp;
 use crate::markdown::render_markdown;
+use crate::review_session::ReviewLocation;
 use crate::selectable_text::SelectableText;
 use crate::state::{AppState, PreparedFileContent, PreparedFileLine};
 use crate::syntax::{self, SyntaxSpan};
 use crate::theme::*;
-use crate::views::diff_view::ensure_selected_file_content_loaded;
+use crate::views::diff_view::{load_local_source_file_content_flow, open_review_source_location};
 
 static CODE_BLOCK_ID: AtomicUsize = AtomicUsize::new(0);
 
@@ -206,6 +206,13 @@ pub fn render_prepared_file_excerpt_with_line_numbers(
         .unwrap_or_default();
 
     render_prepared_code_block_lines(lines, lsp_context)
+}
+
+pub fn render_prepared_file_with_line_numbers(
+    prepared_file: &PreparedFileContent,
+    lsp_context: Option<&PreparedFileLspContext>,
+) -> AnyElement {
+    render_prepared_code_block_lines(prepared_file.lines.as_ref().clone(), lsp_context)
 }
 
 fn numbered_highlighted_code_lines(
@@ -638,18 +645,14 @@ fn navigate_to_prepared_file_lsp_definition(
 
     if let Some(targets) = targets.filter(|t| !t.is_empty()) {
         let target = &targets[0];
-        query.state.update(cx, |state, cx| {
-            state.selected_file_path = Some(target.path.clone());
-            state.selected_diff_anchor = Some(DiffAnchor {
-                file_path: target.path.clone(),
-                hunk_header: None,
-                line: Some(target.line as i64),
-                side: Some("RIGHT".to_string()),
-                thread_id: None,
-            });
-            cx.notify();
-        });
-        ensure_selected_file_content_loaded(&query.state, window, cx);
+        open_review_source_location(
+            &query.state,
+            target.path.clone(),
+            Some(target.line),
+            Some("Jumped to definition".to_string()),
+            window,
+            cx,
+        );
         return;
     }
 
@@ -671,17 +674,19 @@ fn navigate_to_prepared_file_lsp_definition(
                         let target = target.clone();
                         state
                             .update(cx, |state, cx| {
-                                state.selected_file_path = Some(target.path.clone());
-                                state.selected_diff_anchor = Some(DiffAnchor {
-                                    file_path: target.path.clone(),
-                                    hunk_header: None,
-                                    line: Some(target.line as i64),
-                                    side: Some("RIGHT".to_string()),
-                                    thread_id: None,
-                                });
+                                state.navigate_to_review_location(
+                                    ReviewLocation::from_source(
+                                        target.path.clone(),
+                                        Some(target.line),
+                                        Some("Jumped to definition".to_string()),
+                                    ),
+                                    true,
+                                );
+                                state.persist_active_review_session();
                                 cx.notify();
                             })
                             .ok();
+                        load_local_source_file_content_flow(state, target.path.clone(), cx).await;
                     }
                 }
             }
@@ -925,6 +930,36 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails, id_prefix: &str) -
                             .whitespace_normal()
                             .child(format!("{}:{}", target.path, target.line))
                     })),
+            )
+        })
+        .when(!details.reference_targets.is_empty(), |el| {
+            let extra_count = details.reference_targets.len().saturating_sub(6);
+            el.child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(render_lsp_section_label("REFERENCES"))
+                    .children(details.reference_targets.iter().take(6).map(|target| {
+                        div()
+                            .w_full()
+                            .min_w_0()
+                            .font_family("Fira Code")
+                            .text_size(px(12.0))
+                            .text_color(fg_default())
+                            .whitespace_normal()
+                            .child(format!("{}:{}", target.path, target.line))
+                    }))
+                    .when(extra_count > 0, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(11.0))
+                                .text_color(fg_muted())
+                                .child(format!("+{extra_count} more references")),
+                        )
+                    }),
             )
         })
         .into_any_element()

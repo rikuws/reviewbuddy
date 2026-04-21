@@ -8,6 +8,16 @@ pub const APP_LOGO_ASSET: &str = "brand/logo.png";
 pub const OVERVIEW_OPEN_PULL_REQUESTS_ASSET: &str = "icons/overview-open-pull-requests.svg";
 pub const OVERVIEW_MY_PULL_REQUESTS_ASSET: &str = "icons/overview-my-pull-requests.svg";
 pub const OVERVIEW_REVIEW_REQUESTS_ASSET: &str = "icons/overview-review-requests.svg";
+pub const SIDEBAR_OVERVIEW_ASSET: &str = "icons/sidebar-overview.svg";
+pub const SIDEBAR_PULLS_ASSET: &str = "icons/sidebar-pulls.svg";
+pub const SIDEBAR_REVIEWS_ASSET: &str = "icons/sidebar-reviews.svg";
+pub const SIDEBAR_SETTINGS_ASSET: &str = "icons/sidebar-settings.svg";
+pub const SIDEBAR_COLLAPSE_ASSET: &str = "icons/sidebar-collapse.svg";
+pub const SIDEBAR_EXPAND_ASSET: &str = "icons/sidebar-expand.svg";
+pub const SIDEBAR_SYNC_ASSET: &str = "icons/sidebar-sync.svg";
+pub const SIDEBAR_SYSTEM_ASSET: &str = "icons/sidebar-system.svg";
+pub const SIDEBAR_LIGHT_ASSET: &str = "icons/sidebar-light.svg";
+pub const SIDEBAR_DARK_ASSET: &str = "icons/sidebar-dark.svg";
 
 pub struct AppAssets {
     base: PathBuf,

@@ -1,15 +1,20 @@
 use gpui::prelude::*;
 use gpui::*;
 
-use crate::app_assets::APP_LOGO_ASSET;
+use crate::app_assets::{
+    APP_LOGO_ASSET, SIDEBAR_COLLAPSE_ASSET, SIDEBAR_DARK_ASSET, SIDEBAR_EXPAND_ASSET,
+    SIDEBAR_LIGHT_ASSET, SIDEBAR_OVERVIEW_ASSET, SIDEBAR_PULLS_ASSET, SIDEBAR_REVIEWS_ASSET,
+    SIDEBAR_SETTINGS_ASSET, SIDEBAR_SYNC_ASSET, SIDEBAR_SYSTEM_ASSET,
+};
 use crate::github;
+use crate::review_session::load_review_session;
 use crate::state::*;
 use crate::theme::*;
 
 use super::palette::render_palette;
 use super::pr_detail::render_pr_workspace;
-use super::sections::{badge, ghost_button, render_section_workspace};
-use super::settings::prepare_settings_view;
+use super::sections::render_section_workspace;
+use super::settings::{prepare_settings_view, update_theme_preference};
 use super::workspace_sync::{
     sync_workspace_flow, trigger_sync_workspace, wait_for_workspace_poll_interval,
 };
@@ -18,8 +23,27 @@ pub struct RootView {
     state: Entity<AppState>,
 }
 
+const APP_SIDEBAR_EXPANDED_WIDTH: f32 = 216.0;
+const APP_SIDEBAR_COLLAPSED_WIDTH: f32 = 68.0;
+
 impl RootView {
     pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let initial_appearance = window.appearance();
+        state.update(cx, |state, _| {
+            state.set_window_appearance(initial_appearance);
+        });
+        cx.observe_window_appearance(window, {
+            let state = state.clone();
+            move |_, window, cx| {
+                let appearance = window.appearance();
+                state.update(cx, |state, cx| {
+                    state.set_window_appearance(appearance);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+
         // Bootstrap: load workspace from cache, then sync in background.
         let model = state.clone();
         cx.spawn_in(window, async move |_this, cx| {
@@ -51,6 +75,8 @@ impl RootView {
                     cx.notify();
                 })
                 .ok();
+
+            maybe_bootstrap_debug_pull_request(&model, cache.as_ref(), cx).await;
 
             // Check gh version
             let gh_result = cx
@@ -113,38 +139,373 @@ impl RootView {
     }
 }
 
+async fn maybe_bootstrap_debug_pull_request(
+    model: &Entity<AppState>,
+    cache: &crate::cache::CacheStore,
+    cx: &mut AsyncWindowContext,
+) {
+    let Some(debug_target) = std::env::var("REVIEWBUDDY_DEBUG_OPEN_PR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return;
+    };
+
+    let Some((repository, number)) = parse_debug_pull_request_target(&debug_target) else {
+        return;
+    };
+
+    let snapshot = match cx
+        .background_executor()
+        .spawn({
+            let cache = cache.clone();
+            let repository = repository.clone();
+            async move { github::load_pull_request_detail(&cache, &repository, number) }
+        })
+        .await
+    {
+        Ok(snapshot) => snapshot,
+        Err(_) => return,
+    };
+
+    let Some(detail) = snapshot.detail.clone() else {
+        return;
+    };
+
+    let review_session = load_review_session(cache, &pr_key(&repository, number))
+        .ok()
+        .flatten();
+    let summary = github::PullRequestSummary {
+        repository: detail.repository.clone(),
+        number: detail.number,
+        title: detail.title.clone(),
+        author_login: detail.author_login.clone(),
+        is_draft: detail.is_draft,
+        comments_count: detail.comments_count,
+        additions: detail.additions,
+        deletions: detail.deletions,
+        changed_files: detail.changed_files,
+        state: detail.state.clone(),
+        review_decision: detail.review_decision.clone(),
+        updated_at: detail.updated_at.clone(),
+        url: detail.url.clone(),
+    };
+    let detail_key = pr_key(&repository, number);
+
+    model
+        .update(cx, |state, cx| {
+            if !state
+                .open_tabs
+                .iter()
+                .any(|tab| pr_key(&tab.repository, tab.number) == detail_key)
+            {
+                state.open_tabs.insert(0, summary);
+            }
+
+            state.active_section = SectionId::Pulls;
+            state.active_surface = PullRequestSurface::Files;
+            state.active_pr_key = Some(detail_key.clone());
+            state.pr_header_compact = false;
+            state.review_body.clear();
+            state.review_editor_active = false;
+            state.review_message = None;
+            state.review_success = false;
+
+            let detail_state = state.detail_states.entry(detail_key.clone()).or_default();
+            detail_state.snapshot = Some(snapshot.clone());
+            detail_state.loading = false;
+            detail_state.syncing = false;
+            detail_state.error = None;
+
+            state.apply_review_session_document(&detail_key, review_session.clone());
+            cx.notify();
+        })
+        .ok();
+}
+
+fn parse_debug_pull_request_target(target: &str) -> Option<(String, i64)> {
+    let (repository, number) = target.trim().rsplit_once('#')?;
+    let number = number.parse::<i64>().ok()?;
+    Some((repository.to_string(), number))
+}
+
 impl Render for RootView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let state = self.state.read(cx);
         let palette_open = state.palette_open;
 
         div()
+            .relative()
             .size_full()
             .flex()
-            .flex_col()
+            .flex_row()
             .bg(bg_canvas())
             .text_color(fg_default())
             .text_size(px(14.0))
             .font_family(".AppleSystemUIFont")
-            .child(render_topbar(&self.state, cx))
-            .child(render_workspace_area(&self.state, cx))
+            .child(render_app_sidebar(&self.state, cx))
+            .child(render_main_column(&self.state, cx))
             .when(palette_open, |el| el.child(render_palette(&self.state, cx)))
     }
 }
 
-fn render_topbar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
+fn render_app_sidebar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let s = state.read(cx);
+    let collapsed = s.app_sidebar_collapsed;
     let active_section = s.active_section;
-    let active_pr_key = s.active_pr_key.clone();
-    let tabs: Vec<_> = s.open_tabs.clone();
     let is_authenticated = s.is_authenticated();
     let workspace_syncing = s.workspace_syncing;
     let workspace_error = s.workspace_error.clone();
-    let gh_version = s.gh_version.clone();
+    let theme_preference = s.theme_preference;
+    let sidebar_width = if collapsed {
+        APP_SIDEBAR_COLLAPSED_WIDTH
+    } else {
+        APP_SIDEBAR_EXPANDED_WIDTH
+    };
+    let sync_label = if workspace_syncing {
+        "Syncing workspace"
+    } else {
+        "Sync workspace"
+    };
+    let status_label = if workspace_syncing {
+        "Syncing now"
+    } else if workspace_error.is_some() {
+        "Sync issue"
+    } else if is_authenticated {
+        "GitHub connected"
+    } else {
+        "gh needs auth"
+    };
+    let sync_color = if workspace_syncing {
+        accent()
+    } else if workspace_error.is_some() {
+        danger()
+    } else if is_authenticated {
+        success()
+    } else {
+        fg_muted()
+    };
 
     let state_for_nav = state.clone();
-    let state_for_tabs = state.clone();
+    let state_for_toggle = state.clone();
     let state_for_sync = state.clone();
+    let state_for_theme = state.clone();
+
+    div()
+        .w(px(sidebar_width))
+        .flex_shrink_0()
+        .min_h_0()
+        .bg(bg_surface())
+        .border_r(px(1.0))
+        .border_color(border_default())
+        .child(
+            div()
+                .h_full()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .justify_between()
+                .child(
+                    div()
+                        .p(px(10.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .child(if collapsed {
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(10.0))
+                                .pb(px(8.0))
+                                .child(img(APP_LOGO_ASSET).size(px(22.0)))
+                                .child(sidebar_utility_button(SIDEBAR_EXPAND_ASSET, false, true, {
+                                    let state = state_for_toggle.clone();
+                                    move |_, _, cx| {
+                                        state.update(cx, |state, cx| {
+                                            state.app_sidebar_collapsed = false;
+                                            cx.notify();
+                                        });
+                                    }
+                                }))
+                                .into_any_element()
+                        } else {
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(10.0))
+                                .pb(px(8.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(10.0))
+                                        .min_w_0()
+                                        .child(img(APP_LOGO_ASSET).size(px(24.0)))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(2.0))
+                                                .min_w_0()
+                                                .child(
+                                                    div()
+                                                        .text_size(px(13.0))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(fg_emphasis())
+                                                        .child("ReviewBuddy"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(10.0))
+                                                        .font_family("Fira Code")
+                                                        .text_color(fg_subtle())
+                                                        .text_ellipsis()
+                                                        .whitespace_nowrap()
+                                                        .overflow_x_hidden()
+                                                        .child("review workspace"),
+                                                ),
+                                        ),
+                                )
+                                .child(sidebar_utility_button(
+                                    SIDEBAR_COLLAPSE_ASSET,
+                                    false,
+                                    true,
+                                    {
+                                        let state = state_for_toggle.clone();
+                                        move |_, _, cx| {
+                                            state.update(cx, |state, cx| {
+                                                state.app_sidebar_collapsed = true;
+                                                cx.notify();
+                                            });
+                                        }
+                                    },
+                                ))
+                                .into_any_element()
+                        })
+                        .children(
+                            SectionId::all()
+                                .iter()
+                                .filter(|section| **section != SectionId::Issues)
+                                .map(|section| {
+                                    let section = *section;
+                                    let count = s.section_count(section);
+                                    let state = state_for_nav.clone();
+                                    sidebar_nav_button(
+                                        section.label(),
+                                        sidebar_icon_for_section(section),
+                                        count,
+                                        active_section == section,
+                                        collapsed,
+                                        move |_, window, cx| {
+                                            if section == SectionId::Settings {
+                                                prepare_settings_view(&state, window, cx);
+                                            }
+                                            state.update(cx, |s, cx| {
+                                                s.active_section = section;
+                                                s.active_pr_key = None;
+                                                s.palette_open = false;
+                                                s.palette_selected_index = 0;
+                                                cx.notify();
+                                            });
+                                        },
+                                    )
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .p(px(10.0))
+                        .pt(px(12.0))
+                        .border_t(px(1.0))
+                        .border_color(border_muted())
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.0))
+                        .when(!collapsed, |el| {
+                            el.child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(7.0))
+                                    .rounded(radius_sm())
+                                    .bg(bg_overlay())
+                                    .text_size(px(11.0))
+                                    .font_family("Fira Code")
+                                    .text_color(sync_color)
+                                    .child(status_label),
+                            )
+                        })
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .when(!collapsed, |el| {
+                                    el.child(
+                                        div()
+                                            .px(px(6.0))
+                                            .text_size(px(10.0))
+                                            .font_family("Fira Code")
+                                            .text_color(fg_subtle())
+                                            .child("THEME"),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap(px(6.0))
+                                        .flex_col()
+                                        .when(!collapsed, |el| el.flex_row())
+                                        .children(ThemePreference::all().iter().map(|candidate| {
+                                            let candidate = *candidate;
+                                            let state = state_for_theme.clone();
+                                            sidebar_theme_button(
+                                                theme_icon_asset(candidate),
+                                                theme_preference == candidate,
+                                                collapsed,
+                                                move |_, window, cx| {
+                                                    update_theme_preference(
+                                                        &state, candidate, window, cx,
+                                                    );
+                                                },
+                                            )
+                                        })),
+                                ),
+                        )
+                        .child(sidebar_action_button(
+                            SIDEBAR_SYNC_ASSET,
+                            sync_label,
+                            collapsed,
+                            sync_color,
+                            move |_, window, cx| {
+                                trigger_sync_workspace(&state_for_sync, window, cx)
+                            },
+                        )),
+                ),
+        )
+}
+
+fn render_main_column(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
+    let has_tabs = !state.read(cx).open_tabs.is_empty();
+
+    div()
+        .flex_grow()
+        .min_w_0()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .when(has_tabs, |el| {
+            el.child(render_workspace_tabs_strip(state, cx))
+        })
+        .child(render_workspace_body(state, cx))
+}
+
+fn render_workspace_tabs_strip(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
+    let s = state.read(cx);
+    let active_pr_key = s.active_pr_key.clone();
+    let tabs: Vec<_> = s.open_tabs.clone();
+    let state_for_tabs = state.clone();
 
     div()
         .bg(bg_surface())
@@ -153,165 +514,42 @@ fn render_topbar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .flex_shrink_0()
         .child(
             div()
+                .px(px(8.0))
+                .pt(px(6.0))
                 .flex()
-                .items_center()
-                .justify_between()
-                .gap(px(16.0))
-                .px(px(20.0))
-                .h(topbar_height())
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(18.0))
-                        .min_w_0()
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(10.0))
-                                .flex_shrink_0()
-                                .child(img(APP_LOGO_ASSET).size(px(24.0)))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(2.0))
-                                        .child(
-                                            div()
-                                                .text_size(px(13.0))
-                                                .font_weight(FontWeight::SEMIBOLD)
-                                                .text_color(fg_emphasis())
-                                                .child("ReviewBuddy"),
-                                        )
-                                        .child(
-                                            div()
-                                                .text_size(px(11.0))
-                                                .font_family("Fira Code")
-                                                .text_color(fg_subtle())
-                                                .child("desktop review workspace"),
-                                        ),
-                                ),
-                        )
-                        .child(
-                            div().flex().gap(px(4.0)).items_center().min_w_0().children(
-                                SectionId::all()
-                                    .iter()
-                                    .filter(|section| **section != SectionId::Issues)
-                                    .map(|section| {
-                                        let section = *section;
-                                        let is_active =
-                                            active_section == section && active_pr_key.is_none();
-                                        let count = s.section_count(section);
-                                        let state = state_for_nav.clone();
-                                        nav_pill(
-                                            section.label(),
-                                            count,
-                                            is_active,
-                                            move |_, window, cx| {
-                                                if section == SectionId::Settings {
-                                                    prepare_settings_view(&state, window, cx);
-                                                }
-                                                state.update(cx, |s, cx| {
-                                                    s.active_section = section;
-                                                    s.active_pr_key = None;
-                                                    s.palette_open = false;
-                                                    s.palette_selected_index = 0;
-                                                    cx.notify();
-                                                });
-                                            },
-                                        )
-                                    }),
-                            ),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .flex_wrap()
-                        .justify_end()
-                        .child(if workspace_syncing {
-                            badge("syncing workspace").into_any_element()
-                        } else if workspace_error.is_some() {
-                            badge("sync issue").into_any_element()
-                        } else if is_authenticated {
-                            badge("github connected").into_any_element()
-                        } else {
-                            badge("gh needs auth").into_any_element()
-                        })
-                        .when_some(gh_version, |el, version| {
-                            el.child(badge(version.split_whitespace().next().unwrap_or(&version)))
-                        })
-                        .child(ghost_button(
-                            if workspace_syncing {
-                                "Syncing..."
-                            } else {
-                                "Sync"
-                            },
-                            move |_, window, cx| {
-                                trigger_sync_workspace(&state_for_sync, window, cx)
-                            },
-                        )),
-                ),
-        )
-        .when(!tabs.is_empty(), |el| {
-            el.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .px(px(20.0))
-                    .py(px(8.0))
-                    .border_t(px(1.0))
-                    .border_color(border_muted())
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .font_family("Fira Code")
-                            .text_color(fg_subtle())
-                            .flex_shrink_0()
-                            .child(format!("{} OPEN", tabs.len())),
+                .items_end()
+                .gap(px(4.0))
+                .id("workspace-tabs-scroll")
+                .overflow_x_scroll()
+                .min_w_0()
+                .children(tabs.into_iter().map(|tab| {
+                    let key = pr_key(&tab.repository, tab.number);
+                    let is_active = active_pr_key.as_deref() == Some(&key);
+                    let state = state_for_tabs.clone();
+                    pr_tab(
+                        &tab.repository,
+                        tab.number,
+                        &tab.title,
+                        tab.additions,
+                        tab.deletions,
+                        &tab.state,
+                        tab.is_draft,
+                        is_active,
+                        move |_, _, cx| {
+                            state.update(cx, |s, cx| {
+                                s.active_pr_key = Some(key.clone());
+                                s.active_section = SectionId::Pulls;
+                                s.palette_open = false;
+                                s.palette_selected_index = 0;
+                                cx.notify();
+                            });
+                        },
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(6.0))
-                            .items_center()
-                            .id("topbar-tabs-scroll")
-                            .overflow_x_scroll()
-                            .min_w_0()
-                            .children(tabs.into_iter().map(|tab| {
-                                let key = pr_key(&tab.repository, tab.number);
-                                let is_active = active_pr_key.as_deref() == Some(&key);
-                                let state = state_for_tabs.clone();
-                                pr_tab(
-                                    &tab.repository,
-                                    tab.number,
-                                    &tab.title,
-                                    tab.additions,
-                                    tab.deletions,
-                                    &tab.state,
-                                    tab.is_draft,
-                                    is_active,
-                                    move |_, _, cx| {
-                                        state.update(cx, |s, cx| {
-                                            s.active_pr_key = Some(key.clone());
-                                            s.active_section = SectionId::Pulls;
-                                            s.palette_open = false;
-                                            s.palette_selected_index = 0;
-                                            cx.notify();
-                                        });
-                                    },
-                                )
-                            })),
-                    ),
-            )
-        })
+                })),
+        )
 }
 
-fn render_workspace_area(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
+fn render_workspace_body(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let s = state.read(cx);
     let has_active_pr = s.active_pr_key.is_some();
 
@@ -327,34 +565,187 @@ fn render_workspace_area(state: &Entity<AppState>, cx: &App) -> impl IntoElement
         })
 }
 
-fn nav_pill(
+fn sidebar_icon_for_section(section: SectionId) -> &'static str {
+    match section {
+        SectionId::Overview => SIDEBAR_OVERVIEW_ASSET,
+        SectionId::Pulls => SIDEBAR_PULLS_ASSET,
+        SectionId::Reviews => SIDEBAR_REVIEWS_ASSET,
+        SectionId::Settings => SIDEBAR_SETTINGS_ASSET,
+        SectionId::Issues => SIDEBAR_OVERVIEW_ASSET,
+    }
+}
+
+fn theme_icon_asset(preference: ThemePreference) -> &'static str {
+    match preference {
+        ThemePreference::System => SIDEBAR_SYSTEM_ASSET,
+        ThemePreference::Light => SIDEBAR_LIGHT_ASSET,
+        ThemePreference::Dark => SIDEBAR_DARK_ASSET,
+    }
+}
+
+fn sidebar_nav_button(
     label: &str,
+    icon_asset: &str,
     count: i64,
     active: bool,
+    collapsed: bool,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     div()
-        .flex()
-        .gap(px(6.0))
-        .items_center()
-        .px(px(12.0))
-        .py(px(5.0))
+        .h(px(38.0))
+        .px(px(10.0))
+        .when(collapsed, |el| el.px(px(0.0)))
         .rounded(radius_sm())
-        .text_size(px(12.0))
-        .font_weight(FontWeight::MEDIUM)
+        .border_1()
+        .border_color(if active {
+            border_default()
+        } else {
+            transparent()
+        })
+        .when(active, |el| el.bg(bg_selected()))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(10.0))
         .cursor_pointer()
-        .when(active, |el| el.bg(bg_selected()).text_color(fg_emphasis()))
-        .when(!active, |el| el.text_color(fg_muted()))
         .hover(|style| style.bg(hover_bg()).text_color(fg_emphasis()))
         .on_mouse_down(MouseButton::Left, on_click)
-        .child(label.to_string())
-        .when(count > 0, |el| {
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .justify_center()
+                .when(!collapsed, |el| el.justify_start())
+                .flex_grow()
+                .min_w_0()
+                .child(
+                    svg()
+                        .path(icon_asset.to_string())
+                        .size(px(18.0))
+                        .text_color(if active { fg_emphasis() } else { fg_muted() }),
+                )
+                .when(!collapsed, |el| {
+                    el.child(
+                        div()
+                            .min_w_0()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(if active { fg_emphasis() } else { fg_default() })
+                            .child(label.to_string()),
+                    )
+                }),
+        )
+        .when(!collapsed && count > 0, |el| {
             el.child(
                 div()
                     .text_size(px(11.0))
-                    .text_color(if active { fg_default() } else { fg_subtle() })
                     .font_family("Fira Code")
+                    .text_color(if active { fg_default() } else { fg_subtle() })
                     .child(count.to_string()),
+            )
+        })
+        .when(collapsed, |el| el.justify_center())
+}
+
+fn sidebar_theme_button(
+    icon_asset: &str,
+    active: bool,
+    collapsed: bool,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .h(px(34.0))
+        .when(collapsed, |el| el.w_full())
+        .when(!collapsed, |el| el.flex_1())
+        .rounded(radius_sm())
+        .border_1()
+        .border_color(if active {
+            border_default()
+        } else {
+            border_muted()
+        })
+        .bg(if active { bg_selected() } else { bg_overlay() })
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(hover_bg()))
+        .on_mouse_down(MouseButton::Left, on_click)
+        .child(
+            svg()
+                .path(icon_asset.to_string())
+                .size(px(16.0))
+                .text_color(if active { fg_emphasis() } else { fg_muted() }),
+        )
+}
+
+fn sidebar_utility_button(
+    icon_asset: &str,
+    active: bool,
+    bordered: bool,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .w(px(30.0))
+        .h(px(30.0))
+        .rounded(radius_sm())
+        .border_1()
+        .border_color(if bordered {
+            border_muted()
+        } else {
+            transparent()
+        })
+        .bg(if active { bg_selected() } else { transparent() })
+        .flex()
+        .items_center()
+        .justify_center()
+        .cursor_pointer()
+        .hover(|style| style.bg(hover_bg()))
+        .on_mouse_down(MouseButton::Left, on_click)
+        .child(
+            svg()
+                .path(icon_asset.to_string())
+                .size(px(16.0))
+                .text_color(if active { fg_emphasis() } else { fg_muted() }),
+        )
+}
+
+fn sidebar_action_button(
+    icon_asset: &str,
+    label: &str,
+    collapsed: bool,
+    icon_color: Rgba,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .h(px(36.0))
+        .rounded(radius_sm())
+        .border_1()
+        .border_color(border_muted())
+        .bg(bg_overlay())
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap(px(8.0))
+        .when(!collapsed, |el| el.px(px(10.0)).justify_start())
+        .when(collapsed, |el| el.w_full())
+        .cursor_pointer()
+        .hover(|style| style.bg(hover_bg()))
+        .on_mouse_down(MouseButton::Left, on_click)
+        .child(
+            svg()
+                .path(icon_asset.to_string())
+                .size(px(16.0))
+                .text_color(icon_color),
+        )
+        .when(!collapsed, |el| {
+            el.child(
+                div()
+                    .text_size(px(12.0))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(fg_default())
+                    .child(label.to_string()),
             )
         })
 }
@@ -363,8 +754,8 @@ fn pr_tab(
     repository: &str,
     number: i64,
     title: &str,
-    additions: i64,
-    deletions: i64,
+    _additions: i64,
+    _deletions: i64,
     pr_state: &str,
     is_draft: bool,
     active: bool,
@@ -384,8 +775,8 @@ fn pr_tab(
         .items_center()
         .gap(px(8.0))
         .px(px(10.0))
-        .py(px(6.0))
-        .rounded(radius_sm())
+        .py(px(5.0))
+        .rounded_t(radius_sm())
         .border_1()
         .border_color(if active {
             border_default()
@@ -393,8 +784,8 @@ fn pr_tab(
             border_muted()
         })
         .bg(if active { bg_canvas() } else { bg_surface() })
-        .text_size(px(12.0))
-        .max_w(px(320.0))
+        .text_size(px(11.0))
+        .max_w(px(280.0))
         .min_w_0()
         .cursor_pointer()
         .hover(move |style| {
@@ -442,19 +833,7 @@ fn pr_tab(
                         .child(tab_label),
                 ),
         )
-        .child(
-            div()
-                .flex()
-                .gap(px(6.0))
-                .items_center()
-                .text_size(px(10.0))
-                .font_family("Fira Code")
-                .whitespace_nowrap()
-                .flex_shrink_0()
-                .when_some(state_badge, |el, badge| el.child(badge))
-                .child(div().text_color(success()).child(format!("+{additions}")))
-                .child(div().text_color(danger()).child(format!("-{deletions}"))),
-        )
+        .when_some(state_badge, |el, badge| el.child(badge))
 }
 
 fn pr_tab_state_dot(pr_state: &str, is_draft: bool) -> Rgba {
