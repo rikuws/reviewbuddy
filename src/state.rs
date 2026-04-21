@@ -17,10 +17,11 @@ use crate::managed_lsp::{ManagedServerInstallStatus, ManagedServerKind};
 use crate::review_session::{
     add_waymark, load_review_session, location_label, push_history_location, push_route_location,
     remove_waymark, save_review_session, ReviewCenterMode, ReviewLocation, ReviewSessionDocument,
-    ReviewSessionState, ReviewSourceTarget, ReviewTaskRoute, ReviewWaymark,
+    ReviewSessionState, ReviewSidebarMode, ReviewSourceTarget, ReviewTaskRoute, ReviewWaymark,
 };
-use crate::syntax::SyntaxSpan;
-use gpui::{px, ListAlignment, ListState, Pixels, Point, ScrollHandle};
+use crate::syntax::{self, SyntaxSpan};
+use crate::theme::{self, ThemePreference};
+use gpui::{px, ListAlignment, ListState, Pixels, Point, ScrollHandle, WindowAppearance};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SectionId {
@@ -227,6 +228,46 @@ pub struct PreparedFileContent {
     pub lines: Arc<Vec<PreparedFileLine>>,
 }
 
+impl PreparedFileContent {
+    pub fn rehighlighted(&self) -> Self {
+        let text_lines = if self.text.is_empty() {
+            Vec::new()
+        } else {
+            self.text
+                .lines()
+                .map(str::to_string)
+                .collect::<Vec<String>>()
+        };
+        let spans = if self.is_binary || self.size_bytes > syntax::MAX_HIGHLIGHT_BYTES {
+            text_lines
+                .iter()
+                .map(|_| Vec::new())
+                .collect::<Vec<Vec<SyntaxSpan>>>()
+        } else {
+            syntax::highlight_lines(
+                self.path.as_str(),
+                text_lines.iter().map(|line| line.as_str()),
+            )
+        };
+
+        let lines = text_lines
+            .into_iter()
+            .zip(spans)
+            .enumerate()
+            .map(|(index, (text, spans))| PreparedFileLine {
+                line_number: index + 1,
+                text,
+                spans,
+            })
+            .collect::<Vec<_>>();
+
+        Self {
+            lines: Arc::new(lines),
+            ..self.clone()
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PreparedFileLine {
     pub line_number: usize,
@@ -314,6 +355,9 @@ pub struct AppState {
     pub gh_version: Option<String>,
     pub cache_path: String,
     pub bootstrap_loading: bool,
+    pub theme_preference: ThemePreference,
+    pub window_appearance: WindowAppearance,
+    pub app_sidebar_collapsed: bool,
 
     // Selected file in diff view
     pub selected_file_path: Option<String>,
@@ -361,6 +405,13 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(cache: CacheStore) -> Self {
+        let theme_preference = theme::load_theme_settings(&cache)
+            .unwrap_or_default()
+            .preference;
+        theme::set_active_theme(theme::resolve_theme(
+            theme_preference,
+            WindowAppearance::Light,
+        ));
         let cache_path = cache.path().display().to_string();
         let mut state = Self {
             cache: Arc::new(cache),
@@ -380,6 +431,9 @@ impl AppState {
             gh_version: None,
             cache_path,
             bootstrap_loading: true,
+            theme_preference,
+            window_appearance: WindowAppearance::Light,
+            app_sidebar_collapsed: true,
             selected_file_path: None,
             selected_diff_anchor: None,
             diff_view_states: RefCell::new(std::collections::HashMap::new()),
@@ -420,6 +474,44 @@ impl AppState {
 
         state.restore_debug_pull_request_from_cache();
         state
+    }
+
+    pub fn resolved_theme(&self) -> theme::ActiveTheme {
+        theme::resolve_theme(self.theme_preference, self.window_appearance)
+    }
+
+    pub fn set_theme_preference(&mut self, preference: ThemePreference) {
+        let previous = self.resolved_theme();
+        self.theme_preference = preference;
+        self.apply_theme_change(previous);
+    }
+
+    pub fn set_window_appearance(&mut self, appearance: WindowAppearance) {
+        let previous = self.resolved_theme();
+        self.window_appearance = appearance;
+        self.apply_theme_change(previous);
+    }
+
+    fn apply_theme_change(&mut self, previous: theme::ActiveTheme) {
+        let next = self.resolved_theme();
+        theme::set_active_theme(next);
+        if next != previous {
+            self.refresh_theme_dependent_state();
+        }
+    }
+
+    fn refresh_theme_dependent_state(&mut self) {
+        for detail_state in self.detail_states.values_mut() {
+            for file_state in detail_state.file_content_states.values_mut() {
+                if let Some(prepared) = file_state.prepared.as_ref() {
+                    file_state.prepared = Some(prepared.rehighlighted());
+                }
+            }
+        }
+
+        for diff_view_state in self.diff_view_states.borrow_mut().values_mut() {
+            diff_view_state.highlighted_hunks = None;
+        }
     }
 
     pub fn active_queue(&self) -> Option<&PullRequestQueue> {
@@ -755,6 +847,12 @@ impl AppState {
             if mode == ReviewCenterMode::SemanticDiff {
                 session.source_target = None;
             }
+        }
+    }
+
+    pub fn set_review_sidebar_mode(&mut self, mode: ReviewSidebarMode) {
+        if let Some(session) = self.active_review_session_mut() {
+            session.sidebar_mode = mode;
         }
     }
 

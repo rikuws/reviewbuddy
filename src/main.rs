@@ -49,6 +49,10 @@ fn main() {
 
             let cache = CacheStore::new(cache_path()).expect("Failed to initialize cache");
             let app_state = cx.new(|_| AppState::new(cache));
+            let initial_window_appearance = cx.window_appearance();
+            app_state.update(cx, |state, _| {
+                state.set_window_appearance(initial_window_appearance);
+            });
 
             let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
             cx.open_window(

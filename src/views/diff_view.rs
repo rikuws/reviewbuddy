@@ -27,7 +27,9 @@ use crate::review_routes::{
     build_callsite_route, build_changed_touch_route, build_section_symbol_focus,
     collect_section_focus_terms, ReviewSymbolFocus,
 };
-use crate::review_session::{ReviewCenterMode, ReviewLocation, ReviewSourceTarget};
+use crate::review_session::{
+    ReviewCenterMode, ReviewLocation, ReviewSidebarMode, ReviewSourceTarget,
+};
 use crate::selectable_text::{AppTextFieldKind, AppTextInput, SelectableText};
 use crate::semantic_diff::{build_semantic_diff_file, SemanticDiffFile, SemanticDiffSection};
 use crate::source_browser::render_source_browser;
@@ -38,8 +40,6 @@ use crate::theme::*;
 use super::sections::{
     badge, badge_success, error_text, ghost_button, nested_panel, panel_state_text, review_button,
 };
-
-const MAX_FILE_HIGHLIGHT_BYTES: usize = 512 * 1024;
 
 pub fn enter_files_surface(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
     state.update(cx, |s, cx| {
@@ -674,12 +674,16 @@ pub fn render_files_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement
         .flex()
         .flex_grow()
         .min_h_0()
-        .child(render_review_navigation_pane(
+        .child(render_review_sidebar_pane(
             state,
             detail,
             &review_queue,
             selected_path,
+            selected_file,
+            selected_parsed,
             semantic_file.as_ref(),
+            prepared_file,
+            review_context.as_ref(),
             &review_session,
             cx,
         ))
@@ -700,16 +704,6 @@ pub fn render_files_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                     cx,
                 )),
         )
-        .child(render_review_context_pane(
-            state,
-            detail,
-            selected_file,
-            selected_parsed,
-            semantic_file.as_ref(),
-            prepared_file,
-            review_context.as_ref(),
-            cx,
-        ))
         .when(waypoint_spotlight_open, |el| {
             el.child(render_waypoint_spotlight(state, cx))
         })
@@ -731,7 +725,165 @@ pub fn render_files_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement
         .into_any_element()
 }
 
-fn render_review_navigation_pane(
+fn render_review_sidebar_pane(
+    state: &Entity<AppState>,
+    detail: &PullRequestDetail,
+    review_queue: &ReviewQueue,
+    selected_path: Option<&str>,
+    selected_file: Option<&PullRequestFile>,
+    selected_parsed: Option<&ParsedDiffFile>,
+    semantic_file: Option<&SemanticDiffFile>,
+    prepared_file: Option<&PreparedFileContent>,
+    review_context: Option<&ReviewContextData>,
+    review_session: &crate::review_session::ReviewSessionState,
+    cx: &App,
+) -> impl IntoElement {
+    let sidebar_mode = review_session.sidebar_mode;
+    let selected_file_label = selected_file
+        .map(|file| file.path.clone())
+        .unwrap_or_else(|| "No file selected".to_string());
+    let current_location_label = state
+        .read(cx)
+        .current_review_location()
+        .map(|location| location.label.clone())
+        .unwrap_or_else(|| "Select a file or section to focus the review.".to_string());
+
+    div()
+        .w(px(288.0))
+        .flex_shrink_0()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .bg(bg_surface())
+        .border_r(px(1.0))
+        .border_color(border_default())
+        .child(
+            div()
+                .p(px(14.0))
+                .pb(px(12.0))
+                .border_b(px(1.0))
+                .border_color(border_default())
+                .flex()
+                .flex_col()
+                .gap(px(10.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .font_family("Fira Code")
+                                .text_color(fg_subtle())
+                                .child("REVIEW RAIL"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg_emphasis())
+                                .whitespace_nowrap()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .child(selected_file_label),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .text_color(fg_muted())
+                                .whitespace_nowrap()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .child(current_location_label),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(workspace_mode_button(
+                            ReviewSidebarMode::Guide.label(),
+                            sidebar_mode == ReviewSidebarMode::Guide,
+                            {
+                                let state = state.clone();
+                                move |_, _, cx| {
+                                    state.update(cx, |state, cx| {
+                                        state.set_review_sidebar_mode(ReviewSidebarMode::Guide);
+                                        state.persist_active_review_session();
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        ))
+                        .child(workspace_mode_button(
+                            ReviewSidebarMode::Context.label(),
+                            sidebar_mode == ReviewSidebarMode::Context,
+                            {
+                                let state = state.clone();
+                                move |_, _, cx| {
+                                    state.update(cx, |state, cx| {
+                                        state.set_review_sidebar_mode(ReviewSidebarMode::Context);
+                                        state.persist_active_review_session();
+                                        cx.notify();
+                                    });
+                                }
+                            },
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.0))
+                        .flex_wrap()
+                        .child(badge(&format!("{} files", detail.changed_files)))
+                        .child(badge(&format!("{} comments", detail.comments_count)))
+                        .child(badge(&format!("{} commits", detail.commits_count)))
+                        .when_some(semantic_file, |el, semantic_file| {
+                            el.child(badge(&format!("{} sections", semantic_file.sections.len())))
+                        })
+                        .when_some(selected_file, |el, file| {
+                            el.child(render_change_type_chip(&file.change_type))
+                                .child(queue_metric(
+                                    format!("+{}", file.additions),
+                                    success(),
+                                    success_muted(),
+                                ))
+                                .child(queue_metric(
+                                    format!("-{}", file.deletions),
+                                    danger(),
+                                    danger_muted(),
+                                ))
+                        }),
+                ),
+        )
+        .child(match sidebar_mode {
+            ReviewSidebarMode::Guide => render_review_navigation_content(
+                state,
+                detail,
+                review_queue,
+                selected_path,
+                semantic_file,
+                review_session,
+                cx,
+            )
+            .into_any_element(),
+            ReviewSidebarMode::Context => render_review_context_content(
+                state,
+                detail,
+                selected_file,
+                selected_parsed,
+                semantic_file,
+                prepared_file,
+                review_context,
+                cx,
+            )
+            .into_any_element(),
+        })
+}
+
+fn render_review_navigation_content(
     state: &Entity<AppState>,
     detail: &PullRequestDetail,
     review_queue: &ReviewQueue,
@@ -757,14 +909,10 @@ fn render_review_navigation_pane(
     }
 
     div()
-        .w(px(300.0))
-        .flex_shrink_0()
+        .flex_grow()
         .min_h_0()
         .flex()
         .flex_col()
-        .bg(bg_surface())
-        .border_r(px(1.0))
-        .border_color(border_default())
         .id("review-nav-scroll")
         .child(
             list(list_state, {
@@ -1162,8 +1310,16 @@ fn render_review_queue_row(
                 .gap(px(6.0))
                 .flex_wrap()
                 .child(render_change_type_chip(&item.change_type))
-                .child(queue_metric(format!("+{}", item.additions), success()))
-                .child(queue_metric(format!("-{}", item.deletions), danger()))
+                .child(queue_metric(
+                    format!("+{}", item.additions),
+                    success(),
+                    success_muted(),
+                ))
+                .child(queue_metric(
+                    format!("-{}", item.deletions),
+                    danger(),
+                    danger_muted(),
+                ))
                 .when(item.thread_count > 0, |el| {
                     el.child(queue_metric(
                         format!(
@@ -1172,6 +1328,7 @@ fn render_review_queue_row(
                             if item.thread_count == 1 { "" } else { "s" }
                         ),
                         accent(),
+                        accent_muted(),
                     ))
                 }),
         )
@@ -1276,7 +1433,11 @@ fn render_task_route_stop_row(
                 .flex()
                 .items_start()
                 .gap(px(8.0))
-                .child(queue_metric(format!("{:02}", index + 1), accent()))
+                .child(queue_metric(
+                    format!("{:02}", index + 1),
+                    accent(),
+                    accent_muted(),
+                ))
                 .child(
                     div()
                         .flex()
@@ -1425,16 +1586,21 @@ fn default_waymark_name(
         .unwrap_or_else(|| "Waypoint".to_string())
 }
 
-fn queue_metric(label: String, color: gpui::Rgba) -> impl IntoElement {
+fn metric_pill(label: impl Into<String>, fg: gpui::Rgba, bg: gpui::Rgba) -> impl IntoElement {
     div()
-        .px(px(6.0))
-        .py(px(2.0))
+        .px(px(10.0))
+        .py(px(3.0))
         .rounded(px(999.0))
-        .bg(bg_emphasis())
-        .text_size(px(10.0))
+        .bg(bg)
+        .text_size(px(12.0))
+        .font_weight(FontWeight::MEDIUM)
         .font_family("Fira Code")
-        .text_color(color)
-        .child(label)
+        .text_color(fg)
+        .child(label.into())
+}
+
+fn queue_metric(label: String, fg: gpui::Rgba, bg: gpui::Rgba) -> impl IntoElement {
+    metric_pill(label, fg, bg)
 }
 
 fn render_file_tree(
@@ -2261,7 +2427,7 @@ fn prepare_file_content(
     } else {
         lines.lines().map(str::to_string).collect::<Vec<_>>()
     };
-    let spans = if document.is_binary || document.size_bytes > MAX_FILE_HIGHLIGHT_BYTES {
+    let spans = if document.is_binary || document.size_bytes > syntax::MAX_HIGHLIGHT_BYTES {
         text_lines
             .iter()
             .map(|_| Vec::new())
@@ -2400,9 +2566,7 @@ fn render_diff_panel(
             div()
                 .flex_grow()
                 .min_h_0()
-                .bg(bg_canvas())
-                .p(px(16.0))
-                .pt(px(14.0))
+                .bg(bg_inset())
                 .flex()
                 .flex_col()
                 .child(if center_mode == ReviewCenterMode::SourceBrowser {
@@ -2446,7 +2610,7 @@ fn render_diff_toolbar(
     file_document: Option<&RepositoryFileContent>,
     local_repo_status: Option<&local_repo::LocalRepositoryStatus>,
     local_repo_loading: bool,
-    local_repo_error: Option<&str>,
+    _local_repo_error: Option<&str>,
     lsp_status: Option<&lsp::LspServerStatus>,
     lsp_loading: bool,
     center_mode: ReviewCenterMode,
@@ -2480,31 +2644,24 @@ fn render_diff_toolbar(
         semantic_file.and_then(|semantic| semantic.section_for_anchor(selected_anchor)),
         selected_anchor,
     );
-    let rename_from = selected_parsed
-        .and_then(|parsed| parsed.previous_path.as_deref())
-        .filter(|previous| {
-            selected_parsed
-                .map(|parsed| *previous != parsed.path.as_str())
-                .unwrap_or(false)
-        });
 
     div()
         .flex()
-        .items_start()
-        .flex_wrap()
-        .gap(px(16.0))
-        .px(px(20.0))
-        .py(px(12.0))
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .px(px(18.0))
+        .py(px(8.0))
         .bg(bg_surface())
         .border_b(px(1.0))
         .border_color(border_default())
         .child(
             div()
                 .flex()
-                .flex_col()
+                .items_center()
+                .gap(px(8.0))
                 .flex_grow()
                 .min_w_0()
-                .gap(px(6.0))
                 .child(
                     div()
                         .text_size(px(10.0))
@@ -2515,206 +2672,159 @@ fn render_diff_toolbar(
                         .text_ellipsis()
                         .child(format!("REVIEW • {total_files} changed")),
                 )
-                .when_some(selected_file, |el, f| {
-                    el.child(
-                        div()
-                            .text_size(px(14.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(fg_emphasis())
-                            .text_ellipsis()
-                            .whitespace_nowrap()
-                            .overflow_x_hidden()
-                            .child(f.path.clone()),
-                    )
-                })
                 .child(
                     div()
                         .flex()
                         .items_center()
-                        .gap(px(6.0))
+                        .gap(px(8.0))
                         .flex_wrap()
-                        .text_size(px(11.0))
-                        .font_family("Fira Code")
-                        .text_color(fg_muted())
-                        .when_some(rename_from, |el, previous| {
-                            el.child(
-                                div()
-                                    .max_w(px(340.0))
-                                    .whitespace_nowrap()
-                                    .overflow_x_hidden()
-                                    .text_ellipsis()
-                                    .child(format!("renamed from {previous}")),
-                            )
-                        })
                         .when_some(semantic_file, |el, semantic_file| {
-                            el.child(format!(
-                                "{} semantic section{}",
+                            el.child(badge(&format!(
+                                "{} section{}",
                                 semantic_file.sections.len(),
-                                if semantic_file.sections.len() == 1 { "" } else { "s" }
-                            ))
-                        })
-                        .when_some(
-                            local_repo_error.filter(|_| {
-                                file_document
-                                    .map(|document| {
-                                        document.source != REPOSITORY_FILE_SOURCE_LOCAL_CHECKOUT
-                                    })
-                                    .unwrap_or(false)
-                            }),
-                            |el, _| {
-                                el.child(
-                                    div()
-                                        .max_w(px(460.0))
-                                        .whitespace_nowrap()
-                                        .overflow_x_hidden()
-                                        .text_ellipsis()
-                                        .child(
-                                            "Showing a GitHub snapshot because the local checkout is not ready.",
-                                        ),
-                                )
-                            },
-                        )
-                        .when_some(lsp_status.filter(|status| !status.is_ready()), |el, status| {
-                            el.child(
-                                div()
-                                    .max_w(px(460.0))
-                                    .whitespace_nowrap()
-                                    .overflow_x_hidden()
-                                    .text_ellipsis()
-                                    .child(status.message.clone()),
-                            )
-                        }),
-                ),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .items_end()
-                .gap(px(8.0))
-                .flex_shrink_0()
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_end()
-                        .gap(px(6.0))
-                        .flex_wrap()
-                        .child(workspace_mode_button("Semantic", center_mode == ReviewCenterMode::SemanticDiff, {
-                            let state = state_for_semantic.clone();
-                            move |_, _, cx| {
-                                state.update(cx, |state, cx| {
-                                    state.set_review_center_mode(ReviewCenterMode::SemanticDiff);
-                                    state.persist_active_review_session();
-                                    cx.notify();
-                                });
-                            }
-                        }))
-                        .child(workspace_mode_button("Source", center_mode == ReviewCenterMode::SourceBrowser, {
-                            let state = state_for_source.clone();
-                            move |_, window, cx| {
-                                state.update(cx, |state, cx| {
-                                    state.set_review_center_mode(ReviewCenterMode::SourceBrowser);
-                                    state.persist_active_review_session();
-                                    cx.notify();
-                                });
-                                ensure_active_review_focus_loaded(&state, window, cx);
-                            }
-                        }))
-                        .child(ghost_button("Back", {
-                            let state = state_for_back.clone();
-                            move |_, window, cx| {
-                                state.update(cx, |state, cx| {
-                                    if state.navigate_review_back() {
-                                        state.persist_active_review_session();
-                                        cx.notify();
-                                    }
-                                });
-                                ensure_active_review_focus_loaded(&state, window, cx);
-                            }
-                        }))
-                        .child(ghost_button("Forward", {
-                            let state = state_for_forward.clone();
-                            move |_, window, cx| {
-                                state.update(cx, |state, cx| {
-                                    if state.navigate_review_forward() {
-                                        state.persist_active_review_session();
-                                        cx.notify();
-                                    }
-                                });
-                                ensure_active_review_focus_loaded(&state, window, cx);
-                            }
-                        }))
-                        .child(ghost_button(if has_waymark { "Waypointed" } else { "Add waypoint" }, {
-                            let state = state_for_waymark.clone();
-                            let waymark_name = waymark_name.clone();
-                            move |_, _, cx| {
-                                state.update(cx, |state, cx| {
-                                    state.add_waymark_for_current_review_location(waymark_name.clone());
-                                    state.persist_active_review_session();
-                                    cx.notify();
-                                });
-                            }
-                        }))
-                        .when(has_task_route, |el| {
-                            el.child(ghost_button("Clear route", {
-                                let state = state_for_clear_route.clone();
-                                move |_, _, cx| {
-                                    state.update(cx, |state, cx| {
-                                        state.set_active_review_task_route(None);
-                                        state.persist_active_review_session();
-                                        cx.notify();
-                                    });
+                                if semantic_file.sections.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
                                 }
-                            }))
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_end()
-                        .gap(px(6.0))
-                        .flex_wrap()
-                        .when(local_repo_loading, |el| el.child(badge("Preparing checkout")))
+                            )))
+                        })
+                        .when(local_repo_loading, |el| {
+                            el.child(badge("Preparing checkout"))
+                        })
                         .when_some(local_status_badge, |el, status_badge| {
                             el.child(badge(status_badge))
                         })
                         .when_some(file_document, |el, document| {
-                            el.child(badge(match document.source.as_str() {
-                                REPOSITORY_FILE_SOURCE_LOCAL_CHECKOUT => "local checkout",
-                                _ => "GitHub snapshot",
-                            }))
+                            if document.source != REPOSITORY_FILE_SOURCE_LOCAL_CHECKOUT {
+                                el.child(badge("GitHub snapshot"))
+                            } else {
+                                el.child(badge("local checkout"))
+                            }
                         })
                         .when(lsp_loading, |el| el.child(badge("Starting LSP")))
                         .when_some(lsp_status, |el, status| {
-                            el.child(badge(status.badge_label()))
+                            if !status.is_ready() {
+                                el.child(badge(status.badge_label()))
+                            } else {
+                                el.child(badge(status.badge_label()))
+                            }
                         })
                         .when(file_thread_count > 0, |el| {
-                            el.child(badge(&format!("{file_thread_count} threads")))
+                            el.child(badge(&format!(
+                                "{file_thread_count} thread{}",
+                                if file_thread_count == 1 { "" } else { "s" }
+                            )))
                         })
                         .when_some(selected_file, |el, f| {
                             el.child(render_change_type_chip(&f.change_type))
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .font_family("Fira Code")
-                                        .text_color(success())
-                                        .child(format!("+{}", f.additions)),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.0))
-                                        .font_family("Fira Code")
-                                        .text_color(danger())
-                                        .child(format!("-{}", f.deletions)),
-                                )
+                                .child(queue_metric(
+                                    format!("+{}", f.additions),
+                                    success(),
+                                    success_muted(),
+                                ))
+                                .child(queue_metric(
+                                    format!("-{}", f.deletions),
+                                    danger(),
+                                    danger_muted(),
+                                ))
                         })
                         .when(
                             selected_parsed.map(|p| p.is_binary).unwrap_or(false),
                             |el| el.child(badge("binary")),
                         ),
                 ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(6.0))
+                .flex_wrap()
+                .flex_shrink_0()
+                .child(workspace_mode_button(
+                    "Semantic",
+                    center_mode == ReviewCenterMode::SemanticDiff,
+                    {
+                        let state = state_for_semantic.clone();
+                        move |_, _, cx| {
+                            state.update(cx, |state, cx| {
+                                state.set_review_center_mode(ReviewCenterMode::SemanticDiff);
+                                state.persist_active_review_session();
+                                cx.notify();
+                            });
+                        }
+                    },
+                ))
+                .child(workspace_mode_button(
+                    "Source",
+                    center_mode == ReviewCenterMode::SourceBrowser,
+                    {
+                        let state = state_for_source.clone();
+                        move |_, window, cx| {
+                            state.update(cx, |state, cx| {
+                                state.set_review_center_mode(ReviewCenterMode::SourceBrowser);
+                                state.persist_active_review_session();
+                                cx.notify();
+                            });
+                            ensure_active_review_focus_loaded(&state, window, cx);
+                        }
+                    },
+                ))
+                .child(ghost_button("Back", {
+                    let state = state_for_back.clone();
+                    move |_, window, cx| {
+                        state.update(cx, |state, cx| {
+                            if state.navigate_review_back() {
+                                state.persist_active_review_session();
+                                cx.notify();
+                            }
+                        });
+                        ensure_active_review_focus_loaded(&state, window, cx);
+                    }
+                }))
+                .child(ghost_button("Forward", {
+                    let state = state_for_forward.clone();
+                    move |_, window, cx| {
+                        state.update(cx, |state, cx| {
+                            if state.navigate_review_forward() {
+                                state.persist_active_review_session();
+                                cx.notify();
+                            }
+                        });
+                        ensure_active_review_focus_loaded(&state, window, cx);
+                    }
+                }))
+                .child(ghost_button(
+                    if has_waymark {
+                        "Waypointed"
+                    } else {
+                        "Waypoint"
+                    },
+                    {
+                        let state = state_for_waymark.clone();
+                        let waymark_name = waymark_name.clone();
+                        move |_, _, cx| {
+                            state.update(cx, |state, cx| {
+                                state.add_waymark_for_current_review_location(waymark_name.clone());
+                                state.persist_active_review_session();
+                                cx.notify();
+                            });
+                        }
+                    },
+                ))
+                .when(has_task_route, |el| {
+                    el.child(ghost_button("Clear route", {
+                        let state = state_for_clear_route.clone();
+                        move |_, _, cx| {
+                            state.update(cx, |state, cx| {
+                                state.set_active_review_task_route(None);
+                                state.persist_active_review_session();
+                                cx.notify();
+                            });
+                        }
+                    }))
+                }),
         )
 }
 
@@ -2743,7 +2853,7 @@ fn workspace_mode_button(
         .child(label.to_string())
 }
 
-fn render_review_context_pane(
+fn render_review_context_content(
     state: &Entity<AppState>,
     detail: &PullRequestDetail,
     selected_file: Option<&PullRequestFile>,
@@ -2796,12 +2906,8 @@ fn render_review_context_pane(
     };
 
     div()
-        .w(px(320.0))
-        .flex_shrink_0()
+        .flex_grow()
         .min_h_0()
-        .bg(bg_surface())
-        .border_l(px(1.0))
-        .border_color(border_default())
         .id("review-context-scroll")
         .overflow_y_scroll()
         .child(
@@ -2893,10 +2999,12 @@ fn render_review_context_pane(
                                     .child(queue_metric(
                                         format!("+{}", selected_file.additions),
                                         success(),
+                                        success_muted(),
                                     ))
                                     .child(queue_metric(
                                         format!("-{}", selected_file.deletions),
                                         danger(),
+                                        danger_muted(),
                                     )),
                             ),
                     )
@@ -2960,18 +3068,22 @@ fn render_context_summary_panel(review_context: &ReviewContextData) -> impl Into
                 .child(queue_metric(
                     format!("{} approved", review_context.review_status.approved),
                     success(),
+                    success_muted(),
                 ))
                 .child(queue_metric(
                     format!("{} changes", review_context.review_status.changes_requested),
                     danger(),
+                    danger_muted(),
                 ))
                 .child(queue_metric(
                     format!("{} waiting", review_context.review_status.waiting),
                     accent(),
+                    accent_muted(),
                 ))
                 .child(queue_metric(
                     format!("{} commented", review_context.review_status.commented),
                     fg_muted(),
+                    bg_emphasis(),
                 )),
         )
         .child(
@@ -3575,6 +3687,17 @@ fn render_file_diff(
     let rows = diff_view_state.rows.clone();
     let parsed_file_index = diff_view_state.parsed_file_index;
     let highlighted_hunks = diff_view_state.highlighted_hunks.clone();
+    let reserve_waypoint_slot = state
+        .read(cx)
+        .active_review_session()
+        .map(|session| {
+            session.waymarks.iter().any(|waymark| {
+                waymark.location.mode == ReviewCenterMode::SemanticDiff
+                    && waymark.location.file_path == file.path
+            })
+        })
+        .unwrap_or(false);
+    let gutter_layout = diff_gutter_layout(file, parsed, reserve_waypoint_slot);
     let selected_anchor = selected_anchor.cloned();
     let list_state = diff_view_state.list_state.clone();
     let prepared_file = prepared_file.cloned();
@@ -3630,10 +3753,7 @@ fn render_file_diff(
         .flex_col()
         .flex_grow()
         .min_h_0()
-        .rounded(radius())
-        .border_1()
-        .border_color(border_default())
-        .bg(bg_surface())
+        .bg(bg_inset())
         .overflow_hidden()
         .child(
             div()
@@ -3647,6 +3767,7 @@ fn render_file_diff(
                         &state,
                         rows,
                         semantic_sections,
+                        gutter_layout,
                         parsed_file_index,
                         highlighted_hunks,
                         file_lsp_context,
@@ -3665,6 +3786,7 @@ fn render_virtualized_diff_rows(
     state: &Entity<AppState>,
     rows: Arc<Vec<DiffRenderRow>>,
     semantic_sections: Option<Arc<Vec<SemanticDiffSection>>>,
+    gutter_layout: DiffGutterLayout,
     parsed_file_index: Option<usize>,
     highlighted_hunks: Option<Arc<Vec<Vec<Vec<SyntaxSpan>>>>>,
     file_lsp_context: Option<DiffFileLspContext>,
@@ -3683,9 +3805,10 @@ fn render_virtualized_diff_rows(
                     .into_any_element()
             })
             .unwrap_or_else(|| div().into_any_element()),
-        DiffViewItem::Gap(gap) => render_diff_gap_row(gap).into_any_element(),
+        DiffViewItem::Gap(gap) => render_diff_gap_row(gap, gutter_layout).into_any_element(),
         DiffViewItem::Row(row_ix) => render_virtualized_diff_row(
             &state,
+            gutter_layout,
             parsed_file_index,
             highlighted_hunks.as_deref(),
             file_lsp_context.as_ref(),
@@ -4373,7 +4496,10 @@ fn primary_diff_line_number(file: &PullRequestFile, line: &ParsedDiffLine) -> Op
     }
 }
 
-fn render_diff_gap_row(summary: DiffGapSummary) -> impl IntoElement {
+fn render_diff_gap_row(
+    summary: DiffGapSummary,
+    gutter_layout: DiffGutterLayout,
+) -> impl IntoElement {
     let markers = match summary.position {
         DiffGapPosition::Start => vec!["...", "\u{2193}"],
         DiffGapPosition::Between => vec!["\u{2191}", "...", "\u{2193}"],
@@ -4392,7 +4518,7 @@ fn render_diff_gap_row(summary: DiffGapSummary) -> impl IntoElement {
         .text_size(px(11.0))
         .child(
             div()
-                .w(px(96.0))
+                .w(px(gutter_layout.gutter_width()))
                 .flex_shrink_0()
                 .h_full()
                 .bg(diff_context_gutter_bg())
@@ -4603,17 +4729,22 @@ fn prepare_diff_view_state_with_key(
         )
     });
 
-    if entry.revision != revision {
+    let needs_highlight_refresh =
+        entry.highlighted_hunks.is_none() && entry.parsed_file_index.is_some();
+
+    if entry.revision != revision || needs_highlight_refresh {
         let (parsed_file_index, highlighted_hunks) =
             find_parsed_diff_file_with_index(&detail.parsed_diff, file_path)
                 .map(|(ix, file)| (Some(ix), Some(build_diff_highlights(file))))
                 .unwrap_or((None, None));
-        let rows = Arc::new(build_diff_render_rows(detail, file_path));
-        entry.rows = rows;
+        if entry.revision != revision {
+            entry.rows = Arc::new(build_diff_render_rows(detail, file_path));
+            entry.revision = revision.clone();
+            entry.list_state.reset(0);
+        }
         entry.revision = revision;
         entry.parsed_file_index = parsed_file_index;
         entry.highlighted_hunks = highlighted_hunks;
-        entry.list_state.reset(0);
     }
 
     entry.clone()
@@ -4621,6 +4752,7 @@ fn prepare_diff_view_state_with_key(
 
 fn render_virtualized_diff_row(
     state: &Entity<AppState>,
+    gutter_layout: DiffGutterLayout,
     parsed_file_index: Option<usize>,
     highlighted_hunks: Option<&Vec<Vec<Vec<SyntaxSpan>>>>,
     file_lsp_context: Option<&DiffFileLspContext>,
@@ -4656,7 +4788,7 @@ fn render_virtualized_diff_row(
             .and_then(|detail| detail.review_threads.get(*thread_index))
             .map(|thread| {
                 div()
-                    .pl(px(124.0))
+                    .pl(px(gutter_layout.inline_thread_inset()))
                     .pr(px(16.0))
                     .py(px(10.0))
                     .border_b(px(1.0))
@@ -4699,6 +4831,7 @@ fn render_virtualized_diff_row(
                         let line_lsp_context = build_diff_line_lsp_context(file_lsp_context, line);
                         render_reviewable_diff_line(
                             state,
+                            gutter_layout,
                             path,
                             Some(hunk_header),
                             line,
@@ -4797,15 +4930,7 @@ fn render_change_type_chip(change_type: &str) -> impl IntoElement {
         _ => (bg_subtle(), fg_muted(), border_muted()),
     };
 
-    div()
-        .px(px(7.0))
-        .py(px(2.0))
-        .rounded(px(999.0))
-        .bg(bg)
-        .text_size(px(10.0))
-        .font_family("Fira Code")
-        .text_color(fg)
-        .child(label_for_change_type(change_type).to_string())
+    metric_pill(label_for_change_type(change_type).to_string(), fg, bg)
 }
 
 fn render_file_stat_bar(additions: i64, deletions: i64) -> impl IntoElement {
@@ -4874,6 +4999,7 @@ fn build_review_line_action_target(
 
 fn render_reviewable_diff_line(
     state: &Entity<AppState>,
+    gutter_layout: DiffGutterLayout,
     file_path: &str,
     hunk_header: Option<&str>,
     line: &ParsedDiffLine,
@@ -4902,31 +5028,65 @@ fn render_reviewable_diff_line(
         .zip(active_line_action.as_ref())
         .map(|(line_target, active_target)| line_target.stable_key() == active_target.stable_key())
         .unwrap_or(false);
-    let waypoint_for_chip = waypoint.clone();
+    let has_waypoint = !popup_open && waypoint.is_some();
 
+    render_diff_line(
+        gutter_layout,
+        file_path,
+        line,
+        syntax_spans,
+        selected_anchor,
+        lsp_context,
+        line_action_target.map(|target| (state.clone(), target)),
+        has_waypoint,
+    )
+}
+
+fn render_diff_waypoint_icon() -> impl IntoElement {
     div()
         .relative()
-        .child(render_diff_line(
-            file_path,
-            line,
-            syntax_spans,
-            selected_anchor,
-            lsp_context,
-            line_action_target.map(|target| (state.clone(), target)),
-        ))
-        .when(!popup_open, |el| {
-            if let Some(waypoint) = waypoint_for_chip {
-                el.child(
-                    div()
-                        .absolute()
-                        .top(px(2.0))
-                        .right(px(12.0))
-                        .child(render_waypoint_pill(&waypoint.name, false)),
-                )
-            } else {
-                el
-            }
-        })
+        .w(px(12.0))
+        .h(px(12.0))
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(waypoint_icon_border())
+        .bg(waypoint_icon_bg())
+        .child(
+            div()
+                .absolute()
+                .left(px(3.0))
+                .top(px(3.0))
+                .w(px(4.0))
+                .h(px(4.0))
+                .rounded(px(999.0))
+                .bg(waypoint_icon_core()),
+        )
+}
+
+fn build_static_tooltip(text: &'static str, cx: &mut App) -> AnyView {
+    AnyView::from(cx.new(|_| StaticTooltipView {
+        text: SharedString::from(text),
+    }))
+}
+
+struct StaticTooltipView {
+    text: SharedString,
+}
+
+impl Render for StaticTooltipView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(px(8.0))
+            .py(px(4.0))
+            .rounded(radius_sm())
+            .border_1()
+            .border_color(border_default())
+            .bg(bg_overlay())
+            .text_size(px(11.0))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(fg_emphasis())
+            .child(self.text.clone())
+    }
 }
 
 fn render_waypoint_pill(label: &str, active: bool) -> impl IntoElement {
@@ -5013,6 +5173,8 @@ fn render_review_line_action_popup(
         .border_1()
         .border_color(border_default())
         .bg(bg_overlay())
+        // Prevent diff rows behind the popup from receiving mouse interactions.
+        .occlude()
         .shadow_sm()
         .on_any_mouse_down(|_, _, cx| {
             cx.stop_propagation();
@@ -5177,7 +5339,10 @@ fn line_action_button(
         .text_color(if active { waypoint_fg() } else { fg_emphasis() })
         .cursor_pointer()
         .hover(|style| style.bg(hover_bg()))
-        .on_mouse_down(MouseButton::Left, on_click)
+        .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+            cx.stop_propagation();
+            on_click(event, window, cx);
+        })
         .child(label.to_string())
 }
 
@@ -5195,6 +5360,7 @@ fn lerp_rgba(from: Rgba, to: Rgba, progress: f32) -> Rgba {
 }
 
 fn render_hunk(
+    gutter_layout: DiffGutterLayout,
     file_path: &str,
     hunk: &ParsedDiffHunk,
     line_threads: &[&PullRequestReviewThread],
@@ -5211,6 +5377,7 @@ fn render_hunk(
                 .children(hunk.lines.iter().map(|line| {
                     let threads_for_line = find_threads_for_line(file_path, line, line_threads);
                     render_diff_line_with_threads(
+                        gutter_layout,
                         file_path,
                         line,
                         &threads_for_line,
@@ -5221,6 +5388,7 @@ fn render_hunk(
 }
 
 fn render_diff_line_with_threads(
+    gutter_layout: DiffGutterLayout,
     file_path: &str,
     line: &ParsedDiffLine,
     threads: &[&PullRequestReviewThread],
@@ -5230,17 +5398,19 @@ fn render_diff_line_with_threads(
         .flex()
         .flex_col()
         .child(render_diff_line(
+            gutter_layout,
             file_path,
             line,
             None,
             selected_anchor,
             None,
             None,
+            false,
         ))
         .when(!threads.is_empty(), |el| {
             el.child(
                 div()
-                    .pl(px(124.0))
+                    .pl(px(gutter_layout.inline_thread_inset()))
                     .pr(px(16.0))
                     .py(px(8.0))
                     .border_b(px(1.0))
@@ -5259,12 +5429,14 @@ fn render_diff_line_with_threads(
 }
 
 fn render_diff_line(
+    gutter_layout: DiffGutterLayout,
     file_path: &str,
     line: &ParsedDiffLine,
     syntax_spans: Option<&[SyntaxSpan]>,
     selected_anchor: Option<&DiffAnchor>,
     lsp_context: Option<&DiffLineLspContext>,
     line_action: Option<(Entity<AppState>, ReviewLineActionTarget)>,
+    has_waypoint: bool,
 ) -> impl IntoElement {
     let is_selected = line_matches_diff_anchor(line, selected_anchor);
     let row_action = line_action.clone();
@@ -5335,7 +5507,8 @@ fn render_diff_line(
         .flex()
         .items_start()
         .w_full()
-        .min_h(px(22.0))
+        .min_w_0()
+        .min_h(px(DIFF_ROW_HEIGHT))
         .bg(row_bg)
         .border_b(px(1.0))
         .border_color(row_border)
@@ -5354,34 +5527,65 @@ fn render_diff_line(
             div()
                 .flex()
                 .flex_shrink_0()
-                .w(px(96.0))
+                .w(px(gutter_layout.gutter_width()))
                 .bg(gutter_bg)
                 .border_r(px(1.0))
                 .border_color(border_default())
-                .child(
-                    div()
-                        .w(px(48.0))
-                        .px(px(8.0))
-                        .flex()
-                        .justify_end()
-                        .text_size(px(11.0))
-                        .text_color(number_color)
-                        .child(left_num),
-                )
-                .child(
-                    div()
-                        .w(px(48.0))
-                        .px(px(8.0))
-                        .flex()
-                        .justify_end()
-                        .text_size(px(11.0))
-                        .text_color(number_color)
-                        .child(right_num),
-                ),
+                .when(gutter_layout.reserve_waypoint_slot, |el| {
+                    el.child(
+                        div()
+                            .w(px(DIFF_WAYPOINT_SLOT_WIDTH))
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(has_waypoint, |slot| {
+                                slot.child(
+                                    div()
+                                        .id((
+                                            ElementId::named_usize(
+                                                "diff-waypoint",
+                                                line.right_line_number
+                                                    .or(line.left_line_number)
+                                                    .unwrap_or_default()
+                                                    as usize,
+                                            ),
+                                            SharedString::from(file_path.to_string()),
+                                        ))
+                                        .tooltip(|_, cx| build_static_tooltip("waypoint", cx))
+                                        .child(render_diff_waypoint_icon()),
+                                )
+                            }),
+                    )
+                })
+                .when(gutter_layout.show_left_numbers, |el| {
+                    el.child(
+                        div()
+                            .w(px(DIFF_LINE_NUMBER_COLUMN_WIDTH))
+                            .px(px(DIFF_LINE_NUMBER_CELL_PADDING_X))
+                            .flex()
+                            .justify_end()
+                            .text_size(px(11.0))
+                            .text_color(number_color)
+                            .child(left_num),
+                    )
+                })
+                .when(gutter_layout.show_right_numbers, |el| {
+                    el.child(
+                        div()
+                            .w(px(DIFF_LINE_NUMBER_COLUMN_WIDTH))
+                            .px(px(DIFF_LINE_NUMBER_CELL_PADDING_X))
+                            .flex()
+                            .justify_end()
+                            .text_size(px(11.0))
+                            .text_color(number_color)
+                            .child(right_num),
+                    )
+                }),
         )
         .child(
             div()
-                .w(px(20.0))
+                .w(px(DIFF_MARKER_COLUMN_WIDTH))
                 .flex_shrink_0()
                 .py(px(1.0))
                 .text_color(marker_color)
@@ -5408,6 +5612,7 @@ fn render_syntax_content(
     let content = line.content.as_str();
     let content_div = div()
         .flex_grow()
+        .min_w_0()
         .px(px(8.0))
         .py(px(1.0))
         .whitespace_nowrap()
@@ -5531,6 +5736,99 @@ fn render_syntax_content(
     }
 
     content_div.text_color(fallback_color).child(selectable)
+}
+
+const DIFF_ROW_HEIGHT: f32 = 22.0;
+const DIFF_LINE_NUMBER_COLUMN_WIDTH: f32 = 36.0;
+const DIFF_LINE_NUMBER_CELL_PADDING_X: f32 = 6.0;
+const DIFF_MARKER_COLUMN_WIDTH: f32 = 16.0;
+const DIFF_WAYPOINT_SLOT_WIDTH: f32 = DIFF_ROW_HEIGHT;
+
+#[derive(Clone, Copy)]
+struct DiffGutterLayout {
+    show_left_numbers: bool,
+    show_right_numbers: bool,
+    reserve_waypoint_slot: bool,
+}
+
+impl DiffGutterLayout {
+    fn gutter_width(self) -> f32 {
+        let column_count = self.show_left_numbers as u8 + self.show_right_numbers as u8;
+        DIFF_LINE_NUMBER_COLUMN_WIDTH * f32::from(column_count.max(1))
+            + if self.reserve_waypoint_slot {
+                DIFF_WAYPOINT_SLOT_WIDTH
+            } else {
+                0.0
+            }
+    }
+
+    fn inline_thread_inset(self) -> f32 {
+        self.gutter_width() + 12.0
+    }
+}
+
+fn diff_gutter_layout(
+    file: &PullRequestFile,
+    parsed: Option<&ParsedDiffFile>,
+    reserve_waypoint_slot: bool,
+) -> DiffGutterLayout {
+    if let Some(parsed) = parsed {
+        let show_left_numbers = parsed
+            .hunks
+            .iter()
+            .flat_map(|hunk| hunk.lines.iter())
+            .any(|line| line.left_line_number.unwrap_or_default() > 0);
+        let show_right_numbers = parsed
+            .hunks
+            .iter()
+            .flat_map(|hunk| hunk.lines.iter())
+            .any(|line| line.right_line_number.unwrap_or_default() > 0);
+
+        if show_left_numbers || show_right_numbers {
+            return DiffGutterLayout {
+                show_left_numbers,
+                show_right_numbers,
+                reserve_waypoint_slot,
+            };
+        }
+    }
+
+    match file.change_type.as_str() {
+        "ADDED" => DiffGutterLayout {
+            show_left_numbers: false,
+            show_right_numbers: true,
+            reserve_waypoint_slot,
+        },
+        "DELETED" => DiffGutterLayout {
+            show_left_numbers: true,
+            show_right_numbers: false,
+            reserve_waypoint_slot,
+        },
+        _ => DiffGutterLayout {
+            show_left_numbers: true,
+            show_right_numbers: true,
+            reserve_waypoint_slot,
+        },
+    }
+}
+
+fn diff_gutter_layout_from_parsed(parsed_file: &ParsedDiffFile) -> DiffGutterLayout {
+    let show_left_numbers = parsed_file
+        .hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter())
+        .any(|line| line.left_line_number.unwrap_or_default() > 0);
+    let show_right_numbers = parsed_file
+        .hunks
+        .iter()
+        .flat_map(|hunk| hunk.lines.iter())
+        .any(|line| line.right_line_number.unwrap_or_default() > 0);
+
+    DiffGutterLayout {
+        show_left_numbers: show_left_numbers || !show_right_numbers,
+        show_right_numbers,
+        reserve_waypoint_slot: false,
+    }
 }
 
 fn build_diff_highlights(parsed_file: &ParsedDiffFile) -> Arc<Vec<Vec<Vec<SyntaxSpan>>>> {
@@ -5825,6 +6123,7 @@ fn render_tour_diff_preview(
     let rows = diff_view_state.rows;
     let parsed_file_index = diff_view_state.parsed_file_index;
     let highlighted_hunks = diff_view_state.highlighted_hunks;
+    let gutter_layout = diff_gutter_layout(file, Some(parsed_file), false);
     let preview_items = {
         let app_state = state.read(cx);
         build_tour_diff_preview_items(
@@ -5844,9 +6143,10 @@ fn render_tour_diff_preview(
         .iter()
         .map(|item| match item {
             DiffViewItem::SemanticSection(_) => div().into_any_element(),
-            DiffViewItem::Gap(gap) => render_diff_gap_row(*gap).into_any_element(),
+            DiffViewItem::Gap(gap) => render_diff_gap_row(*gap, gutter_layout).into_any_element(),
             DiffViewItem::Row(row_ix) => render_virtualized_diff_row(
                 state,
+                gutter_layout,
                 parsed_file_index,
                 highlighted_hunks.as_deref(),
                 file_lsp_context.as_ref(),
@@ -5898,6 +6198,7 @@ fn render_full_tour_diff_preview(
     file_lsp_context: Option<&DiffFileLspContext>,
 ) -> impl IntoElement {
     let highlighted_hunks = build_diff_highlights(parsed_file);
+    let gutter_layout = diff_gutter_layout_from_parsed(parsed_file);
     let mut elements: Vec<AnyElement> = Vec::new();
     let file_path = parsed_file.path.as_str();
 
@@ -5913,12 +6214,14 @@ fn render_full_tour_diff_preview(
             let line_lsp_context = build_diff_line_lsp_context(file_lsp_context, line);
             elements.push(
                 render_diff_line(
+                    gutter_layout,
                     file_path,
                     line,
                     spans,
                     anchor,
                     line_lsp_context.as_ref(),
                     None,
+                    false,
                 )
                 .into_any_element(),
             );
