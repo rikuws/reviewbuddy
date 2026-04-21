@@ -233,6 +233,10 @@ pub fn diff_add_gutter_bg() -> Rgba {
     theme_hex(0xe0f0e6, 0x1a251e)
 }
 
+pub fn diff_add_emphasis_bg() -> Rgba {
+    theme_hex_alpha((0x1f7a3f, 0.18), (0x79be84, 0.26))
+}
+
 pub fn diff_add_border() -> Rgba {
     transparent()
 }
@@ -243,6 +247,10 @@ pub fn diff_remove_bg() -> Rgba {
 
 pub fn diff_remove_gutter_bg() -> Rgba {
     theme_hex(0xf8e0e6, 0x2a1d20)
+}
+
+pub fn diff_remove_emphasis_bg() -> Rgba {
+    theme_hex_alpha((0xbe3c4d, 0.18), (0xe1848d, 0.26))
 }
 
 pub fn diff_remove_border() -> Rgba {

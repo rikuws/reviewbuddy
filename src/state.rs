@@ -281,6 +281,18 @@ pub struct PreparedFileLine {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DiffInlineRange {
+    pub column_start: usize,
+    pub column_end: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct DiffLineHighlight {
+    pub syntax_spans: Vec<SyntaxSpan>,
+    pub emphasis_ranges: Vec<DiffInlineRange>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub enum ReviewLineActionMode {
     #[default]
     Menu,
@@ -313,7 +325,7 @@ pub struct DiffFileViewState {
     pub rows: Arc<Vec<DiffRenderRow>>,
     pub revision: String,
     pub parsed_file_index: Option<usize>,
-    pub highlighted_hunks: Option<Arc<Vec<Vec<Vec<SyntaxSpan>>>>>,
+    pub highlighted_hunks: Option<Arc<Vec<Vec<DiffLineHighlight>>>>,
     pub list_state: ListState,
 }
 
@@ -322,7 +334,7 @@ impl DiffFileViewState {
         rows: Arc<Vec<DiffRenderRow>>,
         revision: String,
         parsed_file_index: Option<usize>,
-        highlighted_hunks: Option<Arc<Vec<Vec<Vec<SyntaxSpan>>>>>,
+        highlighted_hunks: Option<Arc<Vec<Vec<DiffLineHighlight>>>>,
     ) -> Self {
         Self {
             rows,
