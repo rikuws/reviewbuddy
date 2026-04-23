@@ -40,7 +40,6 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .map(|q| q.items.clone())
         .unwrap_or_default();
     let workspace_loading = s.workspace_loading;
-    let workspace_syncing = s.workspace_syncing;
     let workspace_error = s.workspace_error.clone();
     let first_open_tab = s.open_tabs.first().cloned();
     let overview_greeting_index = s.overview_greeting_index;
@@ -56,7 +55,6 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     } else {
         "Authenticate with gh to populate the review queue.".to_string()
     };
-    let sync_state = state.clone();
     let state_for_open_pull_requests = state.clone();
     let state_for_authored = state.clone();
     let state_for_review_requests = state.clone();
@@ -118,51 +116,24 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                             .flex()
                             .flex_col()
                             .gap(px(16.0))
-                            .child(
-                                div()
-                                    .px(px(4.0))
-                                    .child(eyebrow("At a glance"))
-                                    .child(
-                                        div()
-                                            .text_size(px(14.0))
-                                            .line_height(px(22.0))
-                                            .text_color(fg_muted())
-                                            .child("The live board stays compact on the right so the hero can carry the first impression."),
-                                    ),
-                            )
-                            .child(
+                            .when(is_auth, |el| el.child(
                                 div()
                                     .flex()
                                     .items_center()
                                     .gap(px(8.0))
                                     .flex_wrap()
-                                    .when(is_auth, |el| {
-                                        el.child(review_button("Open review board", {
-                                            let state = state_for_review_board.clone();
-                                            move |_, _, cx| {
-                                                activate_queue(
-                                                    &state,
-                                                    SectionId::Reviews,
-                                                    "reviewRequested",
-                                                    cx,
-                                                );
-                                            }
-                                        }))
-                                    })
-                                    .child(ghost_button(
-                                        if workspace_syncing {
-                                            "Syncing..."
-                                        } else {
-                                            "Sync workspace"
-                                        },
-                                        {
-                                            let state = sync_state.clone();
-                                            move |_, window, cx| {
-                                                trigger_sync_workspace(&state, window, cx)
-                                            }
-                                        },
-                                    )),
-                            )
+                                    .child(review_button("Open review board", {
+                                        let state = state_for_review_board.clone();
+                                        move |_, _, cx| {
+                                            activate_queue(
+                                                &state,
+                                                SectionId::Reviews,
+                                                "reviewRequested",
+                                                cx,
+                                            );
+                                        }
+                                    })),
+                            ))
                             .child(stat_card(
                                 OVERVIEW_OPEN_PULL_REQUESTS_ASSET,
                                 "Open Pull Requests",
