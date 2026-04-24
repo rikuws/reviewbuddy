@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::process::Command;
 
 use crate::{
@@ -8,7 +9,7 @@ use crate::{
     gh::{self, CommandOutput},
 };
 
-const WORKSPACE_CACHE_KEY: &str = "workspace-snapshot-v1";
+const WORKSPACE_CACHE_KEY: &str = "workspace-snapshot-v2";
 const AUTH_STATE_CACHE_KEY: &str = "auth-state-v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +32,8 @@ pub struct PullRequestSummary {
     pub number: i64,
     pub title: String,
     pub author_login: String,
+    #[serde(default)]
+    pub author_avatar_url: Option<String>,
     #[serde(default)]
     pub is_draft: bool,
     pub comments_count: i64,
@@ -78,6 +81,8 @@ pub struct PullRequestFile {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestReview {
     pub author_login: String,
+    #[serde(default)]
+    pub author_avatar_url: Option<String>,
     pub state: String,
     pub body: String,
     pub submitted_at: Option<String>,
@@ -87,6 +92,8 @@ pub struct PullRequestReview {
 pub struct PullRequestReviewComment {
     pub id: String,
     pub author_login: String,
+    #[serde(default)]
+    pub author_avatar_url: Option<String>,
     pub body: String,
     pub path: String,
     pub line: Option<i64>,
@@ -105,6 +112,8 @@ pub struct PullRequestReviewComment {
 pub struct PullRequestComment {
     pub id: String,
     pub author_login: String,
+    #[serde(default)]
+    pub author_avatar_url: Option<String>,
     pub body: String,
     pub created_at: String,
     pub updated_at: String,
@@ -141,6 +150,8 @@ pub struct PullRequestDetail {
     pub body: String,
     pub url: String,
     pub author_login: String,
+    #[serde(default)]
+    pub author_avatar_url: Option<String>,
     pub state: String,
     pub is_draft: bool,
     pub review_decision: Option<String>,
@@ -157,6 +168,8 @@ pub struct PullRequestDetail {
     pub updated_at: String,
     pub labels: Vec<String>,
     pub reviewers: Vec<String>,
+    #[serde(default)]
+    pub reviewer_avatar_urls: BTreeMap<String, String>,
     #[serde(default)]
     pub comments: Vec<PullRequestComment>,
     pub latest_reviews: Vec<PullRequestReview>,
@@ -650,7 +663,7 @@ fn fetch_queue(id: &str, label: &str, search_query: &str) -> Result<PullRequestQ
                 deletions
                 changedFiles
                 reviewDecision
-                author { login }
+                author { login avatarUrl }
                 comments { totalCount }
                 repository { nameWithOwner }
               }
@@ -698,7 +711,7 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
               id number title body url state isDraft reviewDecision
               baseRefName headRefName baseRefOid headRefOid
               additions deletions changedFiles createdAt updatedAt
-              author { login }
+              author { login avatarUrl }
               comments(first: 30) {
                 totalCount
                 nodes {
@@ -707,29 +720,29 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
                   createdAt
                   updatedAt
                   url
-                  author { login }
+                  author { login avatarUrl }
                 }
               }
               commits { totalCount }
               labels(first: 20) { nodes { name } }
               reviewRequests(first: 20) {
-                nodes { requestedReviewer { ... on User { login } ... on Team { slug } } }
+                nodes { requestedReviewer { ... on User { login avatarUrl } ... on Team { slug avatarUrl } } }
               }
               latestReviews(first: 20) {
-                nodes { state body submittedAt author { login } }
+                nodes { state body submittedAt author { login avatarUrl } }
               }
               reviewThreads(first: 100) {
                 nodes {
                   id path line originalLine startLine originalStartLine
                   diffSide startDiffSide isCollapsed isOutdated isResolved
                   subjectType viewerCanReply viewerCanResolve viewerCanUnresolve
-                  resolvedBy { login }
+                  resolvedBy { login avatarUrl }
                   comments(first: 100) {
                     nodes {
                       id body path line originalLine startLine originalStartLine
                       state createdAt updatedAt publishedAt url
                       replyTo { id }
-                      author { login }
+                      author { login avatarUrl }
                     }
                   }
                 }
@@ -773,6 +786,8 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
     let parsed_diff = crate::diff::parse_unified_diff(&diff_output.stdout);
     let raw_diff = diff_output.stdout;
 
+    let author = pr.get("author");
+
     Ok(PullRequestDetail {
         id: str_field(pr, "id"),
         repository: repository.to_string(),
@@ -780,12 +795,8 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
         title: str_field(pr, "title"),
         body: str_field(pr, "body"),
         url: str_field(pr, "url"),
-        author_login: pr
-            .get("author")
-            .and_then(|v| v.get("login"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
+        author_login: actor_login(author).unwrap_or("unknown").to_string(),
+        author_avatar_url: actor_avatar_url(author).map(str::to_string),
         state: str_field_or(pr, "state", "OPEN"),
         is_draft: pr.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
         review_decision: pr
@@ -839,12 +850,11 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
                     .filter_map(|node| {
                         Some(PullRequestComment {
                             id: node.get("id")?.as_str()?.to_string(),
-                            author_login: node
-                                .get("author")
-                                .and_then(|v| v.get("login"))
-                                .and_then(Value::as_str)
+                            author_login: actor_login(node.get("author"))
                                 .unwrap_or("unknown")
                                 .to_string(),
+                            author_avatar_url: actor_avatar_url(node.get("author"))
+                                .map(str::to_string),
                             body: str_field(node, "body"),
                             created_at: str_field(node, "createdAt"),
                             updated_at: str_field(node, "updatedAt"),
@@ -871,6 +881,7 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
                     .collect()
             })
             .unwrap_or_default(),
+        reviewer_avatar_urls: reviewer_avatar_urls(pr),
         latest_reviews: pr
             .get("latestReviews")
             .and_then(|v| v.get("nodes"))
@@ -879,12 +890,10 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
                 nodes
                     .iter()
                     .map(|n| PullRequestReview {
-                        author_login: n
-                            .get("author")
-                            .and_then(|v| v.get("login"))
-                            .and_then(Value::as_str)
+                        author_login: actor_login(n.get("author"))
                             .unwrap_or("unknown")
                             .to_string(),
+                        author_avatar_url: actor_avatar_url(n.get("author")).map(str::to_string),
                         state: str_field_or(n, "state", "COMMENTED"),
                         body: str_field(n, "body"),
                         submitted_at: n
@@ -1047,6 +1056,7 @@ fn default_repository_file_source() -> String {
 }
 
 fn map_pull_request_summary(node: &Value) -> Option<PullRequestSummary> {
+    let author = node.get("author");
     Some(PullRequestSummary {
         repository: node
             .get("repository")?
@@ -1055,12 +1065,8 @@ fn map_pull_request_summary(node: &Value) -> Option<PullRequestSummary> {
             .to_string(),
         number: node.get("number")?.as_i64()?,
         title: node.get("title")?.as_str()?.to_string(),
-        author_login: node
-            .get("author")
-            .and_then(|v| v.get("login"))
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string(),
+        author_login: actor_login(author).unwrap_or("unknown").to_string(),
+        author_avatar_url: actor_avatar_url(author).map(str::to_string),
         is_draft: node
             .get("isDraft")
             .and_then(Value::as_bool)
@@ -1081,6 +1087,40 @@ fn map_pull_request_summary(node: &Value) -> Option<PullRequestSummary> {
         updated_at: str_field(node, "updatedAt"),
         url: node.get("url")?.as_str()?.to_string(),
     })
+}
+
+fn reviewer_avatar_urls(pr: &Value) -> BTreeMap<String, String> {
+    pr.get("reviewRequests")
+        .and_then(|v| v.get("nodes"))
+        .and_then(Value::as_array)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| node.get("requestedReviewer"))
+                .filter_map(|reviewer| {
+                    let login = actor_login(Some(reviewer))?;
+                    let avatar_url = actor_avatar_url(Some(reviewer))?;
+                    Some((login.to_string(), avatar_url.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn actor_login(actor: Option<&Value>) -> Option<&str> {
+    actor.and_then(|actor| {
+        actor
+            .get("login")
+            .or_else(|| actor.get("slug"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn actor_avatar_url(actor: Option<&Value>) -> Option<&str> {
+    actor
+        .and_then(|actor| actor.get("avatarUrl"))
+        .and_then(Value::as_str)
+        .filter(|url| !url.trim().is_empty())
 }
 
 fn map_review_thread(node: &Value) -> Option<PullRequestReviewThread> {
@@ -1136,12 +1176,11 @@ fn map_review_thread(node: &Value) -> Option<PullRequestReviewThread> {
                     .filter_map(|c| {
                         Some(PullRequestReviewComment {
                             id: c.get("id")?.as_str()?.to_string(),
-                            author_login: c
-                                .get("author")
-                                .and_then(|v| v.get("login"))
-                                .and_then(Value::as_str)
+                            author_login: actor_login(c.get("author"))
                                 .unwrap_or("unknown")
                                 .to_string(),
+                            author_avatar_url: actor_avatar_url(c.get("author"))
+                                .map(str::to_string),
                             body: str_field(c, "body"),
                             path: c.get("path")?.as_str()?.to_string(),
                             line: c.get("line").and_then(Value::as_i64),
@@ -1216,7 +1255,7 @@ fn default_queues() -> Vec<PullRequestQueue> {
 }
 
 fn pull_request_detail_cache_key(repository: &str, number: i64) -> String {
-    format!("pr-detail-v2:{}#{}", repository, number)
+    format!("pr-detail-v3:{}#{}", repository, number)
 }
 
 fn pull_request_file_content_cache_key(repository: &str, reference: &str, path: &str) -> String {

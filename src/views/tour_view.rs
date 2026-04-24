@@ -29,7 +29,7 @@ use super::diff_view::{
 };
 use super::sections::{
     badge, error_text, eyebrow, ghost_button, nested_panel, panel_state_text, review_button,
-    success_text,
+    success_text, user_avatar,
 };
 
 pub fn enter_tour_surface(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
@@ -978,6 +978,7 @@ pub fn render_tour_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement 
     let generated_tour = Arc::new(generated_tour.unwrap().clone());
     let overview_meta = TourOverviewMeta {
         author_login: detail.author_login.clone(),
+        author_avatar_url: detail.author_avatar_url.clone(),
         base_ref_name: detail.base_ref_name.clone(),
         head_ref_name: detail.head_ref_name.clone(),
     };
@@ -1570,6 +1571,7 @@ enum TourContentItem {
 #[derive(Clone)]
 struct TourOverviewMeta {
     author_login: String,
+    author_avatar_url: Option<String>,
     base_ref_name: String,
     head_ref_name: String,
 }
@@ -1817,7 +1819,14 @@ fn render_overview_card(
                         .flex()
                         .gap(px(8.0))
                         .flex_wrap()
+                        .items_center()
                         .mt(px(14.0))
+                        .child(user_avatar(
+                            &meta.author_login,
+                            meta.author_avatar_url.as_deref(),
+                            20.0,
+                            false,
+                        ))
                         .child(badge(&meta.author_login))
                         .child(badge(&meta.base_ref_name))
                         .child(badge(&meta.head_ref_name))

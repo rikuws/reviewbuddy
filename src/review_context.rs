@@ -23,6 +23,7 @@ pub struct RelatedReviewFile {
 #[derive(Clone, Debug)]
 pub struct FileThreadPreview {
     pub author_login: String,
+    pub author_avatar_url: Option<String>,
     pub preview: String,
     pub updated_at: String,
     pub is_resolved: bool,
@@ -193,6 +194,7 @@ fn thread_preview(thread: &PullRequestReviewThread) -> FileThreadPreview {
         author_login: latest_comment
             .map(|comment| comment.author_login.clone())
             .unwrap_or_else(|| "review".to_string()),
+        author_avatar_url: latest_comment.and_then(|comment| comment.author_avatar_url.clone()),
         preview,
         updated_at,
         is_resolved: thread.is_resolved,

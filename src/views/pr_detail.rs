@@ -18,7 +18,7 @@ use crate::theme::*;
 use super::diff_view::{enter_files_surface, render_files_view};
 use super::sections::{
     badge, error_text, eyebrow, format_relative_time, ghost_button, nested_panel, panel_state_text,
-    review_button, success_text,
+    review_button, success_text, user_avatar,
 };
 use super::tour_view::{enter_tour_surface, refresh_active_tour_flow, render_tour_view};
 
@@ -36,6 +36,7 @@ struct OwnPrFeedbackItem {
     file_path: String,
     location_label: String,
     author_login: String,
+    author_avatar_url: Option<String>,
     updated_at: String,
     preview: String,
     subject_type: String,
@@ -52,6 +53,7 @@ struct ThreadDigestItem {
     file_path: String,
     location_label: String,
     latest_author: String,
+    latest_author_avatar_url: Option<String>,
     updated_at: String,
     preview: String,
     subject_type: String,
@@ -66,6 +68,7 @@ struct ThreadDigestItem {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ParticipantItem {
     login: String,
+    avatar_url: Option<String>,
     is_author: bool,
     is_requested: bool,
     approved: bool,
@@ -84,6 +87,7 @@ enum ActivityItemKind {
 struct ActivityItem {
     kind: ActivityItemKind,
     author_login: String,
+    author_avatar_url: Option<String>,
     timestamp: String,
     title: String,
     preview: String,
@@ -189,6 +193,7 @@ fn own_pr_feedback_item(
         file_path: thread.path.clone(),
         location_label: feedback_location_label(thread, &anchor),
         author_login: latest_feedback.author_login.clone(),
+        author_avatar_url: latest_feedback.author_avatar_url.clone(),
         updated_at: latest_feedback
             .published_at
             .clone()
@@ -285,6 +290,9 @@ pub fn render_pr_workspace(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
     let author = detail
         .map(|d| d.author_login.clone())
         .unwrap_or_else(|| pr.author_login.clone());
+    let author_avatar_url = detail
+        .and_then(|d| d.author_avatar_url.clone())
+        .or_else(|| pr.author_avatar_url.clone());
     let repository = pr.repository.clone();
     let number = pr.number;
     let loading = detail_state.map(|d| d.loading).unwrap_or(false);
@@ -313,6 +321,7 @@ pub fn render_pr_workspace(state: &Entity<AppState>, cx: &App) -> impl IntoEleme
             &pr_state,
             is_draft,
             &author,
+            author_avatar_url.as_deref(),
             detail.map(|d| (d.base_ref_name.clone(), d.head_ref_name.clone())),
             syncing,
             surface,
@@ -368,6 +377,7 @@ fn render_pr_header(
     pr_state: &str,
     is_draft: bool,
     author: &str,
+    author_avatar_url: Option<&str>,
     refs: Option<(String, String)>,
     syncing: bool,
     surface: PullRequestSurface,
@@ -379,6 +389,7 @@ fn render_pr_header(
 ) -> impl IntoElement {
     let title = pr_title.to_string();
     let author = author.to_string();
+    let author_avatar_url = author_avatar_url.map(str::to_string);
     let repository = repository.to_string();
     let breadcrumb = format!("Pull Requests / {} / #{}", repository, number).to_uppercase();
     let state_for_mark_read = state_for_refresh.clone();
@@ -447,6 +458,12 @@ fn render_pr_header(
                         .flex_wrap()
                         .items_center()
                         .child(pull_request_state_badge(pr_state, is_draft))
+                        .child(user_avatar(
+                            &author,
+                            author_avatar_url.as_deref(),
+                            18.0,
+                            false,
+                        ))
                         .child(author)
                         .when(syncing, |el| el.child(badge("Refreshing live")))
                         .when_some(refs, |el, (base, head)| {
@@ -1221,9 +1238,24 @@ fn render_own_feedback_card(
         .child(
             div()
                 .mt(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
                 .text_size(px(12.0))
                 .text_color(fg_muted())
-                .child(format!("{} \u{2022} {}", item.author_login, updated_at)),
+                .child(user_avatar(
+                    &item.author_login,
+                    item.author_avatar_url.as_deref(),
+                    18.0,
+                    false,
+                ))
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(fg_emphasis())
+                        .child(item.author_login.clone()),
+                )
+                .child(format!("\u{2022} {updated_at}")),
         )
 }
 
@@ -1319,9 +1351,24 @@ fn render_thread_digest_card(
         .child(
             div()
                 .mt(px(8.0))
+                .flex()
+                .items_center()
+                .gap(px(6.0))
                 .text_size(px(12.0))
                 .text_color(fg_muted())
-                .child(format!("{} \u{2022} {}", item.latest_author, updated_at)),
+                .child(user_avatar(
+                    &item.latest_author,
+                    item.latest_author_avatar_url.as_deref(),
+                    18.0,
+                    false,
+                ))
+                .child(
+                    div()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(fg_emphasis())
+                        .child(item.latest_author.clone()),
+                )
+                .child(format!("\u{2022} {updated_at}")),
         )
 }
 
@@ -1440,6 +1487,12 @@ fn render_activity_card(item: &ActivityItem, state: &Entity<AppState>) -> impl I
                         .when(item.kind != ActivityItemKind::Thread, |el| {
                             el.child(activity_kind_badge(&item.kind))
                         })
+                        .child(user_avatar(
+                            &item.author_login,
+                            item.author_avatar_url.as_deref(),
+                            20.0,
+                            false,
+                        ))
                         .child(
                             div()
                                 .min_w_0()
@@ -1928,6 +1981,10 @@ fn render_reviewers_panel(
                 .flex_col()
                 .gap(px(8.0))
                 .children(detail.reviewers.iter().map(|reviewer| {
+                    let avatar_url = detail
+                        .reviewer_avatar_urls
+                        .get(reviewer)
+                        .map(String::as_str);
                     div()
                         .flex()
                         .items_center()
@@ -1941,7 +1998,7 @@ fn render_reviewers_panel(
                                 .gap(px(10.0))
                                 .flex_grow()
                                 .min_w_0()
-                                .child(participant_avatar(reviewer, false))
+                                .child(user_avatar(reviewer, avatar_url, 28.0, false))
                                 .child(
                                     div()
                                         .min_w_0()
@@ -2017,8 +2074,10 @@ fn render_participant_row(participant: &ParticipantItem) -> impl IntoElement {
                 .gap(px(10.0))
                 .flex_grow()
                 .min_w_0()
-                .child(participant_avatar(
+                .child(user_avatar(
                     &participant.login,
+                    participant.avatar_url.as_deref(),
+                    28.0,
                     participant.is_author,
                 ))
                 .child(
@@ -2102,41 +2161,6 @@ fn render_labels_panel(labels: &[String]) -> impl IntoElement {
                 .mt(px(6.0))
                 .children(labels.iter().map(|label| badge(label))),
         )
-}
-
-fn participant_avatar(login: &str, emphasized: bool) -> impl IntoElement {
-    div()
-        .w(px(28.0))
-        .h(px(28.0))
-        .rounded(px(14.0))
-        .border_1()
-        .border_color(transparent())
-        .bg(if emphasized {
-            accent_muted()
-        } else {
-            bg_emphasis()
-        })
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_size(px(11.0))
-        .font_family("Fira Code")
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(if emphasized { accent() } else { fg_emphasis() })
-        .child(login_monogram(login))
-}
-
-fn login_monogram(login: &str) -> String {
-    let mut monogram = login
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(2)
-        .collect::<String>()
-        .to_uppercase();
-    if monogram.is_empty() {
-        monogram.push('?');
-    }
-    monogram
 }
 
 fn participant_display_name(login: &str) -> String {
@@ -2409,6 +2433,7 @@ fn thread_digest_item(
         file_path: thread.path.clone(),
         location_label,
         latest_author: latest_comment.author_login.clone(),
+        latest_author_avatar_url: latest_comment.author_avatar_url.clone(),
         updated_at: latest_comment
             .published_at
             .clone()
@@ -2467,6 +2492,7 @@ fn activity_item_for_comment(comment: &PullRequestComment) -> ActivityItem {
     ActivityItem {
         kind: ActivityItemKind::Conversation,
         author_login: comment.author_login.clone(),
+        author_avatar_url: comment.author_avatar_url.clone(),
         timestamp: comment.updated_at.clone(),
         title: format!("{} commented on the pull request", comment.author_login),
         preview: summarize_text_preview(&comment.body, 220),
@@ -2482,6 +2508,7 @@ fn activity_item_for_review(review: &PullRequestReview) -> ActivityItem {
     ActivityItem {
         kind: ActivityItemKind::Review,
         author_login: review.author_login.clone(),
+        author_avatar_url: review.author_avatar_url.clone(),
         timestamp: review.submitted_at.clone().unwrap_or_default(),
         title: format!(
             "{} {}",
@@ -2520,6 +2547,7 @@ fn activity_item_for_thread(
     Some(ActivityItem {
         kind: ActivityItemKind::Thread,
         author_login: digest.latest_author.clone(),
+        author_avatar_url: digest.latest_author_avatar_url.clone(),
         timestamp: digest.updated_at.clone(),
         title: format!("{} commented", digest.latest_author),
         preview: digest.preview.clone(),
@@ -2549,8 +2577,18 @@ fn summarize_participants(
     review_status: &ReviewStatusSummary,
 ) -> Vec<ParticipantItem> {
     let mut participants = BTreeMap::<String, ParticipantItem>::new();
+    let review_avatar_urls = detail
+        .latest_reviews
+        .iter()
+        .filter_map(|review| {
+            Some((
+                review.author_login.as_str(),
+                review.author_avatar_url.as_deref()?,
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
 
-    let mut upsert = |login: &str, apply: fn(&mut ParticipantItem)| {
+    let mut upsert = |login: &str, avatar_url: Option<&str>, apply: fn(&mut ParticipantItem)| {
         if login.trim().is_empty() {
             return;
         }
@@ -2558,41 +2596,73 @@ fn summarize_participants(
             .entry(login.to_string())
             .or_insert_with(|| ParticipantItem {
                 login: login.to_string(),
+                avatar_url: None,
                 is_author: false,
                 is_requested: false,
                 approved: false,
                 changes_requested: false,
                 commented: false,
             });
+        if entry.avatar_url.is_none() {
+            entry.avatar_url = avatar_url
+                .map(str::trim)
+                .filter(|url| !url.is_empty())
+                .map(str::to_string);
+        }
         apply(entry);
     };
 
-    upsert(&detail.author_login, |participant| {
-        participant.is_author = true
-    });
+    upsert(
+        &detail.author_login,
+        detail.author_avatar_url.as_deref(),
+        |participant| participant.is_author = true,
+    );
 
     for reviewer in &detail.reviewers {
-        upsert(reviewer, |participant| participant.is_requested = true);
+        upsert(
+            reviewer,
+            detail
+                .reviewer_avatar_urls
+                .get(reviewer)
+                .map(String::as_str),
+            |participant| participant.is_requested = true,
+        );
     }
     for login in &review_status.approved {
-        upsert(login, |participant| participant.approved = true);
+        upsert(
+            login,
+            review_avatar_urls.get(login.as_str()).copied(),
+            |participant| participant.approved = true,
+        );
     }
     for login in &review_status.changes_requested {
-        upsert(login, |participant| participant.changes_requested = true);
+        upsert(
+            login,
+            review_avatar_urls.get(login.as_str()).copied(),
+            |participant| participant.changes_requested = true,
+        );
     }
     for login in &review_status.commented {
-        upsert(login, |participant| participant.commented = true);
+        upsert(
+            login,
+            review_avatar_urls.get(login.as_str()).copied(),
+            |participant| participant.commented = true,
+        );
     }
     for comment in &detail.comments {
-        upsert(&comment.author_login, |participant| {
-            participant.commented = true
-        });
+        upsert(
+            &comment.author_login,
+            comment.author_avatar_url.as_deref(),
+            |participant| participant.commented = true,
+        );
     }
     for thread in &detail.review_threads {
         for comment in &thread.comments {
-            upsert(&comment.author_login, |participant| {
-                participant.commented = true
-            });
+            upsert(
+                &comment.author_login,
+                comment.author_avatar_url.as_deref(),
+                |participant| participant.commented = true,
+            );
         }
     }
 
@@ -2971,6 +3041,7 @@ mod tests {
     fn review(author_login: &str, state: &str, submitted_at: Option<&str>) -> PullRequestReview {
         PullRequestReview {
             author_login: author_login.to_string(),
+            author_avatar_url: None,
             state: state.to_string(),
             body: String::new(),
             submitted_at: submitted_at.map(str::to_string),
@@ -2981,6 +3052,7 @@ mod tests {
         PullRequestComment {
             id: format!("issue-comment-{author_login}-{timestamp}"),
             author_login: author_login.to_string(),
+            author_avatar_url: None,
             body: body.to_string(),
             created_at: timestamp.to_string(),
             updated_at: timestamp.to_string(),
@@ -2992,6 +3064,7 @@ mod tests {
         PullRequestReviewComment {
             id: format!("comment-{author_login}-{timestamp}"),
             author_login: author_login.to_string(),
+            author_avatar_url: None,
             body: body.to_string(),
             path: String::new(),
             line: None,
@@ -3077,6 +3150,7 @@ mod tests {
             body: String::new(),
             url: "https://example.com/pr/42".to_string(),
             author_login: "author".to_string(),
+            author_avatar_url: None,
             state: "OPEN".to_string(),
             is_draft: false,
             review_decision: None,
@@ -3093,6 +3167,7 @@ mod tests {
             updated_at: "2026-04-14T11:30:00Z".to_string(),
             labels: vec!["ui".to_string()],
             reviewers: vec!["alice".to_string(), "bob".to_string()],
+            reviewer_avatar_urls: std::collections::BTreeMap::new(),
             comments,
             latest_reviews,
             review_threads,

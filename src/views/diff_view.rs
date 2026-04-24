@@ -44,6 +44,7 @@ use crate::{github, notifications};
 
 use super::sections::{
     badge, badge_success, error_text, ghost_button, nested_panel, panel_state_text, review_button,
+    user_avatar,
 };
 
 pub fn enter_files_surface(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
@@ -5963,12 +5964,26 @@ fn render_context_threads_panel(review_context: &ReviewContextData) -> impl Into
                         .border_color(border_muted())
                         .child(
                             div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
                                 .text_size(px(11.0))
                                 .font_family("Fira Code")
                                 .text_color(fg_subtle())
+                                .child(user_avatar(
+                                    &thread.author_login,
+                                    thread.author_avatar_url.as_deref(),
+                                    16.0,
+                                    false,
+                                ))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(fg_emphasis())
+                                        .child(thread.author_login.clone()),
+                                )
                                 .child(format!(
-                                    "{} • {}{}",
-                                    thread.author_login,
+                                    "• {}{}",
                                     thread.location_label,
                                     if thread.is_resolved {
                                         " • resolved"
@@ -9152,6 +9167,12 @@ fn render_thread_comment(comment: &PullRequestReviewComment, is_unread: bool) ->
                 .items_center()
                 .gap(px(6.0))
                 .text_size(px(12.0))
+                .child(user_avatar(
+                    &comment.author_login,
+                    comment.author_avatar_url.as_deref(),
+                    20.0,
+                    false,
+                ))
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)

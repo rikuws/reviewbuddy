@@ -197,6 +197,7 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
 struct OverviewReviewCommentItem {
     summary: github::PullRequestSummary,
     author_login: String,
+    author_avatar_url: Option<String>,
     location: String,
     preview: String,
     timestamp: String,
@@ -584,11 +585,9 @@ fn overview_review_comment_row(
     let summary = item.summary.clone();
     let repo_ref = format!("{} #{}", summary.repository, summary.number);
     let title = summary.title.clone();
-    let meta = format!(
-        "{} commented {}",
-        item.author_login,
-        format_relative_time(&item.timestamp)
-    );
+    let author_login = item.author_login.clone();
+    let author_avatar_url = item.author_avatar_url.clone();
+    let meta = format!("commented {}", format_relative_time(&item.timestamp));
     let location = item.location.clone();
     let preview = item.preview.clone();
 
@@ -650,7 +649,27 @@ fn overview_review_comment_row(
                                 .when(item.is_outdated, |el| el.child(subtle_pill("outdated"))),
                         ),
                 )
-                .child(div().text_size(px(12.0)).text_color(fg_muted()).child(meta))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .text_size(px(12.0))
+                        .text_color(fg_muted())
+                        .child(user_avatar(
+                            &author_login,
+                            author_avatar_url.as_deref(),
+                            18.0,
+                            false,
+                        ))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg_emphasis())
+                                .child(author_login),
+                        )
+                        .child(meta),
+                )
                 .child(
                     div()
                         .text_size(px(13.0))
@@ -755,6 +774,7 @@ fn overview_comment_item_for_comment(
     OverviewReviewCommentItem {
         summary: summary.clone(),
         author_login: comment.author_login.clone(),
+        author_avatar_url: comment.author_avatar_url.clone(),
         location: overview_comment_location(thread, comment),
         preview: summarize_overview_comment(&comment.body),
         timestamp: comment
@@ -1229,6 +1249,88 @@ pub fn badge(text: &str) -> impl IntoElement {
         .child(text.to_string())
 }
 
+pub fn user_avatar(
+    login: &str,
+    avatar_url: Option<&str>,
+    size: f32,
+    emphasized: bool,
+) -> AnyElement {
+    let login = login.to_string();
+    let avatar_url = avatar_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string);
+
+    match avatar_url {
+        Some(url) => {
+            let loading_login = login.clone();
+            let fallback_login = login.clone();
+            div()
+                .w(px(size))
+                .h(px(size))
+                .rounded(px(size / 2.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(if emphasized { accent() } else { border_muted() })
+                .bg(if emphasized {
+                    accent_muted()
+                } else {
+                    bg_emphasis()
+                })
+                .flex_shrink_0()
+                .child(
+                    img(url)
+                        .size(px(size))
+                        .object_fit(ObjectFit::Cover)
+                        .with_loading(move || {
+                            avatar_placeholder(&loading_login, size, emphasized).into_any_element()
+                        })
+                        .with_fallback(move || {
+                            avatar_placeholder(&fallback_login, size, emphasized).into_any_element()
+                        }),
+                )
+                .into_any_element()
+        }
+        None => avatar_placeholder(&login, size, emphasized).into_any_element(),
+    }
+}
+
+fn avatar_placeholder(login: &str, size: f32, emphasized: bool) -> Div {
+    div()
+        .w(px(size))
+        .h(px(size))
+        .rounded(px(size / 2.0))
+        .border_1()
+        .border_color(if emphasized { accent() } else { border_muted() })
+        .bg(if emphasized {
+            accent_muted()
+        } else {
+            bg_emphasis()
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .flex_shrink_0()
+        .text_size(px((size * 0.38).max(9.0)))
+        .font_family("Fira Code")
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(if emphasized { accent() } else { fg_emphasis() })
+        .child(login_monogram(login))
+}
+
+fn login_monogram(login: &str) -> String {
+    let mut monogram = login
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(2)
+        .collect::<String>()
+        .to_uppercase();
+    if monogram.is_empty() {
+        monogram.push('?');
+    }
+    monogram
+}
+
 pub fn badge_success(text: &str) -> impl IntoElement {
     div()
         .px(px(10.0))
@@ -1475,11 +1577,9 @@ fn pr_list_row(
 ) -> impl IntoElement {
     let title = item.title.clone();
     let repo_ref = format!("{} #{}", item.repository, item.number);
-    let meta = format!(
-        "{} \u{2022} updated {}",
-        item.author_login,
-        format_relative_time(&item.updated_at)
-    );
+    let author_login = item.author_login.clone();
+    let author_avatar_url = item.author_avatar_url.clone();
+    let meta = format!("updated {}", format_relative_time(&item.updated_at));
     let comments = item.comments_count;
     let changed_files = item.changed_files;
     let additions = item.additions;
@@ -1528,7 +1628,27 @@ fn pr_list_row(
                                 .line_clamp(2)
                                 .child(title),
                         )
-                        .child(div().text_size(px(12.0)).text_color(fg_muted()).child(meta))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .text_size(px(12.0))
+                                .text_color(fg_muted())
+                                .child(user_avatar(
+                                    &author_login,
+                                    author_avatar_url.as_deref(),
+                                    18.0,
+                                    false,
+                                ))
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(fg_emphasis())
+                                        .child(author_login),
+                                )
+                                .child(format!("\u{2022} {meta}")),
+                        )
                         .child(
                             div()
                                 .flex()
@@ -1672,11 +1792,12 @@ fn kanban_card(
         .last()
         .unwrap_or(&item.repository)
         .to_string();
+    let author_login = item.author_login.clone();
+    let author_avatar_url = item.author_avatar_url.clone();
     let meta = format!(
-        "{} #{} \u{00b7} {} \u{00b7} {}",
+        "{} #{} \u{00b7} {}",
         repo_label,
         item.number,
-        item.author_login,
         format_relative_time(&item.updated_at)
     );
     let additions = item.additions;
@@ -1725,10 +1846,33 @@ fn kanban_card(
                                 )
                                 .child(
                                     div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .min_w_0()
                                         .text_size(px(10.0))
                                         .font_family("Fira Code")
                                         .text_color(fg_muted())
-                                        .child(meta),
+                                        .child(user_avatar(
+                                            &author_login,
+                                            author_avatar_url.as_deref(),
+                                            16.0,
+                                            false,
+                                        ))
+                                        .child(
+                                            div()
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(fg_emphasis())
+                                                .child(author_login),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .text_ellipsis()
+                                                .whitespace_nowrap()
+                                                .overflow_x_hidden()
+                                                .child(format!("\u{00b7} {meta}")),
+                                        ),
                                 ),
                         )
                         .child(render_diff_summary(additions, deletions)),

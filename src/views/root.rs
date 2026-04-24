@@ -180,6 +180,7 @@ async fn maybe_bootstrap_debug_pull_request(
         number: detail.number,
         title: detail.title.clone(),
         author_login: detail.author_login.clone(),
+        author_avatar_url: detail.author_avatar_url.clone(),
         is_draft: detail.is_draft,
         comments_count: detail.comments_count,
         additions: detail.additions,

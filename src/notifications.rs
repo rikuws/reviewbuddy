@@ -453,6 +453,7 @@ mod tests {
         PullRequestReviewComment {
             id: id.to_string(),
             author_login: author_login.to_string(),
+            author_avatar_url: None,
             body: format!("body-{id}"),
             path: "src/main.rs".to_string(),
             line: Some(1),
@@ -503,6 +504,7 @@ mod tests {
             body: String::new(),
             url: "https://example.com/pr".to_string(),
             author_login: "author".to_string(),
+            author_avatar_url: None,
             state: "OPEN".to_string(),
             is_draft: false,
             review_decision: None,
@@ -519,6 +521,7 @@ mod tests {
             updated_at: "2026-04-24T10:00:00Z".to_string(),
             labels: Vec::new(),
             reviewers: Vec::new(),
+            reviewer_avatar_urls: std::collections::BTreeMap::new(),
             comments: Vec::new(),
             latest_reviews: Vec::new(),
             review_threads: vec![review_thread(comments)],

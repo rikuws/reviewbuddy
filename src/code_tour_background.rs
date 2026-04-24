@@ -211,6 +211,7 @@ mod tests {
             number,
             title: format!("PR {number}"),
             author_login: "octocat".to_string(),
+            author_avatar_url: None,
             is_draft: false,
             comments_count: 0,
             additions: 1,
