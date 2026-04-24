@@ -36,10 +36,11 @@ use cache::CacheStore;
 use platform_macos::apply_app_icon;
 use state::AppState;
 use views::{
-    blur_review_editor, close_palette, close_review_line_action, close_waypoint_spotlight,
-    execute_palette_selection, execute_waypoint_spotlight_selection, move_palette_selection,
-    move_waypoint_spotlight_selection, toggle_palette, toggle_waypoint_spotlight,
-    trigger_add_waypoint_shortcut, trigger_submit_inline_comment, trigger_submit_review, RootView,
+    blur_review_editor, close_palette, close_review_graph_overlay, close_review_line_action,
+    close_waypoint_spotlight, execute_palette_selection, execute_waypoint_spotlight_selection,
+    move_palette_selection, move_waypoint_spotlight_selection, toggle_palette,
+    toggle_waypoint_spotlight, trigger_add_waypoint_shortcut, trigger_submit_inline_comment,
+    trigger_submit_review, RootView,
 };
 
 fn main() {
@@ -121,6 +122,12 @@ fn main() {
                         }
                         _ => {}
                     }
+                    return;
+                }
+
+                let review_graph_expanded = app_state_for_keys.read(cx).review_graph_expanded;
+                if review_graph_expanded && keystroke.key == "escape" {
+                    close_review_graph_overlay(&app_state_for_keys, cx);
                     return;
                 }
 

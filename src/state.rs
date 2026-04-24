@@ -25,7 +25,7 @@ use crate::review_session::{
 use crate::semantic_diff::SemanticDiffFile;
 use crate::syntax::{self, SyntaxSpan};
 use crate::theme::{self, ThemePreference};
-use gpui::{px, ListAlignment, ListState, Pixels, Point, ScrollHandle, WindowAppearance};
+use gpui::{point, px, ListAlignment, ListState, Pixels, Point, ScrollHandle, WindowAppearance};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SectionId {
@@ -441,6 +441,11 @@ pub struct AppState {
     pub active_review_line_action: Option<ReviewLineActionTarget>,
     pub active_review_line_action_position: Option<Point<Pixels>>,
     pub review_line_action_mode: ReviewLineActionMode,
+    pub review_graph_expanded: bool,
+    pub review_graph_selected_node_id: Option<String>,
+    pub review_graph_pan_offset: Point<Pixels>,
+    pub review_graph_panning: bool,
+    pub review_graph_last_pan_position: Option<Point<Pixels>>,
     pub inline_comment_draft: String,
     pub inline_comment_loading: bool,
     pub inline_comment_error: Option<String>,
@@ -519,6 +524,11 @@ impl AppState {
             active_review_line_action: None,
             active_review_line_action_position: None,
             review_line_action_mode: ReviewLineActionMode::Menu,
+            review_graph_expanded: false,
+            review_graph_selected_node_id: None,
+            review_graph_pan_offset: point(px(0.0), px(0.0)),
+            review_graph_panning: false,
+            review_graph_last_pan_position: None,
             inline_comment_draft: String::new(),
             inline_comment_loading: false,
             inline_comment_error: None,
