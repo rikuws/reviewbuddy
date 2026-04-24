@@ -3,27 +3,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::prelude::*;
 use gpui::{
-    canvas, div, fill, linear_color_stop, linear_gradient, point, px, size, Background, Bounds,
+    canvas, div, fill, linear_color_stop, linear_gradient, point, px, Background, Bounds,
     ColorSpace, IntoElement, PathBuilder, Pixels, Point, Rgba, Window,
 };
 
 use crate::theme::bg_canvas;
 
 const PERIOD_SECONDS: f32 = 5.0;
-const MESH_CELL_SIZE: f32 = 4.0;
 pub(super) const WELCOME_SHADER_RADIUS: f32 = 8.0;
-
-#[derive(Clone, Copy)]
-struct MeshStop {
-    color: Rgba,
-    base: (f32, f32),
-    drift: (f32, f32),
-    radius: f32,
-    strength: f32,
-    phase: f32,
-    // Integer phase harmonic. Non-integer values make the mesh jump at the loop boundary.
-    speed: f32,
-}
 
 pub(super) fn render_welcome_shader() -> impl IntoElement {
     div()
@@ -58,174 +45,56 @@ fn paint_welcome_mesh_gradient(bounds: Bounds<Pixels>, time: f32, window: &mut W
 
     let phase = (time / PERIOD_SECONDS).fract();
     let t = phase * TAU;
-    let aspect = w / h.max(1.0);
-    let stops = mesh_stops();
-    let cell = MESH_CELL_SIZE;
-    let cols = (w / cell).ceil() as usize;
-    let rows = (h / cell).ceil() as usize;
 
-    for row in 0..rows {
-        let y = row as f32 * cell;
-        let cell_h = (h - y).min(cell) + 0.75;
-        for col in 0..cols {
-            let x = col as f32 * cell;
-            let cell_w = (w - x).min(cell) + 0.75;
-            let u = (x + cell_w * 0.5) / w;
-            let v = (y + cell_h * 0.5) / h;
-
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(bounds.origin.x + px(x), bounds.origin.y + px(y)),
-                    size(px(cell_w), px(cell_h)),
-                ),
-                sample_mesh(u, v, aspect, t, &stops),
-            ));
-        }
-    }
+    window.paint_quad(fill(bounds, rgba_hex(0x02040a, 0xff)));
+    paint_gradient_layer(
+        bounds,
+        34.0 + 8.0 * t.sin(),
+        rgba_hex(0xff5b24, 0x96),
+        rgba_hex(0xff5b24, 0x00),
+        window,
+    );
+    paint_gradient_layer(
+        bounds,
+        142.0 + 12.0 * (t * 0.8 + 1.3).cos(),
+        rgba_hex(0x73a8c5, 0xa0),
+        rgba_hex(0x203a78, 0x08),
+        window,
+    );
+    paint_gradient_layer(
+        bounds,
+        228.0 + 10.0 * (t * 1.1 + 0.7).sin(),
+        rgba_hex(0xf3eee0, 0x72),
+        rgba_hex(0x08172c, 0x00),
+        window,
+    );
+    paint_gradient_layer(
+        bounds,
+        312.0 + 14.0 * (t * 0.6 + 2.2).cos(),
+        rgba_hex(0x203a78, 0xb0),
+        rgba_hex(0x000105, 0x18),
+        window,
+    );
+    paint_gradient_layer(
+        bounds,
+        82.0 + 8.0 * (t * 1.2 + 3.1).sin(),
+        rgba_hex(0x7a2419, 0x54),
+        rgba_hex(0x000105, 0x00),
+        window,
+    );
 
     paint_mesh_finish(bounds, window);
     paint_corner_masks(bounds, WELCOME_SHADER_RADIUS, window);
 }
 
-fn mesh_stops() -> [MeshStop; 8] {
-    [
-        MeshStop {
-            color: rgba_hex(0x02040a, 0xff),
-            base: (-0.10, 0.02),
-            drift: (0.06, 0.05),
-            radius: 0.72,
-            strength: 1.65,
-            phase: 0.2,
-            speed: 1.0,
-        },
-        MeshStop {
-            color: rgba_hex(0x08172c, 0xff),
-            base: (0.15, 0.56),
-            drift: (0.12, 0.15),
-            radius: 0.48,
-            strength: 1.20,
-            phase: 1.3,
-            speed: 2.0,
-        },
-        MeshStop {
-            color: rgba_hex(0x203a78, 0xff),
-            base: (0.42, 0.48),
-            drift: (0.18, 0.12),
-            radius: 0.36,
-            strength: 1.05,
-            phase: 3.9,
-            speed: 1.0,
-        },
-        MeshStop {
-            color: rgba_hex(0x73a8c5, 0xff),
-            base: (0.72, 0.78),
-            drift: (0.16, 0.10),
-            radius: 0.30,
-            strength: 0.86,
-            phase: 4.7,
-            speed: 2.0,
-        },
-        MeshStop {
-            color: rgba_hex(0xf3eee0, 0xff),
-            base: (0.38, 0.90),
-            drift: (0.18, 0.08),
-            radius: 0.28,
-            strength: 1.28,
-            phase: 2.6,
-            speed: 1.0,
-        },
-        MeshStop {
-            color: rgba_hex(0xff5b24, 0xff),
-            base: (0.93, 0.10),
-            drift: (0.20, 0.12),
-            radius: 0.44,
-            strength: 1.35,
-            phase: 0.8,
-            speed: 2.0,
-        },
-        MeshStop {
-            color: rgba_hex(0x7a2419, 0xff),
-            base: (0.72, 0.28),
-            drift: (0.20, 0.18),
-            radius: 0.38,
-            strength: 1.08,
-            phase: 5.4,
-            speed: 3.0,
-        },
-        MeshStop {
-            color: rgba_hex(0x000105, 0xff),
-            base: (1.02, 0.58),
-            drift: (0.08, 0.14),
-            radius: 0.50,
-            strength: 1.42,
-            phase: 3.1,
-            speed: 1.0,
-        },
-    ]
-}
-
-fn sample_mesh(u: f32, v: f32, aspect: f32, t: f32, stops: &[MeshStop]) -> Rgba {
-    let (u, v) = domain_warp(u, v, t);
-    let mut r = 0.012;
-    let mut g = 0.016;
-    let mut b = 0.027;
-    let mut total = 0.62;
-
-    for stop in stops {
-        let (su, sv) = stop_position(*stop, t);
-        let dx = (u - su) * aspect;
-        let dy = v - sv;
-        let dist2 = dx * dx + dy * dy;
-        let radius2 = stop.radius * stop.radius;
-        let weight = stop.strength * (-dist2 / radius2).exp();
-
-        r += stop.color.r * weight;
-        g += stop.color.g * weight;
-        b += stop.color.b * weight;
-        total += weight;
-    }
-
-    r /= total;
-    g /= total;
-    b /= total;
-
-    let shade = 1.0 - 0.72 * vignette(u, v);
-    let light_sweep = 0.07 * (u * 8.0 - v * 5.2 + t).sin().max(0.0);
-    let grain = (hash_noise(u, v) - 0.5) * 0.006;
-
-    Rgba {
-        r: (r * shade + light_sweep + grain).clamp(0.0, 1.0),
-        g: (g * shade + light_sweep * 0.92 + grain).clamp(0.0, 1.0),
-        b: (b * shade + light_sweep * 0.75 + grain).clamp(0.0, 1.0),
-        a: 1.0,
-    }
-}
-
-fn domain_warp(u: f32, v: f32, t: f32) -> (f32, f32) {
-    let x = u + 0.035 * (v * 5.0 + t).sin() + 0.020 * ((u + v) * 7.0 - t * 2.0).sin();
-    let y = v + 0.030 * (u * 4.5 - t).cos() + 0.018 * ((u - v) * 8.0 + t * 2.0).sin();
-    (x, y)
-}
-
-fn stop_position(stop: MeshStop, t: f32) -> (f32, f32) {
-    let x = stop.base.0
-        + stop.drift.0 * (t * stop.speed + stop.phase).sin()
-        + stop.drift.0 * 0.38 * (t * (stop.speed + 1.0) - stop.phase).cos();
-    let y = stop.base.1
-        + stop.drift.1 * (t * stop.speed + stop.phase * 1.37).cos()
-        + stop.drift.1 * 0.33 * (t * (stop.speed + 2.0) + stop.phase).sin();
-    (x, y)
-}
-
-fn vignette(u: f32, v: f32) -> f32 {
-    let dx = (u - 0.50).abs() * 1.55;
-    let dy = (v - 0.50).abs() * 1.20;
-    (dx * dx + dy * dy).clamp(0.0, 1.0)
-}
-
-fn hash_noise(u: f32, v: f32) -> f32 {
-    let seed = (u * 231.17 + v * 417.31).sin() * 43_758.547;
-    seed.fract().abs()
+fn paint_gradient_layer(
+    bounds: Bounds<Pixels>,
+    angle: f32,
+    from: Rgba,
+    to: Rgba,
+    window: &mut Window,
+) {
+    window.paint_quad(fill(bounds, gradient(angle.rem_euclid(360.0), from, to)));
 }
 
 fn paint_mesh_finish(bounds: Bounds<Pixels>, window: &mut Window) {

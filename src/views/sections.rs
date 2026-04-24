@@ -80,8 +80,7 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .flex_grow()
         .min_h_0()
         .h_full()
-        .id("overview-scroll")
-        .overflow_y_scroll()
+        .overflow_hidden()
         .child(overview_ambient_strip(
             welcome_greeting,
             workspace_syncing,
@@ -98,88 +97,100 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         ))
         .child(
             div()
-                .w_full()
+                .id("overview-scroll")
                 .flex()
-                .flex_wrap()
-                .gap(px(12.0))
-                .child(overview_metric_card(
-                    OVERVIEW_OPEN_PULL_REQUESTS_ASSET,
-                    "Open Pull Requests",
-                    open_tab_count,
-                    first_open_tab.is_some(),
-                    {
-                        let state = state_for_open_pull_requests.clone();
-                        let summary = first_open_tab.clone();
-                        move |_, window, cx| {
-                            if let Some(summary) = summary.clone() {
-                                open_pull_request(&state, summary, window, cx);
-                            }
-                        }
-                    },
-                ))
-                .child(overview_metric_card(
-                    OVERVIEW_MY_PULL_REQUESTS_ASSET,
-                    "My Pull Requests",
-                    authored_count,
-                    is_auth,
-                    {
-                        let state = state_for_authored.clone();
-                        move |_, _, cx| {
-                            activate_queue(&state, SectionId::Pulls, "authored", cx);
-                        }
-                    },
-                ))
-                .child(overview_metric_card(
-                    OVERVIEW_REVIEW_REQUESTS_ASSET,
-                    "Review Requests",
-                    review_count,
-                    is_auth,
-                    {
-                        let state = state_for_review_requests.clone();
-                        move |_, _, cx| {
-                            activate_queue(&state, SectionId::Reviews, "reviewRequested", cx);
-                        }
-                    },
-                )),
-        )
-        .when(show_empty_state, |el| {
-            el.child(overview_empty_state_panel(move |_, window, cx| {
-                trigger_sync_workspace(&state_for_empty_sync, window, cx);
-            }))
-        })
-        .when(!show_empty_state, |el| {
-            el.child(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .items_start()
-                    .gap(px(18.0))
-                    .child(div().flex_1().min_w(px(480.0)).child(
-                        overview_review_comment_briefing_panel(
-                            review_comment_items.clone(),
-                            workspace_loading,
-                            workspace_error.clone(),
+                .flex_col()
+                .gap(px(18.0))
+                .flex_grow()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .gap(px(12.0))
+                        .child(overview_metric_card(
+                            OVERVIEW_OPEN_PULL_REQUESTS_ASSET,
+                            "Open Pull Requests",
+                            open_tab_count,
+                            first_open_tab.is_some(),
+                            {
+                                let state = state_for_open_pull_requests.clone();
+                                let summary = first_open_tab.clone();
+                                move |_, window, cx| {
+                                    if let Some(summary) = summary.clone() {
+                                        open_pull_request(&state, summary, window, cx);
+                                    }
+                                }
+                            },
+                        ))
+                        .child(overview_metric_card(
+                            OVERVIEW_MY_PULL_REQUESTS_ASSET,
+                            "My Pull Requests",
+                            authored_count,
                             is_auth,
-                            state_for_comment_items.clone(),
-                        ),
-                    ))
-                    .child(
+                            {
+                                let state = state_for_authored.clone();
+                                move |_, _, cx| {
+                                    activate_queue(&state, SectionId::Pulls, "authored", cx);
+                                }
+                            },
+                        ))
+                        .child(overview_metric_card(
+                            OVERVIEW_REVIEW_REQUESTS_ASSET,
+                            "Review Requests",
+                            review_count,
+                            is_auth,
+                            {
+                                let state = state_for_review_requests.clone();
+                                move |_, _, cx| {
+                                    activate_queue(
+                                        &state,
+                                        SectionId::Reviews,
+                                        "reviewRequested",
+                                        cx,
+                                    );
+                                }
+                            },
+                        )),
+                )
+                .when(show_empty_state, |el| {
+                    el.child(overview_empty_state_panel(move |_, window, cx| {
+                        trigger_sync_workspace(&state_for_empty_sync, window, cx);
+                    }))
+                })
+                .when(!show_empty_state, |el| {
+                    el.child(
                         div()
-                            .flex_1()
-                            .min_w(px(380.0))
-                            .child(overview_review_requests_panel(
-                                review_items,
-                                review_count,
-                                queue_copy,
-                                workspace_loading,
-                                workspace_error.clone(),
-                                is_auth,
-                                state_for_items.clone(),
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .items_start()
+                            .gap(px(18.0))
+                            .child(div().flex_1().min_w(px(480.0)).child(
+                                overview_review_comment_briefing_panel(
+                                    review_comment_items.clone(),
+                                    workspace_loading,
+                                    workspace_error.clone(),
+                                    is_auth,
+                                    state_for_comment_items.clone(),
+                                ),
+                            ))
+                            .child(div().flex_1().min_w(px(380.0)).child(
+                                overview_review_requests_panel(
+                                    review_items,
+                                    review_count,
+                                    queue_copy,
+                                    workspace_loading,
+                                    workspace_error.clone(),
+                                    is_auth,
+                                    state_for_items.clone(),
+                                ),
                             )),
-                    ),
-            )
-        })
+                    )
+                }),
+        )
 }
 
 #[derive(Clone)]
@@ -205,6 +216,7 @@ fn overview_ambient_strip(
         .relative()
         .w_full()
         .h(px(112.0))
+        .flex_shrink_0()
         .rounded(px(WELCOME_SHADER_RADIUS))
         .overflow_hidden()
         .child(render_welcome_shader())
