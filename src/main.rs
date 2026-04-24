@@ -1,5 +1,6 @@
 mod agents;
 mod app_assets;
+mod app_http;
 mod app_storage;
 mod cache;
 mod code_display;
@@ -28,9 +29,12 @@ mod syntax;
 mod theme;
 mod views;
 
+use std::sync::Arc;
+
 use gpui::*;
 
 use app_assets::{load_bundled_fonts, AppAssets};
+use app_http::UreqHttpClient;
 use app_storage::cache_path;
 use cache::CacheStore;
 use platform_macos::apply_app_icon;
@@ -46,6 +50,7 @@ use views::{
 fn main() {
     Application::new()
         .with_assets(AppAssets::new())
+        .with_http_client(Arc::new(UreqHttpClient::new()))
         .run(|cx: &mut App| {
             apply_app_icon();
             let bundled_fonts = load_bundled_fonts().expect("Failed to load bundled fonts");
