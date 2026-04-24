@@ -14,7 +14,6 @@ use crate::{
 };
 
 const MAX_CHANGED_DEPENDENCY_NEIGHBORS: usize = 16;
-const MAX_EXTERNAL_NEIGHBORS: usize = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReviewGraphNodeKind {
@@ -36,7 +35,7 @@ impl ReviewGraphNodeKind {
             Self::Method => "method",
             Self::Type => "type",
             Self::Module => "module",
-            Self::Data => "data",
+            Self::Data => "variable",
             Self::Branch => "branch",
             Self::Unknown => "symbol",
         }
@@ -192,7 +191,7 @@ pub fn build_review_symbol_graph(
         .iter()
         .filter(|candidate| {
             candidate.path == selected_file_path
-                && is_dependency_symbol_kind(candidate.descriptor.kind)
+                && is_review_graph_symbol_kind(candidate.descriptor.kind)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -230,7 +229,7 @@ pub fn build_review_symbol_graph(
             let Some(target_term) = target.descriptor.term.as_deref() else {
                 continue;
             };
-            if !is_dependency_symbol_kind(target.descriptor.kind) {
+            if !is_review_graph_symbol_kind(target.descriptor.kind) {
                 continue;
             }
             if !candidate_mentions(source, target_term) {
@@ -268,7 +267,7 @@ pub fn build_review_symbol_graph(
             let Some(target_term) = target.descriptor.term.as_deref() else {
                 continue;
             };
-            if !is_dependency_symbol_kind(source.descriptor.kind) {
+            if !is_review_graph_symbol_kind(source.descriptor.kind) {
                 continue;
             }
             if !candidate_mentions(source, target_term) {
@@ -303,7 +302,6 @@ pub fn build_review_symbol_graph(
         (lsp_details, trace_candidate, trace_term.as_deref())
     {
         attach_lsp_neighbors(
-            detail,
             trace_candidate,
             trace_term,
             lsp_details,
@@ -317,7 +315,7 @@ pub fn build_review_symbol_graph(
         .values()
         .filter(|node| {
             node.kind != ReviewGraphNodeKind::File
-                && is_dependency_symbol_kind(node.kind)
+                && is_review_graph_symbol_kind(node.kind)
                 && node.subtitle == selected_file_path
         })
         .count();
@@ -353,22 +351,22 @@ pub fn build_review_symbol_graph(
         impacted_count,
     ) {
         (0, _, _, _) => format!(
-            "{} has no callable or reusable symbols available. The graph only shows functions, methods, types, modules, and data symbols.",
+            "{} has no function or variable symbols available. The graph only shows functions, methods, and variables.",
             file_name(selected_file_path)
         ),
         (_, _, 0, 0) => format!(
-            "{file_symbol_count} reusable symbol{} in this file; {changed_file_symbol_count} changed. Edges show direct calls and uses inferred from symbol bodies.",
+            "{file_symbol_count} function/variable symbol{} in this file; {changed_file_symbol_count} changed. Edges show direct calls and variable uses inferred from symbol bodies.",
             if file_symbol_count == 1 { "" } else { "s" }
         ),
         (_, _, _, 0) => format!(
-            "{file_symbol_count} reusable symbol{} in this file; {changed_file_symbol_count} changed, plus {changed_dependency_count} changed one-hop dependenc{} in the PR.",
+            "{file_symbol_count} function/variable symbol{} in this file; {changed_file_symbol_count} changed, plus {changed_dependency_count} changed one-hop call/dependency target{} in the PR.",
             if file_symbol_count == 1 { "" } else { "s" },
-            if changed_dependency_count == 1 { "y" } else { "ies" }
+            if changed_dependency_count == 1 { "" } else { "s" }
         ),
         _ => format!(
-            "{file_symbol_count} reusable symbol{} in this file; {changed_file_symbol_count} changed, plus {changed_dependency_count} changed PR dependenc{} and {impacted_count} source neighbor{}.",
+            "{file_symbol_count} function/variable symbol{} in this file; {changed_file_symbol_count} changed, plus {changed_dependency_count} changed PR target{} and {impacted_count} source call site{}.",
             if file_symbol_count == 1 { "" } else { "s" },
-            if changed_dependency_count == 1 { "y" } else { "ies" },
+            if changed_dependency_count == 1 { "" } else { "s" },
             if impacted_count == 1 { "" } else { "s" }
         ),
     };
@@ -450,14 +448,10 @@ fn insert_changed_dependency_node(
     true
 }
 
-fn is_dependency_symbol_kind(kind: ReviewGraphNodeKind) -> bool {
+fn is_review_graph_symbol_kind(kind: ReviewGraphNodeKind) -> bool {
     matches!(
         kind,
-        ReviewGraphNodeKind::Function
-            | ReviewGraphNodeKind::Method
-            | ReviewGraphNodeKind::Type
-            | ReviewGraphNodeKind::Module
-            | ReviewGraphNodeKind::Data
+        ReviewGraphNodeKind::Function | ReviewGraphNodeKind::Method | ReviewGraphNodeKind::Data
     )
 }
 
@@ -621,45 +615,7 @@ pub fn load_symbol_evolution_timeline(
     })
 }
 
-pub fn review_location_for_reference(
-    detail: &PullRequestDetail,
-    target: &LspReferenceTarget,
-) -> ReviewLocation {
-    let hunk_header = find_parsed_diff_file(&detail.parsed_diff, &target.path).and_then(|parsed| {
-        parsed.hunks.iter().find_map(|hunk| {
-            hunk.lines
-                .iter()
-                .any(|line| {
-                    line.right_line_number == Some(target.line as i64)
-                        || line.left_line_number == Some(target.line as i64)
-                })
-                .then(|| hunk.header.clone())
-        })
-    });
-
-    let is_changed = detail.files.iter().any(|file| file.path == target.path);
-    if is_changed {
-        ReviewLocation::from_diff(
-            target.path.clone(),
-            Some(DiffAnchor {
-                file_path: target.path.clone(),
-                hunk_header,
-                line: Some(target.line as i64),
-                side: None,
-                thread_id: None,
-            }),
-        )
-    } else {
-        ReviewLocation::from_source(
-            target.path.clone(),
-            Some(target.line),
-            Some("Impacted neighbor".to_string()),
-        )
-    }
-}
-
 fn attach_lsp_neighbors(
-    detail: &PullRequestDetail,
     focus_candidate: &GraphSectionCandidate,
     focus_term: &str,
     lsp_details: &LspSymbolDetails,
@@ -668,107 +624,63 @@ fn attach_lsp_neighbors(
     edges: &mut BTreeSet<(String, String, ReviewGraphEdgeKind)>,
 ) {
     for target in lsp_details.definition_targets.iter().take(2) {
-        let location = review_location_for_reference(detail, target);
-        let node_id = location.stable_key();
-        let in_diff = detail.files.iter().any(|file| file.path == target.path);
-        if node_id == focus_candidate.location.stable_key() {
+        let Some(candidate) = candidate_for_reference(candidates, target)
+            .filter(|candidate| is_review_graph_symbol_kind(candidate.descriptor.kind))
+        else {
+            continue;
+        };
+        if candidate.id == focus_candidate.id {
             continue;
         }
 
-        nodes
-            .entry(node_id.clone())
-            .or_insert_with(|| ReviewSymbolGraphNode {
-                id: node_id.clone(),
-                label: if in_diff {
-                    display_changed_reference_label(candidates, target)
-                } else {
-                    format!("definition line {}", target.line)
-                },
-                subtitle: format!("{}:{}", target.path, target.line),
-                kind: if in_diff {
-                    candidate_kind_for_reference(candidates, target)
-                } else {
-                    ReviewGraphNodeKind::Unknown
-                },
-                state: if in_diff {
-                    ReviewGraphNodeState::Modified
-                } else {
-                    ReviewGraphNodeState::Impacted
-                },
-                location,
-                in_diff,
-            });
+        insert_candidate_node(
+            nodes,
+            candidate,
+            if candidate.changed {
+                ReviewGraphNodeState::Modified
+            } else {
+                ReviewGraphNodeState::Impacted
+            },
+            candidate.changed,
+        );
         edges.insert((
             focus_candidate.id.clone(),
-            node_id,
+            candidate.id.clone(),
             ReviewGraphEdgeKind::Defines,
         ));
     }
 
-    let mut external_neighbors = 0usize;
     for target in &lsp_details.reference_targets {
-        let location = review_location_for_reference(detail, target);
-        let node_id = if let Some(candidate) = candidate_for_reference(candidates, target) {
-            candidate.id.clone()
-        } else {
-            location.stable_key()
+        let Some(candidate) = candidate_for_reference(candidates, target)
+            .filter(|candidate| is_review_graph_symbol_kind(candidate.descriptor.kind))
+        else {
+            continue;
         };
 
-        if node_id == focus_candidate.id {
+        if candidate.id == focus_candidate.id {
             continue;
         }
 
-        let in_diff = detail.files.iter().any(|file| file.path == target.path);
-        if !in_diff && external_neighbors >= MAX_EXTERNAL_NEIGHBORS {
-            continue;
-        }
-
-        if !in_diff {
-            external_neighbors += 1;
-        }
-
-        nodes.entry(node_id.clone()).or_insert_with(|| {
-            if let Some(candidate) = candidate_for_reference(candidates, target) {
-                ReviewSymbolGraphNode {
-                    id: candidate.id.clone(),
-                    label: candidate.descriptor.label.clone(),
-                    subtitle: candidate.path.clone(),
-                    kind: candidate.descriptor.kind,
-                    state: ReviewGraphNodeState::Modified,
-                    location: candidate.location.clone(),
-                    in_diff: true,
-                }
+        insert_candidate_node(
+            nodes,
+            candidate,
+            if candidate.changed {
+                ReviewGraphNodeState::Modified
             } else {
-                ReviewSymbolGraphNode {
-                    id: node_id.clone(),
-                    label: if in_diff {
-                        format!("changed reference line {}", target.line)
-                    } else {
-                        format!("reference line {}", target.line)
-                    },
-                    subtitle: format!("{}:{}", target.path, target.line),
-                    kind: ReviewGraphNodeKind::Unknown,
-                    state: ReviewGraphNodeState::Impacted,
-                    location,
-                    in_diff,
-                }
-            }
-        });
+                ReviewGraphNodeState::Impacted
+            },
+            candidate.changed,
+        );
 
-        let edge_kind = if in_diff {
-            ReviewGraphEdgeKind::Calls
-        } else {
-            ReviewGraphEdgeKind::Uses
-        };
-        if mentions_reference_target(target, focus_term) {
-            edges.insert((node_id, focus_candidate.id.clone(), edge_kind));
-        } else {
-            edges.insert((
-                node_id,
-                focus_candidate.id.clone(),
-                ReviewGraphEdgeKind::Uses,
-            ));
-        }
+        edges.insert((
+            candidate.id.clone(),
+            focus_candidate.id.clone(),
+            infer_edge_kind(
+                candidate_dependency_lines(candidate),
+                focus_term,
+                focus_candidate.descriptor.kind,
+            ),
+        ));
     }
 }
 
@@ -831,8 +743,12 @@ fn build_file_symbol_candidates(
         .iter()
         .enumerate()
         .filter_map(|(index, line)| {
-            extract_symbol_descriptor(line).and_then(|descriptor| {
-                is_dependency_symbol_kind(descriptor.kind).then_some((index + 1, line, descriptor))
+            extract_symbol_descriptor_from_source_line(line).and_then(|descriptor| {
+                is_review_graph_symbol_kind(descriptor.kind).then_some((
+                    index + 1,
+                    line,
+                    descriptor,
+                ))
             })
         })
         .collect::<Vec<_>>();
@@ -890,7 +806,16 @@ fn extract_symbol_descriptor_from_changed_lines(
 ) -> Option<SymbolDescriptor> {
     section_changed_lines(section, parsed_file)
         .iter()
-        .find_map(|line| extract_symbol_descriptor(line))
+        .find_map(|line| extract_symbol_descriptor_from_source_line(line))
+}
+
+fn extract_symbol_descriptor_from_source_line(line: &str) -> Option<SymbolDescriptor> {
+    let descriptor = extract_symbol_descriptor(line)?;
+    if descriptor.kind == ReviewGraphNodeKind::Data && source_line_indent(line) > 0 {
+        return None;
+    }
+
+    Some(descriptor)
 }
 
 fn extract_symbol_descriptor(title: &str) -> Option<SymbolDescriptor> {
@@ -961,6 +886,13 @@ fn extract_symbol_descriptor(title: &str) -> Option<SymbolDescriptor> {
     }
 
     None
+}
+
+fn source_line_indent(line: &str) -> usize {
+    line.chars()
+        .take_while(|ch| ch.is_ascii_whitespace())
+        .map(|ch| if ch == '\t' { 4 } else { 1 })
+        .sum()
 }
 
 fn strip_line_comment(value: &str) -> &str {
@@ -1297,31 +1229,6 @@ fn candidate_for_reference<'a>(
         })
 }
 
-fn candidate_kind_for_reference(
-    candidates: &[GraphSectionCandidate],
-    target: &LspReferenceTarget,
-) -> ReviewGraphNodeKind {
-    candidate_for_reference(candidates, target)
-        .map(|candidate| candidate.descriptor.kind)
-        .unwrap_or(ReviewGraphNodeKind::Unknown)
-}
-
-fn display_changed_reference_label(
-    candidates: &[GraphSectionCandidate],
-    target: &LspReferenceTarget,
-) -> String {
-    candidate_for_reference(candidates, target)
-        .map(|candidate| candidate.descriptor.label.clone())
-        .unwrap_or_else(|| file_name(&target.path))
-}
-
-fn mentions_reference_target(target: &LspReferenceTarget, focus_term: &str) -> bool {
-    target
-        .path
-        .split('/')
-        .any(|segment| token_matches_term(segment, focus_term))
-}
-
 fn classify_evolution_entry(patch: &str, focus_term: Option<&str>, touches_focus: bool) -> String {
     let Some(focus_term) = focus_term else {
         return "file diff".to_string();
@@ -1403,6 +1310,7 @@ mod tests {
     use crate::{
         diff::parse_unified_diff,
         github::{PullRequestDetail, PullRequestFile},
+        lsp::{LspDefinitionTarget, LspSymbolDetails},
     };
 
     #[test]
@@ -1490,6 +1398,107 @@ pub fn validate_order(order: Order) {
         );
     }
 
+    #[test]
+    fn limits_graph_nodes_to_functions_methods_and_variables() {
+        let raw_diff = r#"diff --git a/src/orders.rs b/src/orders.rs
+index 1111111..2222222 100644
+--- a/src/orders.rs
++++ b/src/orders.rs
+@@ -1,9 +1,11 @@
+ struct Order;
+ const TAX_RATE: f32 = 0.2;
+ pub fn place_order(order: Order) {
++    let local_total = TAX_RATE;
++    apply_tax(local_total);
+ }
+ pub fn apply_tax(total: f32) -> f32 {
+     total
+ }
+"#;
+        let detail = detail_with_diff(raw_diff);
+        let selected_file_text = r#"struct Order;
+const TAX_RATE: f32 = 0.2;
+
+pub fn place_order(order: Order) {
+    let local_total = TAX_RATE;
+    apply_tax(local_total);
+}
+
+pub fn apply_tax(total: f32) -> f32 {
+    total
+}
+"#;
+
+        let graph = build_review_symbol_graph(
+            &detail,
+            "src/orders.rs",
+            Some(selected_file_text),
+            None,
+            None,
+            None,
+        );
+
+        assert_node(&graph, "TAX_RATE", false);
+        assert_node(&graph, "place_order", true);
+        assert_node(&graph, "apply_tax", false);
+        assert_no_node(&graph, "Order");
+        assert_no_node(&graph, "local_total");
+        assert!(
+            graph.nodes.iter().all(|node| matches!(
+                node.kind,
+                ReviewGraphNodeKind::Function
+                    | ReviewGraphNodeKind::Method
+                    | ReviewGraphNodeKind::Data
+            )),
+            "graph should only contain function, method, and variable nodes"
+        );
+    }
+
+    #[test]
+    fn lsp_references_do_not_create_line_nodes() {
+        let raw_diff = r#"diff --git a/src/orders.rs b/src/orders.rs
+index 1111111..2222222 100644
+--- a/src/orders.rs
++++ b/src/orders.rs
+@@ -1,3 +1,4 @@ pub fn place_order(order: Order) {
+ pub fn place_order(order: Order) {
++    validate_order(order);
+ }
+"#;
+        let detail = detail_with_diff(raw_diff);
+        let selected_file_text = r#"pub fn place_order(order: Order) {
+    validate_order(order);
+}
+"#;
+        let lsp_details = LspSymbolDetails {
+            reference_targets: vec![LspDefinitionTarget {
+                uri: "file:///repo/src/external.rs".to_string(),
+                path: "src/external.rs".to_string(),
+                line: 42,
+                column: 8,
+            }],
+            ..LspSymbolDetails::default()
+        };
+
+        let graph = build_review_symbol_graph(
+            &detail,
+            "src/orders.rs",
+            Some(selected_file_text),
+            None,
+            Some("place_order"),
+            Some(&lsp_details),
+        );
+
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| node.kind != ReviewGraphNodeKind::Unknown),
+            "LSP references should be mapped to symbol nodes or omitted"
+        );
+        assert_no_node(&graph, "reference line 42");
+    }
+
     fn assert_node(graph: &ReviewSymbolGraph, label: &str, in_diff: bool) {
         let node = graph
             .nodes
@@ -1497,6 +1506,13 @@ pub fn validate_order(order: Order) {
             .find(|node| node.label == label)
             .unwrap_or_else(|| panic!("missing node {label}"));
         assert_eq!(node.in_diff, in_diff);
+    }
+
+    fn assert_no_node(graph: &ReviewSymbolGraph, label: &str) {
+        assert!(
+            graph.nodes.iter().all(|node| node.label != label),
+            "unexpected node {label}"
+        );
     }
 
     fn assert_focus_node(graph: &ReviewSymbolGraph, label: &str) {

@@ -3595,7 +3595,7 @@ fn render_review_graph_preview_panel(
                                 .text_size(px(10.0))
                                 .font_family("Fira Code")
                                 .text_color(fg_subtle())
-                                .child("FILE GRAPH"),
+                                .child("SYMBOL GRAPH"),
                         )
                         .child(
                             div()
@@ -3621,6 +3621,7 @@ fn render_review_graph_preview_panel(
                                     state.review_graph_expanded = true;
                                     state.review_graph_selected_node_id = selected_node_id.clone();
                                     state.review_graph_pan_offset = point(px(0.0), px(0.0));
+                                    state.review_graph_zoom = 1.0;
                                     state.review_graph_panning = false;
                                     state.review_graph_last_pan_position = None;
                                     state.set_review_inspector_mode(ReviewInspectorMode::Graph);
@@ -3688,6 +3689,7 @@ fn render_review_graph_preview_panel(
                         state.review_graph_expanded = true;
                         state.review_graph_selected_node_id = selected_node_id.clone();
                         state.review_graph_pan_offset = point(px(0.0), px(0.0));
+                        state.review_graph_zoom = 1.0;
                         state.review_graph_panning = false;
                         state.review_graph_last_pan_position = None;
                         state.set_review_inspector_mode(ReviewInspectorMode::Graph);
@@ -3707,7 +3709,7 @@ fn render_review_graph_preview_panel(
                     .mt(px(10.0))
                     .text_size(px(12.0))
                     .text_color(fg_muted())
-                    .child("Tracing symbol dependencies..."),
+                    .child("Tracing call sites and dependencies..."),
             )
         })
         .when_some(error, |el, error| {
@@ -3851,10 +3853,11 @@ fn render_review_graph_expanded_panel(
         .clone()
         .or_else(|| graph.focus_node_id.clone())
         .or_else(|| graph.nodes.first().map(|node| node.id.clone()));
-    let (pan_offset, panning) = {
+    let (pan_offset, zoom, panning) = {
         let app_state = state.read(cx);
         (
             app_state.review_graph_pan_offset,
+            app_state.review_graph_zoom,
             app_state.review_graph_panning,
         )
     };
@@ -3886,7 +3889,7 @@ fn render_review_graph_expanded_panel(
                                 .text_size(px(10.0))
                                 .font_family("Fira Code")
                                 .text_color(fg_subtle())
-                                .child("FILE DEPENDENCY GRAPH"),
+                                .child("FUNCTION / VARIABLE GRAPH"),
                         )
                         .child(
                             div()
@@ -3924,6 +3927,7 @@ fn render_review_graph_expanded_panel(
                         .child(ghost_button("Reset view", move |_, _, cx| {
                             state_for_reset_pan.update(cx, |state, cx| {
                                 state.review_graph_pan_offset = point(px(0.0), px(0.0));
+                                state.review_graph_zoom = 1.0;
                                 state.review_graph_panning = false;
                                 state.review_graph_last_pan_position = None;
                                 cx.notify();
@@ -3976,6 +3980,7 @@ fn render_review_graph_expanded_panel(
                             ReviewGraphCanvasMode::Expanded {
                                 selected_node_id: selected_node_id.clone(),
                                 pan_offset,
+                                zoom,
                                 panning,
                             },
                         )),
@@ -3994,12 +3999,93 @@ fn render_review_graph_expanded_panel(
         )
 }
 
+fn render_review_graph_zoom_controls(state: &Entity<AppState>, zoom: f32) -> impl IntoElement {
+    div()
+        .absolute()
+        .right(px(12.0))
+        .bottom(px(12.0))
+        .px(px(6.0))
+        .py(px(6.0))
+        .rounded(radius_sm())
+        .border_1()
+        .border_color(border_muted())
+        .bg(bg_overlay())
+        .shadow_sm()
+        .flex()
+        .items_center()
+        .gap(px(4.0))
+        .child(review_graph_zoom_button("-", "Zoom out", {
+            let state = state.clone();
+            move |_, _, cx| {
+                state.update(cx, |state, cx| {
+                    state.review_graph_zoom =
+                        clamp_review_graph_zoom(state.review_graph_zoom / 1.15);
+                    state.review_graph_pan_offset = clamp_review_graph_pan_offset(
+                        state.review_graph_pan_offset,
+                        state.review_graph_zoom,
+                    );
+                    cx.notify();
+                });
+            }
+        }))
+        .child(
+            div()
+                .w(px(50.0))
+                .h(px(28.0))
+                .rounded(radius_sm())
+                .bg(bg_subtle())
+                .flex()
+                .items_center()
+                .justify_center()
+                .font_family("Fira Code")
+                .text_size(px(11.0))
+                .text_color(fg_muted())
+                .child(format!("{:.0}%", clamp_review_graph_zoom(zoom) * 100.0)),
+        )
+        .child(review_graph_zoom_button("+", "Zoom in", {
+            let state = state.clone();
+            move |_, _, cx| {
+                state.update(cx, |state, cx| {
+                    state.review_graph_zoom =
+                        clamp_review_graph_zoom(state.review_graph_zoom * 1.15);
+                    cx.notify();
+                });
+            }
+        }))
+}
+
+fn review_graph_zoom_button(
+    label: &'static str,
+    tooltip: &'static str,
+    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let button_id = if label == "+" { 1usize } else { 0usize };
+    div()
+        .id(("review-graph-zoom-button", button_id))
+        .w(px(28.0))
+        .h(px(28.0))
+        .rounded(radius_sm())
+        .bg(bg_subtle())
+        .text_color(fg_muted())
+        .text_size(px(15.0))
+        .font_weight(FontWeight::SEMIBOLD)
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .tooltip(move |_, cx| build_static_tooltip(tooltip, cx))
+        .hover(|style| style.bg(hover_bg()).text_color(fg_emphasis()))
+        .on_mouse_down(MouseButton::Left, on_click)
+        .child(label)
+}
+
 #[derive(Clone)]
 enum ReviewGraphCanvasMode {
     Preview,
     Expanded {
         selected_node_id: Option<String>,
         pan_offset: Point<Pixels>,
+        zoom: f32,
         panning: bool,
     },
 }
@@ -4022,6 +4108,21 @@ impl ReviewGraphCanvasMode {
         match self {
             Self::Preview => point(px(0.0), px(0.0)),
             Self::Expanded { pan_offset, .. } => *pan_offset,
+        }
+    }
+
+    fn zoom(&self) -> f32 {
+        match self {
+            Self::Preview => 1.0,
+            Self::Expanded { zoom, .. } => clamp_review_graph_zoom(*zoom),
+        }
+    }
+
+    fn node_scale(&self) -> f32 {
+        if self.is_preview() {
+            1.0
+        } else {
+            self.zoom().clamp(0.72, 1.28)
         }
     }
 
@@ -4069,6 +4170,8 @@ fn render_review_graph_canvas(
 ) -> impl IntoElement {
     let layout = build_interactive_review_graph_layout(graph);
     let pan_offset = mode.pan_offset();
+    let zoom = mode.zoom();
+    let lane_counts = review_graph_lane_counts(&layout);
     let edge_segments = layout.edges.clone();
     let hidden_node_count = layout.hidden_node_count;
     let layout_nodes = layout.nodes;
@@ -4087,7 +4190,7 @@ fn render_review_graph_canvas(
         let state_for_pan_start = state.clone();
         let state_for_pan_move = state.clone();
         let state_for_pan_end = state.clone();
-        let state_for_wheel_pan = state.clone();
+        let state_for_wheel = state.clone();
         canvas_root = canvas_root
             .h_full()
             .min_h(px(520.0))
@@ -4124,10 +4227,13 @@ fn render_review_graph_canvas(
                         event.position.x - last_position.x,
                         event.position.y - last_position.y,
                     );
-                    state.review_graph_pan_offset = clamp_review_graph_pan_offset(point(
-                        state.review_graph_pan_offset.x + delta.x,
-                        state.review_graph_pan_offset.y + delta.y,
-                    ));
+                    state.review_graph_pan_offset = clamp_review_graph_pan_offset(
+                        point(
+                            state.review_graph_pan_offset.x + delta.x,
+                            state.review_graph_pan_offset.y + delta.y,
+                        ),
+                        state.review_graph_zoom,
+                    );
                     state.review_graph_last_pan_position = Some(event.position);
                     cx.notify();
                 });
@@ -4147,11 +4253,24 @@ fn render_review_graph_canvas(
             })
             .on_scroll_wheel(move |event, _, cx| {
                 let delta = event.delta.pixel_delta(px(16.0));
-                state_for_wheel_pan.update(cx, |state, cx| {
-                    state.review_graph_pan_offset = clamp_review_graph_pan_offset(point(
-                        state.review_graph_pan_offset.x - delta.x,
-                        state.review_graph_pan_offset.y - delta.y,
-                    ));
+                state_for_wheel.update(cx, |state, cx| {
+                    if event.modifiers.shift {
+                        state.review_graph_pan_offset = clamp_review_graph_pan_offset(
+                            point(
+                                state.review_graph_pan_offset.x - delta.x,
+                                state.review_graph_pan_offset.y - delta.y,
+                            ),
+                            state.review_graph_zoom,
+                        );
+                    } else {
+                        let zoom_delta = (-f32::from(delta.y) / 420.0).clamp(-0.18, 0.18);
+                        state.review_graph_zoom =
+                            clamp_review_graph_zoom(state.review_graph_zoom * (1.0 + zoom_delta));
+                        state.review_graph_pan_offset = clamp_review_graph_pan_offset(
+                            state.review_graph_pan_offset,
+                            state.review_graph_zoom,
+                        );
+                    }
                     state.review_graph_panning = false;
                     state.review_graph_last_pan_position = None;
                     cx.notify();
@@ -4176,12 +4295,20 @@ fn render_review_graph_canvas(
                 move |bounds, edges, window, _| {
                     for edge in edges {
                         let from = point(
-                            bounds.left() + pan_offset.x + bounds.size.width * edge.from_x,
-                            bounds.top() + pan_offset.y + bounds.size.height * edge.from_y,
+                            bounds.left()
+                                + pan_offset.x
+                                + bounds.size.width * review_graph_scaled_coord(edge.from_x, zoom),
+                            bounds.top()
+                                + pan_offset.y
+                                + bounds.size.height * review_graph_scaled_coord(edge.from_y, zoom),
                         );
                         let to = point(
-                            bounds.left() + pan_offset.x + bounds.size.width * edge.to_x,
-                            bounds.top() + pan_offset.y + bounds.size.height * edge.to_y,
+                            bounds.left()
+                                + pan_offset.x
+                                + bounds.size.width * review_graph_scaled_coord(edge.to_x, zoom),
+                            bounds.top()
+                                + pan_offset.y
+                                + bounds.size.height * review_graph_scaled_coord(edge.to_y, zoom),
                         );
                         let mut builder = PathBuilder::stroke(px(1.35));
                         if edge.kind == ReviewGraphEdgeKind::Touches {
@@ -4202,7 +4329,8 @@ fn render_review_graph_canvas(
             .size_full(),
         )
         .when(!mode.is_preview(), |el| {
-            el.child(render_review_graph_canvas_legend())
+            el.child(render_review_graph_canvas_lane_headers(lane_counts))
+                .child(render_review_graph_zoom_controls(state, zoom))
         })
         .children(layout_nodes.into_iter().map(|layout_node| {
             render_review_graph_canvas_node(state, layout_node, mode.clone(), pan_offset)
@@ -4211,8 +4339,10 @@ fn render_review_graph_canvas(
             el.child(
                 div()
                     .absolute()
-                    .right(px(10.0))
-                    .bottom(px(10.0))
+                    .bottom(px(12.0))
+                    .left(px(10.0))
+                    .flex()
+                    .items_center()
                     .child(metric_pill(
                         format!("+{} hidden", hidden_node_count),
                         fg_default(),
@@ -4222,23 +4352,89 @@ fn render_review_graph_canvas(
         })
 }
 
-fn render_review_graph_canvas_legend() -> impl IntoElement {
-    div()
-        .absolute()
-        .top(px(10.0))
-        .left(px(10.0))
-        .flex()
-        .items_center()
-        .gap(px(6.0))
-        .child(metric_pill("incoming", fg_default(), bg_overlay()))
-        .child(metric_pill("selected file", fg_emphasis(), bg_selected()))
-        .child(metric_pill("outgoing", accent(), accent_muted()))
+#[derive(Clone, Copy, Default)]
+struct ReviewGraphLaneCounts {
+    primary: usize,
+    incoming: usize,
+    outgoing: usize,
 }
 
-fn clamp_review_graph_pan_offset(offset: Point<Pixels>) -> Point<Pixels> {
+fn review_graph_lane_counts(layout: &ReviewGraphLayout) -> ReviewGraphLaneCounts {
+    let mut counts = ReviewGraphLaneCounts::default();
+    for node in &layout.nodes {
+        match node.lane {
+            ReviewGraphLayoutLane::Primary => counts.primary += 1,
+            ReviewGraphLayoutLane::Incoming => counts.incoming += 1,
+            ReviewGraphLayoutLane::Outgoing => counts.outgoing += 1,
+            ReviewGraphLayoutLane::Related => {}
+        }
+    }
+    counts
+}
+
+fn render_review_graph_canvas_lane_headers(counts: ReviewGraphLaneCounts) -> impl IntoElement {
+    div()
+        .absolute()
+        .top(px(8.0))
+        .left(px(8.0))
+        .right(px(8.0))
+        .h(px(20.0))
+        .child(render_review_graph_lane_header(
+            "Calls",
+            counts.incoming,
+            0.18,
+            fg_default(),
+        ))
+        .child(render_review_graph_lane_header(
+            "File",
+            counts.primary,
+            0.50,
+            fg_emphasis(),
+        ))
+        .child(render_review_graph_lane_header(
+            "Deps",
+            counts.outgoing,
+            0.82,
+            accent(),
+        ))
+}
+
+fn render_review_graph_lane_header(
+    label: &'static str,
+    count: usize,
+    x: f32,
+    fg: gpui::Rgba,
+) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(relative(x))
+        .ml(px(-38.0))
+        .w(px(76.0))
+        .h(px(20.0))
+        .rounded(px(999.0))
+        .bg(bg_overlay())
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(9.0))
+        .font_family("Fira Code")
+        .text_color(fg)
+        .child(format!("{label} {count}"))
+}
+
+fn review_graph_scaled_coord(coord: f32, zoom: f32) -> f32 {
+    0.5 + (coord - 0.5) * clamp_review_graph_zoom(zoom)
+}
+
+fn clamp_review_graph_zoom(zoom: f32) -> f32 {
+    zoom.clamp(0.65, 1.65)
+}
+
+fn clamp_review_graph_pan_offset(offset: Point<Pixels>, zoom: f32) -> Point<Pixels> {
+    let extra = (clamp_review_graph_zoom(zoom) - 1.0).max(0.0);
     point(
-        px(f32::from(offset.x).clamp(-900.0, 900.0)),
-        px(f32::from(offset.y).clamp(-700.0, 700.0)),
+        px(f32::from(offset.x).clamp(-900.0 - 360.0 * extra, 900.0 + 360.0 * extra)),
+        px(f32::from(offset.y).clamp(-700.0 - 260.0 * extra, 700.0 + 260.0 * extra)),
     )
 }
 
@@ -4288,6 +4484,8 @@ fn render_review_graph_canvas_node(
     let node = layout_node.node;
     let is_selected = mode.selected_node_id() == Some(node.id.as_str());
     let is_focus = node.state == ReviewGraphNodeState::Focus;
+    let zoom = mode.zoom();
+    let node_scale = mode.node_scale();
     let marker_color = review_graph_status_color(&node);
     let border = if is_selected {
         purple()
@@ -4307,8 +4505,8 @@ fn render_review_graph_canvas_node(
         return div()
             .id(("review-graph-preview-node", node_element_id))
             .absolute()
-            .left(relative(layout_node.x))
-            .top(relative(layout_node.y))
+            .left(relative(review_graph_scaled_coord(layout_node.x, zoom)))
+            .top(relative(review_graph_scaled_coord(layout_node.y, zoom)))
             .ml(pan_offset.x + px(-size / 2.0))
             .mt(pan_offset.y + px(-size / 2.0))
             .w(px(size))
@@ -4325,29 +4523,29 @@ fn render_review_graph_canvas_node(
     let width = if mode.is_preview() {
         112.0
     } else if is_focus {
-        176.0
+        156.0
     } else {
-        148.0
-    };
+        126.0
+    } * node_scale;
     let height = if mode.is_preview() {
         38.0
     } else if is_focus {
-        68.0
+        46.0
     } else {
-        58.0
-    };
+        40.0
+    } * node_scale;
     let state_for_select = state.clone();
     let mut card = div()
         .id(("review-graph-canvas-node", node_element_id))
         .absolute()
-        .left(relative(layout_node.x))
-        .top(relative(layout_node.y))
+        .left(relative(review_graph_scaled_coord(layout_node.x, zoom)))
+        .top(relative(review_graph_scaled_coord(layout_node.y, zoom)))
         .ml(pan_offset.x + px(-width / 2.0))
         .mt(pan_offset.y + px(-height / 2.0))
         .w(px(width))
         .h(px(height))
-        .px(px(10.0))
-        .py(px(8.0))
+        .px(px(10.0 * node_scale))
+        .py(px(8.0 * node_scale))
         .rounded(radius_sm())
         .border_1()
         .border_color(border)
@@ -4386,7 +4584,7 @@ fn render_review_graph_canvas_node(
                         .text_size(if mode.is_preview() {
                             px(10.0)
                         } else {
-                            px(12.0)
+                            px(12.0 * node_scale)
                         })
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(fg_emphasis())
@@ -4409,17 +4607,7 @@ fn render_review_graph_canvas_node(
                     cx.notify();
                 });
                 cx.stop_propagation();
-            })
-            .child(
-                div()
-                    .mt(px(5.0))
-                    .text_size(px(10.0))
-                    .text_color(fg_muted())
-                    .whitespace_nowrap()
-                    .overflow_x_hidden()
-                    .text_ellipsis()
-                    .child(node.subtitle.clone()),
-            );
+            });
     }
 
     card.into_any_element()
@@ -4560,7 +4748,7 @@ fn render_review_graph_detail_rail(
                     .mt(px(10.0))
                     .text_size(px(12.0))
                     .text_color(fg_muted())
-                    .child("Tracing symbol dependencies..."),
+                    .child("Tracing call sites and dependencies..."),
             )
         })
         .when_some(error, |el, error| {
@@ -4619,13 +4807,13 @@ fn render_review_graph_neighbor_list(
                         .text_size(px(10.0))
                         .font_family("Fira Code")
                         .text_color(fg_subtle())
-                        .child("DEPENDENCIES"),
+                        .child("CALL SITES / DEPENDENCIES"),
                 )
                 .child(badge(&rows.len().to_string())),
         )
         .when(rows.is_empty(), |el| {
             el.child(div().mt(px(10.0)).child(panel_state_text(
-                "No direct dependencies in this graph slice.",
+                "No direct call sites or dependencies in this graph slice.",
             )))
         })
         .child(
@@ -4648,6 +4836,12 @@ fn render_review_graph_neighbor_row(
 ) -> impl IntoElement {
     let node_id = node.id.clone();
     let state = state.clone();
+    let direction_label = if incoming { "call site" } else { "target" };
+    let relation_label = if incoming {
+        format!("{} here", kind.label())
+    } else {
+        kind.label().to_string()
+    };
 
     div()
         .px(px(10.0))
@@ -4670,15 +4864,11 @@ fn render_review_graph_neighbor_row(
                 .items_center()
                 .gap(px(6.0))
                 .child(metric_pill(
-                    if incoming { "in" } else { "out" }.to_string(),
+                    direction_label.to_string(),
                     fg_default(),
                     bg_emphasis(),
                 ))
-                .child(metric_pill(
-                    kind.label().to_string(),
-                    accent(),
-                    accent_muted(),
-                )),
+                .child(metric_pill(relation_label, accent(), accent_muted())),
         )
         .child(
             div()
@@ -4753,11 +4943,9 @@ fn build_interactive_review_graph_layout(graph: &ReviewSymbolGraph) -> ReviewGra
             .then_with(|| compare_review_graph_nodes(left, right))
     });
 
-    append_review_graph_lane_nodes(
+    append_review_graph_primary_nodes(
         &mut layout_nodes,
         primary.into_iter().take(MAX_PRIMARY_NODES).collect(),
-        ReviewGraphLayoutLane::Primary,
-        0.50,
         0.50,
         0.16,
         0.84,
@@ -4878,6 +5066,37 @@ fn append_review_graph_lane_nodes(
     }
 }
 
+fn append_review_graph_primary_nodes(
+    layout_nodes: &mut Vec<ReviewGraphLayoutNode>,
+    nodes: Vec<ReviewSymbolGraphNode>,
+    x: f32,
+    min_y: f32,
+    max_y: f32,
+) {
+    let center_y = (min_y + max_y) / 2.0;
+    let spread = (max_y - min_y) / 2.0;
+    let total = nodes.len();
+
+    for (index, node) in nodes.into_iter().enumerate() {
+        let y = if index == 0 {
+            center_y
+        } else {
+            let side = if index % 2 == 1 { -1.0 } else { 1.0 };
+            let ring = ((index + 1) / 2) as f32;
+            let slots = ((total + 1) / 2).max(1) as f32;
+            center_y + side * spread * (ring / slots)
+        }
+        .clamp(min_y, max_y);
+
+        layout_nodes.push(ReviewGraphLayoutNode {
+            node,
+            x,
+            y,
+            lane: ReviewGraphLayoutLane::Primary,
+        });
+    }
+}
+
 fn review_graph_lane_position(index: usize, total: usize) -> f32 {
     if total <= 1 {
         0.5
@@ -4954,8 +5173,6 @@ fn review_graph_is_reusable_node(node: &crate::review_graph::ReviewSymbolGraphNo
         node.kind,
         crate::review_graph::ReviewGraphNodeKind::Function
             | crate::review_graph::ReviewGraphNodeKind::Method
-            | crate::review_graph::ReviewGraphNodeKind::Type
-            | crate::review_graph::ReviewGraphNodeKind::Module
             | crate::review_graph::ReviewGraphNodeKind::Data
     )
 }
@@ -4967,7 +5184,7 @@ fn review_graph_kind_marker(kind: crate::review_graph::ReviewGraphNodeKind) -> &
         crate::review_graph::ReviewGraphNodeKind::Method => "M",
         crate::review_graph::ReviewGraphNodeKind::Type => "T",
         crate::review_graph::ReviewGraphNodeKind::Module => "MO",
-        crate::review_graph::ReviewGraphNodeKind::Data => "D",
+        crate::review_graph::ReviewGraphNodeKind::Data => "VAR",
         crate::review_graph::ReviewGraphNodeKind::Branch => "B",
         crate::review_graph::ReviewGraphNodeKind::Unknown => "?",
     }
@@ -5027,7 +5244,7 @@ fn render_review_graph_node_badges(
             metric_pill("modified", success(), success_muted()).into_any_element()
         }
         ReviewGraphEntityStatus::Impacted => {
-            metric_pill("source", accent(), accent_muted()).into_any_element()
+            metric_pill("context", accent(), accent_muted()).into_any_element()
         }
     })
 }
