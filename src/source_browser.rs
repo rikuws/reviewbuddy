@@ -30,8 +30,6 @@ pub fn render_source_browser(
             .cloned()
     };
 
-    let focus_line = target.line.filter(|line| *line > 0);
-
     let shell = div()
         .flex()
         .flex_col()
@@ -41,58 +39,7 @@ pub fn render_source_browser(
         .border_1()
         .border_color(border_default())
         .bg(bg_surface())
-        .overflow_hidden()
-        .child(
-            div()
-                .px(px(18.0))
-                .py(px(12.0))
-                .border_b(px(1.0))
-                .border_color(border_default())
-                .flex()
-                .items_start()
-                .justify_between()
-                .gap(px(16.0))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(4.0))
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .font_family("Fira Code")
-                                .text_color(fg_subtle())
-                                .child("FULL FILE"),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(14.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(fg_emphasis())
-                                .text_ellipsis()
-                                .whitespace_nowrap()
-                                .overflow_x_hidden()
-                                .child(source_location_label(&target.path, focus_line)),
-                        )
-                        .when_some(target.reason.clone(), |el, reason| {
-                            el.child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .text_color(fg_muted())
-                                    .child(reason),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(6.0))
-                        .flex_wrap()
-                        .flex_shrink_0()
-                        .child(source_badge("read-only")),
-                ),
-        );
+        .overflow_hidden();
 
     let Some(prepared_file) = prepared_file else {
         return shell
@@ -132,16 +79,10 @@ pub fn render_source_browser(
                 .flex_grow()
                 .min_h_0()
                 .id("source-browser-scroll")
-                .p(px(18.0))
+                .p(px(10.0))
                 .flex()
                 .flex_col()
-                .gap(px(16.0))
-                .child(
-                    source_panel("Full file")
-                        .flex_grow()
-                        .min_h_0()
-                        .child(full_file),
-                ),
+                .child(full_file),
         )
         .into_any_element()
 }
@@ -184,38 +125,9 @@ fn build_full_file_diff_lines(parsed: &ParsedDiffFile) -> PreparedFileLineDiffs 
     Arc::new(lines)
 }
 
-fn source_location_label(path: &str, line: Option<usize>) -> String {
-    match line {
-        Some(line) => format!("{path}:{line}"),
-        None => path.to_string(),
-    }
-}
-
-fn source_panel(title: &str) -> Div {
-    div().flex().flex_col().gap(px(10.0)).child(
-        div()
-            .text_size(px(11.0))
-            .font_family("Fira Code")
-            .text_color(fg_subtle())
-            .child(title.to_ascii_uppercase()),
-    )
-}
-
 fn source_state_text(message: &str) -> impl IntoElement {
     div()
         .text_size(px(12.0))
         .text_color(fg_muted())
         .child(message.to_string())
-}
-
-fn source_badge(label: &str) -> impl IntoElement {
-    div()
-        .px(px(7.0))
-        .py(px(2.0))
-        .rounded(px(999.0))
-        .bg(bg_emphasis())
-        .text_size(px(10.0))
-        .font_family("Fira Code")
-        .text_color(fg_muted())
-        .child(label.to_string())
 }
