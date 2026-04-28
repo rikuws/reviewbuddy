@@ -656,6 +656,7 @@ mod tests {
                     }],
                 },
             ],
+            data_completeness: crate::github::PullRequestDataCompleteness::default(),
         };
 
         let route = build_changed_touch_route(

@@ -1,11 +1,8 @@
-use std::{path::Path, process::Command};
+use std::{path::Path, time::Duration};
 
-#[derive(Debug)]
-pub struct CommandOutput {
-    pub exit_code: Option<i32>,
-    pub stdout: String,
-    pub stderr: String,
-}
+pub use crate::command_runner::CommandOutput;
+
+use crate::command_runner::CommandRunner;
 
 pub fn run(args: &[&str]) -> Result<CommandOutput, String> {
     let owned_args = args
@@ -26,22 +23,19 @@ pub fn run_owned_in<P>(
 where
     P: AsRef<Path>,
 {
-    let mut command = Command::new("gh");
-    command.args(&args);
+    let mut runner = CommandRunner::new("gh")
+        .args(args)
+        .timeout(Duration::from_secs(120));
 
     if let Some(path) = working_directory {
-        command.current_dir(path.as_ref());
+        runner = runner.current_dir(path.as_ref());
     }
 
-    let output = command
-        .output()
-        .map_err(|error| format!("Failed to launch gh: {error}"))?;
-
-    Ok(CommandOutput {
-        exit_code: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
+    let output = runner.run()?;
+    if output.timed_out {
+        return Err("gh command timed out after 120 seconds.".to_string());
+    }
+    Ok(output)
 }
 
 pub fn run_json_owned(args: Vec<String>) -> Result<serde_json::Value, String> {
@@ -63,7 +57,7 @@ pub fn run_json_owned(args: Vec<String>) -> Result<serde_json::Value, String> {
                 .ok_or_else(|| {
                     serde_json::Error::io(std::io::Error::other("no JSON document found"))
                 })
-                .and_then(|json| serde_json::from_str(json))
+                .and_then(serde_json::from_str)
         })
         .map_err(|error| format!("Failed to parse gh JSON output: {error}"))
 }

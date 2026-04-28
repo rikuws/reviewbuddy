@@ -261,7 +261,7 @@ pub fn load_code_tour(
 pub fn generate_code_tour_with_progress<F>(
     cache: &CacheStore,
     input: GenerateCodeTourInput,
-    mut on_progress: F,
+    on_progress: F,
 ) -> Result<GeneratedCodeTour, String>
 where
     F: FnMut(CodeTourProgressUpdate),
@@ -282,8 +282,7 @@ where
     }
 
     let backend = agents::backend_for(input.provider);
-    let mut progress_sink: Box<dyn FnMut(CodeTourProgressUpdate)> =
-        Box::new(|progress| on_progress(progress));
+    let mut progress_sink: Box<dyn FnMut(CodeTourProgressUpdate)> = Box::new(on_progress);
     let tour = backend.generate(&input, progress_sink.as_mut())?;
 
     let cache_key = code_tour_cache_key_from_parts(
@@ -978,6 +977,7 @@ mod tests {
             files: Vec::new(),
             raw_diff: raw_diff.to_string(),
             parsed_diff: Vec::new(),
+            data_completeness: crate::github::PullRequestDataCompleteness::default(),
         }
     }
 

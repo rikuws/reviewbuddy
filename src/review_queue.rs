@@ -230,6 +230,7 @@ mod tests {
             ],
             raw_diff: String::new(),
             parsed_diff: Vec::new(),
+            data_completeness: crate::github::PullRequestDataCompleteness::default(),
         };
 
         let queue = build_review_queue(&detail);

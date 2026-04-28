@@ -18,6 +18,7 @@ use crate::app_storage;
 
 const USER_AGENT: &str = concat!("remiss/", env!("CARGO_PKG_VERSION"));
 const MINIMUM_JDTLS_JAVA_MAJOR_VERSION: u32 = 21;
+const MANAGED_LSP_DIR: &str = "lsp-servers";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ManagedServerKind {
@@ -28,6 +29,15 @@ pub enum ManagedServerKind {
     KotlinLsp,
     Jdtls,
     Roslyn,
+    VscodeHtmlLanguageServer,
+    VscodeCssLanguageServer,
+    VscodeJsonLanguageServer,
+    VscodeMarkdownLanguageServer,
+    YamlLanguageServer,
+    BashLanguageServer,
+    DockerfileLanguageServer,
+    Intelephense,
+    SvelteLanguageServer,
 }
 
 impl ManagedServerKind {
@@ -40,6 +50,15 @@ impl ManagedServerKind {
             ManagedServerKind::KotlinLsp,
             ManagedServerKind::Jdtls,
             ManagedServerKind::Roslyn,
+            ManagedServerKind::VscodeHtmlLanguageServer,
+            ManagedServerKind::VscodeCssLanguageServer,
+            ManagedServerKind::VscodeJsonLanguageServer,
+            ManagedServerKind::VscodeMarkdownLanguageServer,
+            ManagedServerKind::YamlLanguageServer,
+            ManagedServerKind::BashLanguageServer,
+            ManagedServerKind::DockerfileLanguageServer,
+            ManagedServerKind::Intelephense,
+            ManagedServerKind::SvelteLanguageServer,
         ]
     }
 
@@ -52,12 +71,31 @@ impl ManagedServerKind {
             ManagedServerKind::KotlinLsp => "Kotlin",
             ManagedServerKind::Jdtls => "Java",
             ManagedServerKind::Roslyn => "C#",
+            ManagedServerKind::VscodeHtmlLanguageServer => "HTML",
+            ManagedServerKind::VscodeCssLanguageServer => "CSS / SCSS / Less",
+            ManagedServerKind::VscodeJsonLanguageServer => "JSON / JSONC",
+            ManagedServerKind::VscodeMarkdownLanguageServer => "Markdown",
+            ManagedServerKind::YamlLanguageServer => "YAML",
+            ManagedServerKind::BashLanguageServer => "Shell scripts",
+            ManagedServerKind::DockerfileLanguageServer => "Dockerfiles",
+            ManagedServerKind::Intelephense => "PHP",
+            ManagedServerKind::SvelteLanguageServer => "Svelte",
         }
     }
 
     pub fn runtime_note(&self) -> Option<&'static str> {
         match self {
-            ManagedServerKind::TypescriptLanguageServer | ManagedServerKind::Pyright => {
+            ManagedServerKind::TypescriptLanguageServer
+            | ManagedServerKind::Pyright
+            | ManagedServerKind::VscodeHtmlLanguageServer
+            | ManagedServerKind::VscodeCssLanguageServer
+            | ManagedServerKind::VscodeJsonLanguageServer
+            | ManagedServerKind::VscodeMarkdownLanguageServer
+            | ManagedServerKind::YamlLanguageServer
+            | ManagedServerKind::BashLanguageServer
+            | ManagedServerKind::DockerfileLanguageServer
+            | ManagedServerKind::Intelephense
+            | ManagedServerKind::SvelteLanguageServer => {
                 Some("Uses an app-managed Node.js runtime.")
             }
             ManagedServerKind::Gopls => {
@@ -91,11 +129,19 @@ pub struct ManagedServerInstallStatus {
     pub detail: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct InstalledServerRecord {
     version: String,
     install_dir: String,
     command_path: String,
+}
+
+#[derive(Clone, Copy)]
+struct NodeHostedLanguageServerSpec {
+    package_name: &'static str,
+    entrypoint_relative_path: &'static str,
+    args: &'static [&'static str],
+    extra_packages: &'static [&'static str],
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +201,15 @@ pub fn managed_server_display_name(kind: ManagedServerKind) -> &'static str {
         ManagedServerKind::KotlinLsp => "managed Kotlin LSP",
         ManagedServerKind::Jdtls => "managed JDTLS",
         ManagedServerKind::Roslyn => "managed Roslyn",
+        ManagedServerKind::VscodeHtmlLanguageServer => "managed HTML language server",
+        ManagedServerKind::VscodeCssLanguageServer => "managed CSS language server",
+        ManagedServerKind::VscodeJsonLanguageServer => "managed JSON language server",
+        ManagedServerKind::VscodeMarkdownLanguageServer => "managed Markdown language server",
+        ManagedServerKind::YamlLanguageServer => "managed YAML language server",
+        ManagedServerKind::BashLanguageServer => "managed Bash language server",
+        ManagedServerKind::DockerfileLanguageServer => "managed Dockerfile language server",
+        ManagedServerKind::Intelephense => "managed Intelephense",
+        ManagedServerKind::SvelteLanguageServer => "managed Svelte language server",
     }
 }
 
@@ -198,6 +253,17 @@ pub fn install_managed_server(
             ManagedServerKind::Roslyn => {
                 install_roslyn()?;
             }
+            ManagedServerKind::VscodeHtmlLanguageServer
+            | ManagedServerKind::VscodeCssLanguageServer
+            | ManagedServerKind::VscodeJsonLanguageServer
+            | ManagedServerKind::VscodeMarkdownLanguageServer
+            | ManagedServerKind::YamlLanguageServer
+            | ManagedServerKind::BashLanguageServer
+            | ManagedServerKind::DockerfileLanguageServer
+            | ManagedServerKind::Intelephense
+            | ManagedServerKind::SvelteLanguageServer => {
+                install_node_hosted_language_server(kind)?;
+            }
         }
         Ok(())
     })();
@@ -213,13 +279,20 @@ pub fn inspect_managed_server(kind: ManagedServerKind) -> ManagedServerInstallSt
         | ManagedServerKind::Gopls
         | ManagedServerKind::KotlinLsp
         | ManagedServerKind::Roslyn => inspect_command_record(kind),
-        ManagedServerKind::TypescriptLanguageServer => inspect_node_hosted_record(
+        ManagedServerKind::TypescriptLanguageServer
+        | ManagedServerKind::Pyright
+        | ManagedServerKind::VscodeHtmlLanguageServer
+        | ManagedServerKind::VscodeCssLanguageServer
+        | ManagedServerKind::VscodeJsonLanguageServer
+        | ManagedServerKind::VscodeMarkdownLanguageServer
+        | ManagedServerKind::YamlLanguageServer
+        | ManagedServerKind::BashLanguageServer
+        | ManagedServerKind::DockerfileLanguageServer
+        | ManagedServerKind::Intelephense
+        | ManagedServerKind::SvelteLanguageServer => inspect_node_hosted_record(
             kind,
-            Path::new("node_modules/typescript-language-server/lib/cli.mjs"),
+            Path::new(node_hosted_language_server_spec(kind).entrypoint_relative_path),
         ),
-        ManagedServerKind::Pyright => {
-            inspect_node_hosted_record(kind, Path::new("node_modules/pyright/langserver.index.js"))
-        }
         ManagedServerKind::Jdtls => inspect_jdtls_record(),
     }
 }
@@ -236,6 +309,15 @@ fn resolve_managed_server_locked(
         ManagedServerKind::KotlinLsp => install_kotlin_lsp(),
         ManagedServerKind::Jdtls => install_jdtls(repo_root),
         ManagedServerKind::Roslyn => install_roslyn(),
+        ManagedServerKind::VscodeHtmlLanguageServer
+        | ManagedServerKind::VscodeCssLanguageServer
+        | ManagedServerKind::VscodeJsonLanguageServer
+        | ManagedServerKind::VscodeMarkdownLanguageServer
+        | ManagedServerKind::YamlLanguageServer
+        | ManagedServerKind::BashLanguageServer
+        | ManagedServerKind::DockerfileLanguageServer
+        | ManagedServerKind::Intelephense
+        | ManagedServerKind::SvelteLanguageServer => install_node_hosted_language_server(kind),
     }
 }
 
@@ -528,6 +610,27 @@ fn install_rust_analyzer() -> Result<ManagedServerConfiguration, String> {
         "rust-analyzer-{}",
         release.tag_name.trim_start_matches('v')
     ));
+    let existing_command = install_dir.join(rust_analyzer_binary_name());
+    if existing_command.is_file() {
+        make_executable(&existing_command)?;
+        write_installed_server_record(
+            ManagedServerKind::RustAnalyzer,
+            &InstalledServerRecord {
+                version: release.tag_name,
+                install_dir: path_to_string(&install_dir)?,
+                command_path: path_to_string(&existing_command)?,
+            },
+        )?;
+        cleanup_other_versions(
+            ManagedServerKind::RustAnalyzer,
+            install_dir.file_name().and_then(|name| name.to_str()),
+        )?;
+        return Ok(ManagedServerConfiguration {
+            command: path_to_string(&existing_command)?,
+            args: Vec::new(),
+        });
+    }
+
     let archive_path = install_dir.with_extension(rust_analyzer_archive_extension());
     download_to_file(&asset.browser_download_url, &archive_path)?;
 
@@ -579,68 +682,130 @@ fn install_rust_analyzer() -> Result<ManagedServerConfiguration, String> {
     })
 }
 
-fn install_typescript_language_server() -> Result<ManagedServerConfiguration, String> {
-    let node_runtime = install_node_runtime()?;
-    if let Some(record) = read_installed_server_record(ManagedServerKind::TypescriptLanguageServer)?
-    {
-        let entrypoint = PathBuf::from(&record.command_path);
-        if entrypoint.is_file() {
-            return build_node_hosted_server_configuration(
-                &node_runtime.node,
-                &entrypoint,
-                &["--stdio"],
-            );
-        }
+fn node_hosted_language_server_spec(kind: ManagedServerKind) -> NodeHostedLanguageServerSpec {
+    match kind {
+        ManagedServerKind::TypescriptLanguageServer => NodeHostedLanguageServerSpec {
+            package_name: "typescript-language-server",
+            entrypoint_relative_path: "node_modules/typescript-language-server/lib/cli.mjs",
+            args: &["--stdio"],
+            extra_packages: &["typescript@latest"],
+        },
+        ManagedServerKind::Pyright => NodeHostedLanguageServerSpec {
+            package_name: "pyright",
+            entrypoint_relative_path: "node_modules/pyright/langserver.index.js",
+            args: &["--stdio"],
+            extra_packages: &[],
+        },
+        ManagedServerKind::VscodeHtmlLanguageServer => NodeHostedLanguageServerSpec {
+            package_name: "vscode-langservers-extracted",
+            entrypoint_relative_path:
+                "node_modules/vscode-langservers-extracted/bin/vscode-html-language-server",
+            args: &["--stdio"],
+            extra_packages: &[],
+        },
+        ManagedServerKind::VscodeCssLanguageServer => NodeHostedLanguageServerSpec {
+            package_name: "vscode-langservers-extracted",
+            entrypoint_relative_path:
+                "node_modules/vscode-langservers-extracted/bin/vscode-css-language-server",
+            args: &["--stdio"],
+            extra_packages: &[],
+        },
+        ManagedServerKind::VscodeJsonLanguageServer => NodeHostedLanguageServerSpec {
+            package_name: "vscode-langservers-extracted",
+            entrypoint_relative_path:
+                "node_modules/vscode-langservers-extracted/bin/vscode-json-language-server",
+            args: &["--stdio"],
+            extra_packages: &[],
+        },
+        ManagedServerKind::VscodeMarkdownLanguageServer => NodeHostedLanguageServerSpec {
+            package_name: "vscode-langservers-extracted",
+            entrypoint_relative_path:
+                "node_modules/vscode-langservers-extracted/bin/vscode-markdown-language-server",
+            args: &["--stdio"],
+            extra_packages: &[],
+        },
+        ManagedServerKind::YamlLanguageServer => NodeHostedLanguageServerSpec {
+            package_name: "yaml-language-server",
+            entrypoint_relative_path: "node_modules/yaml-language-server/bin/yaml-language-server",
+            args: &["--stdio"],
+            extra_packages: &[],
+        },
+        ManagedServerKind::BashLanguageServer => NodeHostedLanguageServerSpec {
+            package_name: "bash-language-server",
+            entrypoint_relative_path: "node_modules/bash-language-server/out/cli.js",
+            args: &["start"],
+            extra_packages: &[],
+        },
+        ManagedServerKind::DockerfileLanguageServer => NodeHostedLanguageServerSpec {
+            package_name: "dockerfile-language-server-nodejs",
+            entrypoint_relative_path:
+                "node_modules/dockerfile-language-server-nodejs/bin/docker-langserver",
+            args: &["--stdio"],
+            extra_packages: &[],
+        },
+        ManagedServerKind::Intelephense => NodeHostedLanguageServerSpec {
+            package_name: "intelephense",
+            entrypoint_relative_path: "node_modules/intelephense/lib/intelephense.js",
+            args: &["--stdio"],
+            extra_packages: &[],
+        },
+        ManagedServerKind::SvelteLanguageServer => NodeHostedLanguageServerSpec {
+            package_name: "svelte-language-server",
+            entrypoint_relative_path: "node_modules/svelte-language-server/bin/server.js",
+            args: &["--stdio"],
+            extra_packages: &["typescript@latest"],
+        },
+        ManagedServerKind::RustAnalyzer
+        | ManagedServerKind::Gopls
+        | ManagedServerKind::KotlinLsp
+        | ManagedServerKind::Jdtls
+        | ManagedServerKind::Roslyn => unreachable!("non-Node language server kind"),
     }
+}
 
-    let package: NpmPackageMetadata =
-        fetch_json("https://registry.npmjs.org/typescript-language-server/latest")?;
-    let entrypoint = install_managed_node_package(
-        ManagedServerKind::TypescriptLanguageServer,
-        &package.version,
-        vec![
-            format!("typescript-language-server@{}", package.version),
-            "typescript@latest".to_string(),
-        ],
-        Path::new("node_modules/typescript-language-server/lib/cli.mjs"),
-        &node_runtime,
-    )?;
-
-    build_node_hosted_server_configuration(&node_runtime.node, &entrypoint, &["--stdio"])
+fn install_typescript_language_server() -> Result<ManagedServerConfiguration, String> {
+    install_node_hosted_language_server(ManagedServerKind::TypescriptLanguageServer)
 }
 
 fn install_pyright() -> Result<ManagedServerConfiguration, String> {
+    install_node_hosted_language_server(ManagedServerKind::Pyright)
+}
+
+fn install_node_hosted_language_server(
+    kind: ManagedServerKind,
+) -> Result<ManagedServerConfiguration, String> {
+    let spec = node_hosted_language_server_spec(kind);
     let node_runtime = install_node_runtime()?;
-    if let Some(record) = read_installed_server_record(ManagedServerKind::Pyright)? {
+    if let Some(record) = read_installed_server_record(kind)? {
         let entrypoint = PathBuf::from(&record.command_path);
         if entrypoint.is_file() {
             return build_node_hosted_server_configuration(
                 &node_runtime.node,
                 &entrypoint,
-                &["--stdio"],
+                spec.args,
             );
         }
     }
 
-    let package: NpmPackageMetadata = fetch_json("https://registry.npmjs.org/pyright/latest")?;
-    let install_dir =
-        server_root(ManagedServerKind::Pyright).join(format!("pyright-{}", package.version));
+    let package: NpmPackageMetadata = fetch_json(format!(
+        "https://registry.npmjs.org/{}/latest",
+        spec.package_name
+    ))?;
+    let mut packages = vec![format!("{}@{}", spec.package_name, package.version)];
+    packages.extend(
+        spec.extra_packages
+            .iter()
+            .map(|package| (*package).to_string()),
+    );
     let entrypoint = install_managed_node_package(
-        ManagedServerKind::Pyright,
+        kind,
         &package.version,
-        vec![format!("pyright@{}", package.version)],
-        Path::new("node_modules/pyright/langserver.index.js"),
+        packages,
+        Path::new(spec.entrypoint_relative_path),
         &node_runtime,
     )?;
 
-    if !install_dir.is_dir() {
-        return Err(format!(
-            "Pyright was expected in '{}', but the install directory is missing.",
-            install_dir.display()
-        ));
-    }
-
-    build_node_hosted_server_configuration(&node_runtime.node, &entrypoint, &["--stdio"])
+    build_node_hosted_server_configuration(&node_runtime.node, &entrypoint, spec.args)
 }
 
 fn install_gopls() -> Result<ManagedServerConfiguration, String> {
@@ -716,6 +881,23 @@ fn install_node_runtime() -> Result<NodeRuntimePaths, String> {
     let release = latest_lts_node_release()?;
     let archive_name = node_archive_name(&release.version)?;
     let runtime_root = node_runtime_root();
+    let install_dir = runtime_root.join(node_archive_root_dir_name(&release.version)?);
+    if let Ok(paths) = node_runtime_paths_for_install_dir(&install_dir) {
+        write_installed_record(
+            &record_path,
+            &InstalledServerRecord {
+                version: release.version.clone(),
+                install_dir: path_to_string(&install_dir)?,
+                command_path: path_to_string(&paths.node)?,
+            },
+        )?;
+        cleanup_directory_entries(
+            &runtime_root,
+            install_dir.file_name().and_then(|name| name.to_str()),
+        )?;
+        return Ok(paths);
+    }
+
     fs::create_dir_all(&runtime_root).map_err(|error| {
         format!(
             "Failed to create managed Node runtime directory '{}': {error}",
@@ -735,7 +917,6 @@ fn install_node_runtime() -> Result<NodeRuntimePaths, String> {
     }
     let _ = fs::remove_file(&archive_path);
 
-    let install_dir = runtime_root.join(node_archive_root_dir_name(&release.version)?);
     let paths = node_runtime_paths_for_install_dir(&install_dir)?;
     write_installed_record(
         &record_path,
@@ -763,6 +944,15 @@ fn install_managed_node_package(
     let install_dir = server_root(kind).join(format!("{}-{version}", server_root_name(kind)));
     let entrypoint = install_dir.join(entrypoint_relative_path);
     if entrypoint.is_file() {
+        write_installed_server_record(
+            kind,
+            &InstalledServerRecord {
+                version: version.to_string(),
+                install_dir: path_to_string(&install_dir)?,
+                command_path: path_to_string(&entrypoint)?,
+            },
+        )?;
+        cleanup_other_versions(kind, install_dir.file_name().and_then(|name| name.to_str()))?;
         return Ok(entrypoint);
     }
 
@@ -1405,6 +1595,15 @@ fn server_root_name(kind: ManagedServerKind) -> &'static str {
         ManagedServerKind::KotlinLsp => "kotlin-lsp",
         ManagedServerKind::Jdtls => "jdtls",
         ManagedServerKind::Roslyn => "roslyn",
+        ManagedServerKind::VscodeHtmlLanguageServer => "html-language-server",
+        ManagedServerKind::VscodeCssLanguageServer => "css-language-server",
+        ManagedServerKind::VscodeJsonLanguageServer => "json-language-server",
+        ManagedServerKind::VscodeMarkdownLanguageServer => "markdown-language-server",
+        ManagedServerKind::YamlLanguageServer => "yaml-language-server",
+        ManagedServerKind::BashLanguageServer => "bash-language-server",
+        ManagedServerKind::DockerfileLanguageServer => "dockerfile-language-server",
+        ManagedServerKind::Intelephense => "intelephense",
+        ManagedServerKind::SvelteLanguageServer => "svelte-language-server",
     }
 }
 
@@ -1425,9 +1624,14 @@ fn read_installed_record(path: &Path) -> Result<Option<InstalledServerRecord>, S
         Err(error) => return Err(format!("Failed to read managed server metadata: {error}")),
     };
 
-    serde_json::from_slice(&bytes)
-        .map(Some)
-        .map_err(|error| format!("Failed to parse managed server metadata: {error}"))
+    let record: InstalledServerRecord = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("Failed to parse managed server metadata: {error}"))?;
+    let relocated = relocate_installed_record_paths(&record);
+    if relocated != record {
+        write_installed_record(path, &relocated)?;
+    }
+
+    Ok(Some(relocated))
 }
 
 fn write_installed_server_record(
@@ -1448,6 +1652,53 @@ fn write_installed_record(path: &Path, record: &InstalledServerRecord) -> Result
         .map_err(|error| format!("Failed to serialize managed server metadata: {error}"))?;
     fs::write(&path, json)
         .map_err(|error| format!("Failed to write managed server metadata: {error}"))
+}
+
+fn relocate_installed_record_paths(record: &InstalledServerRecord) -> InstalledServerRecord {
+    InstalledServerRecord {
+        version: record.version.clone(),
+        install_dir: relocate_managed_storage_path(&record.install_dir)
+            .unwrap_or_else(|| record.install_dir.clone()),
+        command_path: relocate_managed_storage_path(&record.command_path)
+            .unwrap_or_else(|| record.command_path.clone()),
+    }
+}
+
+fn relocate_managed_storage_path(path: &str) -> Option<String> {
+    let original = Path::new(path);
+    if original.exists() {
+        return None;
+    }
+
+    let rebased = rebase_managed_storage_path(original, &managed_servers_root())?;
+    rebased
+        .exists()
+        .then(|| path_to_string(&rebased).ok())
+        .flatten()
+}
+
+fn rebase_managed_storage_path(path: &Path, managed_root: &Path) -> Option<PathBuf> {
+    let mut after_lsp_root = Vec::new();
+    let mut found_lsp_root = false;
+
+    for component in path.components() {
+        let segment = component.as_os_str();
+        if found_lsp_root {
+            after_lsp_root.push(segment.to_os_string());
+        } else if segment == std::ffi::OsStr::new(MANAGED_LSP_DIR) {
+            found_lsp_root = true;
+        }
+    }
+
+    if !found_lsp_root || after_lsp_root.is_empty() {
+        return None;
+    }
+
+    let mut rebased = managed_root.to_path_buf();
+    for segment in after_lsp_root {
+        rebased.push(segment);
+    }
+    Some(rebased)
 }
 
 fn cleanup_other_versions(kind: ManagedServerKind, keep_name: Option<&str>) -> Result<(), String> {
@@ -1737,7 +1988,11 @@ fn path_to_string(path: &Path) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_kotlin_release_version, parse_java_major_version};
+    use std::path::Path;
+
+    use super::{
+        extract_kotlin_release_version, parse_java_major_version, rebase_managed_storage_path,
+    };
 
     #[test]
     fn extracts_kotlin_release_version() {
@@ -1757,5 +2012,18 @@ mod tests {
     fn parses_legacy_java_version_output() {
         let output = r#"java version "1.8.0_432""#;
         assert_eq!(parse_java_major_version(output), Some(8));
+    }
+
+    #[test]
+    fn rebases_migrated_lsp_storage_paths() {
+        let original = Path::new(
+            "/Users/example/Library/Application Support/gh-ui-tool/lsp-servers/rust-analyzer/rust-analyzer/rust-analyzer",
+        );
+        let current = Path::new("/Users/example/Library/Application Support/remiss/lsp-servers");
+
+        assert_eq!(
+            rebase_managed_storage_path(original, current),
+            Some(current.join("rust-analyzer/rust-analyzer/rust-analyzer"))
+        );
     }
 }

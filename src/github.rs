@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::process::Command;
 
 use crate::{
     cache::{CacheStore, CachedDocument},
@@ -9,8 +8,10 @@ use crate::{
     gh::{self, CommandOutput},
 };
 
-const WORKSPACE_CACHE_KEY: &str = "workspace-snapshot-v2";
+const WORKSPACE_CACHE_KEY: &str = "workspace-snapshot-v3";
 const AUTH_STATE_CACHE_KEY: &str = "auth-state-v1";
+const GITHUB_GRAPHQL_PAGE_SIZE: i64 = 100;
+const GITHUB_SEARCH_RESULT_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthState {
@@ -52,6 +53,10 @@ pub struct PullRequestQueue {
     pub label: String,
     pub items: Vec<PullRequestSummary>,
     pub total_count: i64,
+    #[serde(default = "default_true")]
+    pub is_complete: bool,
+    #[serde(default)]
+    pub truncated_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +146,108 @@ pub struct PullRequestReviewThread {
     pub comments: Vec<PullRequestReviewComment>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectionCompleteness {
+    pub loaded_count: usize,
+    pub total_count: i64,
+    pub is_complete: bool,
+    #[serde(default)]
+    pub truncated_reason: Option<String>,
+}
+
+impl ConnectionCompleteness {
+    fn from_counts(
+        loaded_count: usize,
+        total_count: i64,
+        truncated_reason: Option<String>,
+    ) -> Self {
+        Self {
+            loaded_count,
+            total_count,
+            is_complete: truncated_reason.is_none() && loaded_count as i64 >= total_count,
+            truncated_reason,
+        }
+    }
+}
+
+impl Default for ConnectionCompleteness {
+    fn default() -> Self {
+        Self {
+            loaded_count: 0,
+            total_count: 0,
+            is_complete: true,
+            truncated_reason: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PullRequestDataCompleteness {
+    pub comments: ConnectionCompleteness,
+    pub labels: ConnectionCompleteness,
+    pub reviewers: ConnectionCompleteness,
+    pub latest_reviews: ConnectionCompleteness,
+    pub review_threads: ConnectionCompleteness,
+    pub review_thread_comments: ConnectionCompleteness,
+    pub files: ConnectionCompleteness,
+}
+
+impl PullRequestDataCompleteness {
+    pub fn is_complete(&self) -> bool {
+        self.comments.is_complete
+            && self.labels.is_complete
+            && self.reviewers.is_complete
+            && self.latest_reviews.is_complete
+            && self.review_threads.is_complete
+            && self.review_thread_comments.is_complete
+            && self.files.is_complete
+    }
+
+    pub fn warnings(&self) -> Vec<String> {
+        [
+            ("comments", &self.comments),
+            ("labels", &self.labels),
+            ("reviewers", &self.reviewers),
+            ("reviews", &self.latest_reviews),
+            ("review threads", &self.review_threads),
+            ("thread comments", &self.review_thread_comments),
+            ("files", &self.files),
+        ]
+        .into_iter()
+        .filter_map(|(label, completeness)| {
+            if completeness.is_complete {
+                return None;
+            }
+
+            Some(match completeness.truncated_reason.as_deref() {
+                Some(reason) if !reason.is_empty() => format!(
+                    "Loaded {} of {} {label}: {reason}",
+                    completeness.loaded_count, completeness.total_count
+                ),
+                _ => format!(
+                    "Loaded {} of {} {label}.",
+                    completeness.loaded_count, completeness.total_count
+                ),
+            })
+        })
+        .collect()
+    }
+}
+
+impl Default for PullRequestDataCompleteness {
+    fn default() -> Self {
+        Self {
+            comments: ConnectionCompleteness::default(),
+            labels: ConnectionCompleteness::default(),
+            reviewers: ConnectionCompleteness::default(),
+            latest_reviews: ConnectionCompleteness::default(),
+            review_threads: ConnectionCompleteness::default(),
+            review_thread_comments: ConnectionCompleteness::default(),
+            files: ConnectionCompleteness::default(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PullRequestDetail {
     pub id: String,
@@ -177,6 +284,8 @@ pub struct PullRequestDetail {
     pub files: Vec<PullRequestFile>,
     pub raw_diff: String,
     pub parsed_diff: Vec<ParsedDiffFile>,
+    #[serde(default)]
+    pub data_completeness: PullRequestDataCompleteness,
 }
 
 #[derive(Debug, Clone)]
@@ -648,9 +757,10 @@ fn fetch_viewer() -> Result<Viewer, String> {
 
 fn fetch_queue(id: &str, label: &str, search_query: &str) -> Result<PullRequestQueue, String> {
     let query = r#"
-        query($searchQuery: String!, $count: Int!) {
-          search(query: $searchQuery, type: ISSUE, first: $count) {
+        query($searchQuery: String!, $count: Int!, $cursor: String) {
+          search(query: $searchQuery, type: ISSUE, first: $count, after: $cursor) {
             issueCount
+            pageInfo { hasNextPage endCursor }
             nodes {
               ... on PullRequest {
                 number
@@ -672,48 +782,87 @@ fn fetch_queue(id: &str, label: &str, search_query: &str) -> Result<PullRequestQ
         }
     "#;
 
-    let response = gh::graphql(query, json!({ "searchQuery": search_query, "count": 50 }))?;
-    let search = response
-        .get("data")
-        .and_then(|v| v.get("search"))
-        .ok_or_else(|| "Missing search data in GraphQL response.".to_string())?;
+    let mut items = Vec::new();
+    let mut total_count = 0;
+    let mut cursor: Option<String> = None;
+    let mut truncated_reason = None;
 
-    let total_count = search
-        .get("issueCount")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
+    loop {
+        let response = gh::graphql(
+            query,
+            json!({
+                "searchQuery": search_query,
+                "count": GITHUB_GRAPHQL_PAGE_SIZE,
+                "cursor": cursor,
+            }),
+        )?;
+        if let Some(error_message) = graphql_error_message(&response) {
+            return Err(error_message);
+        }
+        let search = response
+            .get("data")
+            .and_then(|v| v.get("search"))
+            .ok_or_else(|| "Missing search data in GraphQL response.".to_string())?;
 
-    let items = search
-        .get("nodes")
-        .and_then(Value::as_array)
-        .map(|nodes| {
-            nodes
-                .iter()
-                .filter_map(map_pull_request_summary)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+        total_count = search
+            .get("issueCount")
+            .and_then(Value::as_i64)
+            .unwrap_or(total_count);
+
+        if let Some(nodes) = connection_nodes(search) {
+            items.extend(nodes.iter().filter_map(map_pull_request_summary));
+        }
+
+        let page_info = page_info(search);
+        if !page_info.has_next_page {
+            break;
+        }
+
+        if items.len() >= GITHUB_SEARCH_RESULT_LIMIT {
+            truncated_reason = Some(format!(
+                "GitHub search results are capped at {GITHUB_SEARCH_RESULT_LIMIT} items."
+            ));
+            break;
+        }
+
+        let Some(next_cursor) = page_info.end_cursor else {
+            truncated_reason =
+                Some("GitHub did not return a cursor for the next search page.".to_string());
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    if truncated_reason.is_none() && (items.len() as i64) < total_count {
+        truncated_reason = Some(
+            "GitHub reported more matching pull requests than the search connection returned."
+                .to_string(),
+        );
+    }
 
     Ok(PullRequestQueue {
         id: id.to_string(),
         label: label.to_string(),
         items,
         total_count,
+        is_complete: truncated_reason.is_none(),
+        truncated_reason,
     })
 }
 
 fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullRequestDetail, String> {
     let (owner, name) = split_repository(repository)?;
     let query = r#"
-        query($owner: String!, $name: String!, $number: Int!) {
+        query($owner: String!, $name: String!, $number: Int!, $count: Int!) {
           repository(owner: $owner, name: $name) {
             pullRequest(number: $number) {
               id number title body url state isDraft reviewDecision
               baseRefName headRefName baseRefOid headRefOid
               additions deletions changedFiles createdAt updatedAt
               author { login avatarUrl }
-              comments(first: 30) {
+              comments(first: $count) {
                 totalCount
+                pageInfo { hasNextPage endCursor }
                 nodes {
                   id
                   body
@@ -724,20 +873,32 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
                 }
               }
               commits { totalCount }
-              labels(first: 20) { nodes { name } }
-              reviewRequests(first: 20) {
+              labels(first: $count) {
+                totalCount
+                pageInfo { hasNextPage endCursor }
+                nodes { name }
+              }
+              reviewRequests(first: $count) {
+                totalCount
+                pageInfo { hasNextPage endCursor }
                 nodes { requestedReviewer { ... on User { login avatarUrl } ... on Team { slug avatarUrl } } }
               }
-              latestReviews(first: 20) {
+              latestReviews(first: $count) {
+                totalCount
+                pageInfo { hasNextPage endCursor }
                 nodes { state body submittedAt author { login avatarUrl } }
               }
-              reviewThreads(first: 100) {
+              reviewThreads(first: $count) {
+                totalCount
+                pageInfo { hasNextPage endCursor }
                 nodes {
                   id path line originalLine startLine originalStartLine
                   diffSide startDiffSide isCollapsed isOutdated isResolved
                   subjectType viewerCanReply viewerCanResolve viewerCanUnresolve
                   resolvedBy { login avatarUrl }
-                  comments(first: 100) {
+                  comments(first: $count) {
+                    totalCount
+                    pageInfo { hasNextPage endCursor }
                     nodes {
                       id body path line originalLine startLine originalStartLine
                       state createdAt updatedAt publishedAt url
@@ -747,7 +908,11 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
                   }
                 }
               }
-              files(first: 100) { nodes { path additions deletions changeType } }
+              files(first: $count) {
+                totalCount
+                pageInfo { hasNextPage endCursor }
+                nodes { path additions deletions changeType }
+              }
             }
           }
         }
@@ -755,7 +920,7 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
 
     let response = gh::graphql(
         query,
-        json!({ "owner": owner, "name": name, "number": number }),
+        json!({ "owner": owner, "name": name, "number": number, "count": GITHUB_GRAPHQL_PAGE_SIZE }),
     )?;
 
     if let Some(error_message) = graphql_error_message(&response) {
@@ -787,6 +952,104 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
     let raw_diff = diff_output.stdout;
 
     let author = pr.get("author");
+    let null = Value::Null;
+    let comments_connection = pr.get("comments").unwrap_or(&null);
+    let labels_connection = pr.get("labels").unwrap_or(&null);
+    let review_requests_connection = pr.get("reviewRequests").unwrap_or(&null);
+    let latest_reviews_connection = pr.get("latestReviews").unwrap_or(&null);
+    let review_threads_connection = pr.get("reviewThreads").unwrap_or(&null);
+    let files_connection = pr.get("files").unwrap_or(&null);
+
+    let mut comments = map_connection_items(comments_connection, map_pull_request_comment);
+    let comments_completeness = append_pull_request_connection_pages(
+        owner,
+        name,
+        number,
+        "comments",
+        pull_request_comments_selection(),
+        comments_connection,
+        &mut comments,
+        map_pull_request_comment,
+    )?;
+
+    let mut labels = map_connection_items(labels_connection, map_label_name);
+    let labels_completeness = append_pull_request_connection_pages(
+        owner,
+        name,
+        number,
+        "labels",
+        pull_request_labels_selection(),
+        labels_connection,
+        &mut labels,
+        map_label_name,
+    )?;
+
+    let mut reviewer_items = map_connection_items(review_requests_connection, map_review_request);
+    let reviewers_completeness = append_pull_request_connection_pages(
+        owner,
+        name,
+        number,
+        "reviewRequests",
+        pull_request_review_requests_selection(),
+        review_requests_connection,
+        &mut reviewer_items,
+        map_review_request,
+    )?;
+    let (reviewers, reviewer_avatar_urls) = split_reviewer_items(reviewer_items);
+
+    let mut latest_reviews =
+        map_connection_items(latest_reviews_connection, map_pull_request_review);
+    let latest_reviews_completeness = append_pull_request_connection_pages(
+        owner,
+        name,
+        number,
+        "latestReviews",
+        pull_request_latest_reviews_selection(),
+        latest_reviews_connection,
+        &mut latest_reviews,
+        map_pull_request_review,
+    )?;
+
+    let mut review_thread_pages =
+        map_connection_items(review_threads_connection, map_review_thread_page);
+    let review_threads_completeness = append_pull_request_connection_pages(
+        owner,
+        name,
+        number,
+        "reviewThreads",
+        pull_request_review_threads_selection(),
+        review_threads_connection,
+        &mut review_thread_pages,
+        map_review_thread_page,
+    )?;
+    let review_thread_comments_completeness =
+        append_review_thread_comment_pages(&mut review_thread_pages)?;
+    let review_threads = review_thread_pages
+        .into_iter()
+        .map(|page| page.thread)
+        .collect::<Vec<_>>();
+
+    let mut files = map_connection_items(files_connection, map_pull_request_file);
+    let files_completeness = append_pull_request_connection_pages(
+        owner,
+        name,
+        number,
+        "files",
+        pull_request_files_selection(),
+        files_connection,
+        &mut files,
+        map_pull_request_file,
+    )?;
+
+    let data_completeness = PullRequestDataCompleteness {
+        comments: comments_completeness,
+        labels: labels_completeness,
+        reviewers: reviewers_completeness,
+        latest_reviews: latest_reviews_completeness,
+        review_threads: review_threads_completeness,
+        review_thread_comments: review_thread_comments_completeness,
+        files: files_completeness,
+    };
 
     Ok(PullRequestDetail {
         id: str_field(pr, "id"),
@@ -828,109 +1091,335 @@ fn fetch_pull_request_detail(repository: &str, number: i64) -> Result<PullReques
             .unwrap_or(0),
         created_at: str_field(pr, "createdAt"),
         updated_at: str_field(pr, "updatedAt"),
-        labels: pr
-            .get("labels")
-            .and_then(|v| v.get("nodes"))
-            .and_then(Value::as_array)
-            .map(|nodes| {
-                nodes
-                    .iter()
-                    .filter_map(|n| n.get("name").and_then(Value::as_str))
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        comments: pr
-            .get("comments")
-            .and_then(|v| v.get("nodes"))
-            .and_then(Value::as_array)
-            .map(|nodes| {
-                nodes
-                    .iter()
-                    .filter_map(|node| {
-                        Some(PullRequestComment {
-                            id: node.get("id")?.as_str()?.to_string(),
-                            author_login: actor_login(node.get("author"))
-                                .unwrap_or("unknown")
-                                .to_string(),
-                            author_avatar_url: actor_avatar_url(node.get("author"))
-                                .map(str::to_string),
-                            body: str_field(node, "body"),
-                            created_at: str_field(node, "createdAt"),
-                            updated_at: str_field(node, "updatedAt"),
-                            url: node.get("url")?.as_str()?.to_string(),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        reviewers: pr
-            .get("reviewRequests")
-            .and_then(|v| v.get("nodes"))
-            .and_then(Value::as_array)
-            .map(|nodes| {
-                nodes
-                    .iter()
-                    .filter_map(|n| n.get("requestedReviewer"))
-                    .filter_map(|r| {
-                        r.get("login")
-                            .or_else(|| r.get("slug"))
-                            .and_then(Value::as_str)
-                    })
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default(),
-        reviewer_avatar_urls: reviewer_avatar_urls(pr),
-        latest_reviews: pr
-            .get("latestReviews")
-            .and_then(|v| v.get("nodes"))
-            .and_then(Value::as_array)
-            .map(|nodes| {
-                nodes
-                    .iter()
-                    .map(|n| PullRequestReview {
-                        author_login: actor_login(n.get("author"))
-                            .unwrap_or("unknown")
-                            .to_string(),
-                        author_avatar_url: actor_avatar_url(n.get("author")).map(str::to_string),
-                        state: str_field_or(n, "state", "COMMENTED"),
-                        body: str_field(n, "body"),
-                        submitted_at: n
-                            .get("submittedAt")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        review_threads: pr
-            .get("reviewThreads")
-            .and_then(|v| v.get("nodes"))
-            .and_then(Value::as_array)
-            .map(|nodes| nodes.iter().filter_map(map_review_thread).collect())
-            .unwrap_or_default(),
-        files: pr
-            .get("files")
-            .and_then(|v| v.get("nodes"))
-            .and_then(Value::as_array)
-            .map(|nodes| {
-                nodes
-                    .iter()
-                    .filter_map(|n| {
-                        Some(PullRequestFile {
-                            path: n.get("path")?.as_str()?.to_string(),
-                            additions: i64_field(n, "additions"),
-                            deletions: i64_field(n, "deletions"),
-                            change_type: str_field_or(n, "changeType", "MODIFIED"),
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        labels,
+        comments,
+        reviewers,
+        reviewer_avatar_urls,
+        latest_reviews,
+        review_threads,
+        files,
         raw_diff,
         parsed_diff,
+        data_completeness,
     })
+}
+
+#[derive(Debug, Clone, Default)]
+struct PageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewThreadPage {
+    thread: PullRequestReviewThread,
+    comments_total_count: i64,
+    comments_page_info: PageInfo,
+}
+
+fn connection_nodes(connection: &Value) -> Option<&Vec<Value>> {
+    connection.get("nodes").and_then(Value::as_array)
+}
+
+fn connection_total_count(connection: &Value) -> i64 {
+    connection
+        .get("totalCount")
+        .or_else(|| connection.get("issueCount"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+}
+
+fn page_info(connection: &Value) -> PageInfo {
+    let page_info = connection.get("pageInfo");
+    PageInfo {
+        has_next_page: page_info
+            .and_then(|value| value.get("hasNextPage"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        end_cursor: page_info
+            .and_then(|value| value.get("endCursor"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+fn map_connection_items<T>(
+    connection: &Value,
+    mut map_node: impl FnMut(&Value) -> Option<T>,
+) -> Vec<T> {
+    connection_nodes(connection)
+        .map(|nodes| {
+            nodes
+                .iter()
+                .filter_map(|node| map_node(node))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn append_pull_request_connection_pages<T>(
+    owner: &str,
+    name: &str,
+    number: i64,
+    connection_name: &str,
+    selection: &str,
+    initial_connection: &Value,
+    items: &mut Vec<T>,
+    mut map_node: impl FnMut(&Value) -> Option<T>,
+) -> Result<ConnectionCompleteness, String> {
+    let total_count = connection_total_count(initial_connection);
+    let mut page = page_info(initial_connection);
+    let mut truncated_reason = None;
+
+    while page.has_next_page {
+        let Some(cursor) = page.end_cursor.clone() else {
+            truncated_reason = Some(format!(
+                "GitHub did not return a cursor for the next {connection_name} page."
+            ));
+            break;
+        };
+        let connection = fetch_pull_request_connection(
+            owner,
+            name,
+            number,
+            connection_name,
+            selection,
+            Some(cursor),
+        )?;
+        if let Some(nodes) = connection_nodes(&connection) {
+            items.extend(nodes.iter().filter_map(|node| map_node(node)));
+        }
+        page = page_info(&connection);
+    }
+
+    if truncated_reason.is_none() && (items.len() as i64) < total_count {
+        truncated_reason = Some(format!(
+            "GitHub reported more {connection_name} than the connection returned."
+        ));
+    }
+
+    Ok(ConnectionCompleteness::from_counts(
+        items.len(),
+        total_count,
+        truncated_reason,
+    ))
+}
+
+fn fetch_pull_request_connection(
+    owner: &str,
+    name: &str,
+    number: i64,
+    connection_name: &str,
+    selection: &str,
+    cursor: Option<String>,
+) -> Result<Value, String> {
+    let query = format!(
+        r#"
+        query($owner: String!, $name: String!, $number: Int!, $count: Int!, $cursor: String) {{
+          repository(owner: $owner, name: $name) {{
+            pullRequest(number: $number) {{
+              {selection}
+            }}
+          }}
+        }}
+    "#
+    );
+    let response = gh::graphql(
+        &query,
+        json!({
+            "owner": owner,
+            "name": name,
+            "number": number,
+            "count": GITHUB_GRAPHQL_PAGE_SIZE,
+            "cursor": cursor,
+        }),
+    )?;
+    if let Some(error_message) = graphql_error_message(&response) {
+        return Err(error_message);
+    }
+
+    response
+        .get("data")
+        .and_then(|value| value.get("repository"))
+        .and_then(|value| value.get("pullRequest"))
+        .and_then(|value| value.get(connection_name))
+        .cloned()
+        .ok_or_else(|| format!("Missing {connection_name} data in GraphQL response."))
+}
+
+fn append_review_thread_comment_pages(
+    thread_pages: &mut [ReviewThreadPage],
+) -> Result<ConnectionCompleteness, String> {
+    let mut total_count = 0;
+    let mut truncated_reason = None;
+
+    for thread_page in thread_pages.iter_mut() {
+        total_count += thread_page.comments_total_count;
+        let mut page = thread_page.comments_page_info.clone();
+
+        while page.has_next_page {
+            let Some(cursor) = page.end_cursor.clone() else {
+                truncated_reason = Some(format!(
+                    "GitHub did not return a cursor for comments in thread {}.",
+                    thread_page.thread.id
+                ));
+                break;
+            };
+            let connection =
+                fetch_review_thread_comments_connection(&thread_page.thread.id, cursor)?;
+            if let Some(nodes) = connection_nodes(&connection) {
+                thread_page
+                    .thread
+                    .comments
+                    .extend(nodes.iter().filter_map(map_review_comment));
+            }
+            page = page_info(&connection);
+        }
+
+        if (thread_page.thread.comments.len() as i64) < thread_page.comments_total_count
+            && truncated_reason.is_none()
+        {
+            truncated_reason = Some(format!(
+                "GitHub reported more comments than returned for thread {}.",
+                thread_page.thread.id
+            ));
+        }
+    }
+
+    let loaded_count = thread_pages
+        .iter()
+        .map(|thread_page| thread_page.thread.comments.len())
+        .sum();
+    Ok(ConnectionCompleteness::from_counts(
+        loaded_count,
+        total_count,
+        truncated_reason,
+    ))
+}
+
+fn fetch_review_thread_comments_connection(
+    thread_id: &str,
+    cursor: String,
+) -> Result<Value, String> {
+    let query = r#"
+        query($threadId: ID!, $count: Int!, $cursor: String) {
+          node(id: $threadId) {
+            ... on PullRequestReviewThread {
+              comments(first: $count, after: $cursor) {
+                totalCount
+                pageInfo { hasNextPage endCursor }
+                nodes {
+                  id body path line originalLine startLine originalStartLine
+                  state createdAt updatedAt publishedAt url
+                  replyTo { id }
+                  author { login avatarUrl }
+                }
+              }
+            }
+          }
+        }
+    "#;
+    let response = gh::graphql(
+        query,
+        json!({
+            "threadId": thread_id,
+            "count": GITHUB_GRAPHQL_PAGE_SIZE,
+            "cursor": cursor,
+        }),
+    )?;
+    if let Some(error_message) = graphql_error_message(&response) {
+        return Err(error_message);
+    }
+
+    response
+        .get("data")
+        .and_then(|value| value.get("node"))
+        .and_then(|value| value.get("comments"))
+        .cloned()
+        .ok_or_else(|| format!("Missing comments data for review thread {thread_id}."))
+}
+
+fn pull_request_comments_selection() -> &'static str {
+    r#"
+      comments(first: $count, after: $cursor) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id body createdAt updatedAt url
+          author { login avatarUrl }
+        }
+      }
+    "#
+}
+
+fn pull_request_labels_selection() -> &'static str {
+    r#"
+      labels(first: $count, after: $cursor) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { name }
+      }
+    "#
+}
+
+fn pull_request_review_requests_selection() -> &'static str {
+    r#"
+      reviewRequests(first: $count, after: $cursor) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          requestedReviewer {
+            ... on User { login avatarUrl }
+            ... on Team { slug avatarUrl }
+          }
+        }
+      }
+    "#
+}
+
+fn pull_request_latest_reviews_selection() -> &'static str {
+    r#"
+      latestReviews(first: $count, after: $cursor) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { state body submittedAt author { login avatarUrl } }
+      }
+    "#
+}
+
+fn pull_request_review_threads_selection() -> &'static str {
+    r#"
+      reviewThreads(first: $count, after: $cursor) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id path line originalLine startLine originalStartLine
+          diffSide startDiffSide isCollapsed isOutdated isResolved
+          subjectType viewerCanReply viewerCanResolve viewerCanUnresolve
+          resolvedBy { login avatarUrl }
+          comments(first: $count) {
+            totalCount
+            pageInfo { hasNextPage endCursor }
+            nodes {
+              id body path line originalLine startLine originalStartLine
+              state createdAt updatedAt publishedAt url
+              replyTo { id }
+              author { login avatarUrl }
+            }
+          }
+        }
+      }
+    "#
+}
+
+fn pull_request_files_selection() -> &'static str {
+    r#"
+      files(first: $count, after: $cursor) {
+        totalCount
+        pageInfo { hasNextPage endCursor }
+        nodes { path additions deletions changeType }
+      }
+    "#
 }
 
 fn cached_auth_state(cache: &CacheStore) -> Result<AuthState, String> {
@@ -1007,29 +1496,26 @@ fn fetch_repository_file_content(
         encoded_path
     );
 
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &endpoint,
-            "--method",
-            "GET",
-            "--header",
-            "Accept: application/vnd.github.raw",
-            "--field",
-            &format!("ref={reference}"),
-        ])
-        .output()
-        .map_err(|e| format!("Failed to launch gh: {e}"))?;
+    let output = gh::run_owned(vec![
+        "api".to_string(),
+        endpoint,
+        "--method".to_string(),
+        "GET".to_string(),
+        "--header".to_string(),
+        "Accept: application/vnd.github.raw".to_string(),
+        "--field".to_string(),
+        format!("ref={reference}"),
+    ])?;
 
-    if !output.status.success() {
+    if output.exit_code != Some(0) {
         return Err(format!(
             "Failed to fetch file contents for {repository}@{reference}:{path}: {}",
-            String::from_utf8_lossy(&output.stderr)
+            output.stderr
         ));
     }
 
-    let size_bytes = output.stdout.len();
-    match String::from_utf8(output.stdout) {
+    let size_bytes = output.stdout_bytes.len();
+    match String::from_utf8(output.stdout_bytes) {
         Ok(content) => Ok(RepositoryFileContent {
             repository: repository.to_string(),
             reference: reference.to_string(),
@@ -1089,22 +1575,69 @@ fn map_pull_request_summary(node: &Value) -> Option<PullRequestSummary> {
     })
 }
 
-fn reviewer_avatar_urls(pr: &Value) -> BTreeMap<String, String> {
-    pr.get("reviewRequests")
-        .and_then(|v| v.get("nodes"))
-        .and_then(Value::as_array)
-        .map(|nodes| {
-            nodes
-                .iter()
-                .filter_map(|node| node.get("requestedReviewer"))
-                .filter_map(|reviewer| {
-                    let login = actor_login(Some(reviewer))?;
-                    let avatar_url = actor_avatar_url(Some(reviewer))?;
-                    Some((login.to_string(), avatar_url.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+fn map_pull_request_comment(node: &Value) -> Option<PullRequestComment> {
+    Some(PullRequestComment {
+        id: node.get("id")?.as_str()?.to_string(),
+        author_login: actor_login(node.get("author"))
+            .unwrap_or("unknown")
+            .to_string(),
+        author_avatar_url: actor_avatar_url(node.get("author")).map(str::to_string),
+        body: str_field(node, "body"),
+        created_at: str_field(node, "createdAt"),
+        updated_at: str_field(node, "updatedAt"),
+        url: node.get("url")?.as_str()?.to_string(),
+    })
+}
+
+fn map_label_name(node: &Value) -> Option<String> {
+    node.get("name").and_then(Value::as_str).map(str::to_string)
+}
+
+fn map_review_request(node: &Value) -> Option<(String, Option<String>)> {
+    let reviewer = node.get("requestedReviewer")?;
+    let login = actor_login(Some(reviewer))?.to_string();
+    let avatar_url = actor_avatar_url(Some(reviewer)).map(str::to_string);
+    Some((login, avatar_url))
+}
+
+fn split_reviewer_items(
+    reviewer_items: Vec<(String, Option<String>)>,
+) -> (Vec<String>, BTreeMap<String, String>) {
+    let mut reviewers = Vec::new();
+    let mut avatar_urls = BTreeMap::new();
+    for (reviewer, avatar_url) in reviewer_items {
+        if !reviewers.iter().any(|existing| existing == &reviewer) {
+            reviewers.push(reviewer.clone());
+        }
+        if let Some(avatar_url) = avatar_url {
+            avatar_urls.insert(reviewer, avatar_url);
+        }
+    }
+    (reviewers, avatar_urls)
+}
+
+fn map_pull_request_review(node: &Value) -> Option<PullRequestReview> {
+    Some(PullRequestReview {
+        author_login: actor_login(node.get("author"))
+            .unwrap_or("unknown")
+            .to_string(),
+        author_avatar_url: actor_avatar_url(node.get("author")).map(str::to_string),
+        state: str_field_or(node, "state", "COMMENTED"),
+        body: str_field(node, "body"),
+        submitted_at: node
+            .get("submittedAt")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn map_pull_request_file(node: &Value) -> Option<PullRequestFile> {
+    Some(PullRequestFile {
+        path: node.get("path")?.as_str()?.to_string(),
+        additions: i64_field(node, "additions"),
+        deletions: i64_field(node, "deletions"),
+        change_type: str_field_or(node, "changeType", "MODIFIED"),
+    })
 }
 
 fn actor_login(actor: Option<&Value>) -> Option<&str> {
@@ -1121,6 +1654,16 @@ fn actor_avatar_url(actor: Option<&Value>) -> Option<&str> {
         .and_then(|actor| actor.get("avatarUrl"))
         .and_then(Value::as_str)
         .filter(|url| !url.trim().is_empty())
+}
+
+fn map_review_thread_page(node: &Value) -> Option<ReviewThreadPage> {
+    let null = Value::Null;
+    let comments_connection = node.get("comments").unwrap_or(&null);
+    Some(ReviewThreadPage {
+        thread: map_review_thread(node)?,
+        comments_total_count: connection_total_count(comments_connection),
+        comments_page_info: page_info(comments_connection),
+    })
 }
 
 fn map_review_thread(node: &Value) -> Option<PullRequestReviewThread> {
@@ -1168,43 +1711,37 @@ fn map_review_thread(node: &Value) -> Option<PullRequestReviewThread> {
             .unwrap_or(false),
         comments: node
             .get("comments")
-            .and_then(|v| v.get("nodes"))
-            .and_then(Value::as_array)
-            .map(|nodes| {
-                nodes
-                    .iter()
-                    .filter_map(|c| {
-                        Some(PullRequestReviewComment {
-                            id: c.get("id")?.as_str()?.to_string(),
-                            author_login: actor_login(c.get("author"))
-                                .unwrap_or("unknown")
-                                .to_string(),
-                            author_avatar_url: actor_avatar_url(c.get("author"))
-                                .map(str::to_string),
-                            body: str_field(c, "body"),
-                            path: c.get("path")?.as_str()?.to_string(),
-                            line: c.get("line").and_then(Value::as_i64),
-                            original_line: c.get("originalLine").and_then(Value::as_i64),
-                            start_line: c.get("startLine").and_then(Value::as_i64),
-                            original_start_line: c.get("originalStartLine").and_then(Value::as_i64),
-                            state: str_field_or(c, "state", "PUBLISHED"),
-                            created_at: str_field(c, "createdAt"),
-                            updated_at: str_field(c, "updatedAt"),
-                            published_at: c
-                                .get("publishedAt")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                            reply_to_id: c
-                                .get("replyTo")
-                                .and_then(|v| v.get("id"))
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                            url: str_field(c, "url"),
-                        })
-                    })
-                    .collect()
-            })
+            .map(|connection| map_connection_items(connection, map_review_comment))
             .unwrap_or_default(),
+    })
+}
+
+fn map_review_comment(node: &Value) -> Option<PullRequestReviewComment> {
+    Some(PullRequestReviewComment {
+        id: node.get("id")?.as_str()?.to_string(),
+        author_login: actor_login(node.get("author"))
+            .unwrap_or("unknown")
+            .to_string(),
+        author_avatar_url: actor_avatar_url(node.get("author")).map(str::to_string),
+        body: str_field(node, "body"),
+        path: node.get("path")?.as_str()?.to_string(),
+        line: node.get("line").and_then(Value::as_i64),
+        original_line: node.get("originalLine").and_then(Value::as_i64),
+        start_line: node.get("startLine").and_then(Value::as_i64),
+        original_start_line: node.get("originalStartLine").and_then(Value::as_i64),
+        state: str_field_or(node, "state", "PUBLISHED"),
+        created_at: str_field(node, "createdAt"),
+        updated_at: str_field(node, "updatedAt"),
+        published_at: node
+            .get("publishedAt")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        reply_to_id: node
+            .get("replyTo")
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        url: str_field(node, "url"),
     })
 }
 
@@ -1250,12 +1787,14 @@ fn default_queues() -> Vec<PullRequestQueue> {
         label: label.to_string(),
         items: Vec::new(),
         total_count: 0,
+        is_complete: true,
+        truncated_reason: None,
     })
     .collect()
 }
 
 fn pull_request_detail_cache_key(repository: &str, number: i64) -> String {
-    format!("pr-detail-v3:{}#{}", repository, number)
+    format!("pr-detail-v4:{}#{}", repository, number)
 }
 
 fn pull_request_file_content_cache_key(repository: &str, reference: &str, path: &str) -> String {
@@ -1272,6 +1811,10 @@ fn pull_request_file_content_cache_key(repository: &str, reference: &str, path: 
 
 fn default_change_type() -> String {
     "MODIFIED".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn encode_uri_component(value: &str) -> String {

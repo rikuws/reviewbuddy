@@ -310,6 +310,7 @@ struct LspIo {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    workspace_folders: Vec<Value>,
 }
 
 #[derive(Clone)]
@@ -320,6 +321,17 @@ struct OpenDocumentState {
 
 impl LspSession {
     fn spawn(repo_root: PathBuf, config: ResolvedServerConfiguration) -> Result<Self, String> {
+        let root_uri = file_uri(&repo_root)?;
+        let root_name = repo_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("repository")
+            .to_string();
+        let workspace_folders = vec![json!({
+            "uri": root_uri,
+            "name": root_name,
+        })];
+
         let mut child = Command::new(&config.command)
             .args(&config.args)
             .current_dir(&repo_root)
@@ -353,6 +365,7 @@ impl LspSession {
                 child,
                 stdin,
                 stdout: BufReader::new(stdout),
+                workspace_folders,
             }),
             capabilities: Mutex::new(None),
             documents: Mutex::new(HashMap::new()),
@@ -395,12 +408,13 @@ impl LspSession {
             return Ok(capabilities);
         }
 
-        let root_uri = file_uri(&self.repo_root)?;
-        let root_name = self
-            .repo_root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("repository");
+        let workspace_folders = io.workspace_folders.clone();
+        let root_uri = workspace_folders
+            .first()
+            .and_then(|folder| folder.get("uri"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or(file_uri(&self.repo_root)?);
 
         let result = send_request(
             &mut io,
@@ -413,18 +427,35 @@ impl LspSession {
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "rootUri": root_uri,
-                "workspaceFolders": [
-                    {
-                        "uri": root_uri,
-                        "name": root_name,
-                    }
-                ],
+                "workspaceFolders": workspace_folders,
                 "capabilities": {
+                    "workspace": {
+                        "configuration": true,
+                        "workspaceFolders": true,
+                    },
                     "textDocument": {
-                        "hover": {},
-                        "definition": {},
+                        "synchronization": {
+                            "dynamicRegistration": false,
+                            "didSave": true,
+                        },
+                        "hover": {
+                            "contentFormat": ["markdown", "plaintext"],
+                        },
+                        "definition": {
+                            "linkSupport": true,
+                        },
                         "references": {},
-                        "signatureHelp": {},
+                        "signatureHelp": {
+                            "signatureInformation": {
+                                "documentationFormat": ["markdown", "plaintext"],
+                                "parameterInformation": {
+                                    "labelOffsetSupport": true,
+                                },
+                            },
+                        },
+                        "publishDiagnostics": {
+                            "relatedInformation": true,
+                        },
                     }
                 }
             }),
@@ -720,7 +751,23 @@ fn resolved_server_configuration_cache(
 }
 
 fn language_server_spec_for_path(file_path: &str) -> Option<LanguageServerSpec> {
-    let extension = Path::new(file_path)
+    let path = Path::new(file_path);
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if file_name == "dockerfile" || file_name.ends_with(".dockerfile") {
+        return Some(LanguageServerSpec {
+            language_id: "dockerfile",
+            command_candidates: &["docker-langserver"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::DockerfileLanguageServer),
+        });
+    }
+
+    let extension = path
         .extension()
         .and_then(|ext| ext.to_str())?
         .to_ascii_lowercase();
@@ -786,6 +833,144 @@ fn language_server_spec_for_path(file_path: &str) -> Option<LanguageServerSpec> 
             args: &["--stdio"],
             managed: Some(ManagedServerKind::Roslyn),
         }),
+        "html" | "htm" => Some(LanguageServerSpec {
+            language_id: "html",
+            command_candidates: &["vscode-html-language-server"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::VscodeHtmlLanguageServer),
+        }),
+        "css" => Some(LanguageServerSpec {
+            language_id: "css",
+            command_candidates: &["vscode-css-language-server"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::VscodeCssLanguageServer),
+        }),
+        "scss" => Some(LanguageServerSpec {
+            language_id: "scss",
+            command_candidates: &["vscode-css-language-server"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::VscodeCssLanguageServer),
+        }),
+        "less" => Some(LanguageServerSpec {
+            language_id: "less",
+            command_candidates: &["vscode-css-language-server"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::VscodeCssLanguageServer),
+        }),
+        "json" => Some(LanguageServerSpec {
+            language_id: "json",
+            command_candidates: &["vscode-json-language-server"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::VscodeJsonLanguageServer),
+        }),
+        "jsonc" => Some(LanguageServerSpec {
+            language_id: "jsonc",
+            command_candidates: &["vscode-json-language-server"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::VscodeJsonLanguageServer),
+        }),
+        "md" | "markdown" => Some(LanguageServerSpec {
+            language_id: "markdown",
+            command_candidates: &["vscode-markdown-language-server"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::VscodeMarkdownLanguageServer),
+        }),
+        "yaml" | "yml" => Some(LanguageServerSpec {
+            language_id: "yaml",
+            command_candidates: &["yaml-language-server"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::YamlLanguageServer),
+        }),
+        "sh" | "bash" | "zsh" => Some(LanguageServerSpec {
+            language_id: "shellscript",
+            command_candidates: &["bash-language-server"],
+            args: &["start"],
+            managed: Some(ManagedServerKind::BashLanguageServer),
+        }),
+        "php" => Some(LanguageServerSpec {
+            language_id: "php",
+            command_candidates: &["intelephense"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::Intelephense),
+        }),
+        "svelte" => Some(LanguageServerSpec {
+            language_id: "svelte",
+            command_candidates: &["svelteserver"],
+            args: &["--stdio"],
+            managed: Some(ManagedServerKind::SvelteLanguageServer),
+        }),
+        "c" => Some(LanguageServerSpec {
+            language_id: "c",
+            command_candidates: &["clangd"],
+            args: &[],
+            managed: None,
+        }),
+        "h" => Some(LanguageServerSpec {
+            language_id: "c",
+            command_candidates: &["clangd"],
+            args: &[],
+            managed: None,
+        }),
+        "cc" | "cpp" | "cxx" | "hpp" | "hh" | "hxx" => Some(LanguageServerSpec {
+            language_id: "cpp",
+            command_candidates: &["clangd"],
+            args: &[],
+            managed: None,
+        }),
+        "lua" => Some(LanguageServerSpec {
+            language_id: "lua",
+            command_candidates: &["lua-language-server"],
+            args: &[],
+            managed: None,
+        }),
+        "swift" => Some(LanguageServerSpec {
+            language_id: "swift",
+            command_candidates: &["sourcekit-lsp"],
+            args: &[],
+            managed: None,
+        }),
+        "zig" => Some(LanguageServerSpec {
+            language_id: "zig",
+            command_candidates: &["zls"],
+            args: &[],
+            managed: None,
+        }),
+        "nix" => Some(LanguageServerSpec {
+            language_id: "nix",
+            command_candidates: &["nil", "nixd"],
+            args: &[],
+            managed: None,
+        }),
+        "toml" => Some(LanguageServerSpec {
+            language_id: "toml",
+            command_candidates: &["taplo"],
+            args: &["lsp", "stdio"],
+            managed: None,
+        }),
+        "tf" | "tfvars" => Some(LanguageServerSpec {
+            language_id: "terraform",
+            command_candidates: &["terraform-ls"],
+            args: &["serve"],
+            managed: None,
+        }),
+        "graphql" | "gql" => Some(LanguageServerSpec {
+            language_id: "graphql",
+            command_candidates: &["graphql-lsp"],
+            args: &["server", "-m", "stream"],
+            managed: None,
+        }),
+        "sql" => Some(LanguageServerSpec {
+            language_id: "sql",
+            command_candidates: &["sqls"],
+            args: &[],
+            managed: None,
+        }),
+        "rb" => Some(LanguageServerSpec {
+            language_id: "ruby",
+            command_candidates: &["ruby-lsp"],
+            args: &[],
+            managed: None,
+        }),
         _ => None,
     }
 }
@@ -794,7 +979,7 @@ fn resolve_server_command(candidates: &[&str]) -> Option<String> {
     candidates.iter().find_map(|candidate| {
         let resolved = resolve_binary_path(candidate)?;
         if command_candidate_is_usable(candidate, &resolved) {
-            Some((*candidate).to_string())
+            Some(resolved.to_string_lossy().to_string())
         } else {
             None
         }
@@ -810,11 +995,29 @@ fn resolve_binary_path(binary: &str) -> Option<PathBuf> {
     env::var_os("PATH")
         .map(|paths| {
             env::split_paths(&paths).find_map(|directory| {
-                let candidate = directory.join(binary);
-                candidate.is_file().then_some(candidate)
+                executable_name_candidates(binary).find_map(|name| {
+                    let candidate = directory.join(name);
+                    candidate.is_file().then_some(candidate)
+                })
             })
         })
         .unwrap_or(None)
+}
+
+fn executable_name_candidates(binary: &str) -> Box<dyn Iterator<Item = String> + '_> {
+    if cfg!(windows) && Path::new(binary).extension().is_none() {
+        Box::new(
+            [
+                binary.to_string(),
+                format!("{binary}.exe"),
+                format!("{binary}.cmd"),
+                format!("{binary}.bat"),
+            ]
+            .into_iter(),
+        )
+    } else {
+        Box::new(std::iter::once(binary.to_string()))
+    }
 }
 
 fn command_candidate_is_usable(binary: &str, resolved_path: &Path) -> bool {
@@ -826,7 +1029,7 @@ fn command_candidate_is_usable(binary: &str, resolved_path: &Path) -> bool {
         return true;
     }
 
-    Command::new(binary)
+    Command::new(resolved_path)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1057,7 +1260,8 @@ fn handle_server_request(io: &mut LspIo, message: &Value) -> Result<bool, String
     };
 
     if let Some(id) = message.get("id").cloned() {
-        send_response(io, id, Value::Null)?;
+        let result = server_request_result(method, message.get("params"), &io.workspace_folders);
+        send_response(io, id, result)?;
     }
 
     match method {
@@ -1066,6 +1270,32 @@ fn handle_server_request(io: &mut LspIo, message: &Value) -> Result<bool, String
     }
 
     Ok(true)
+}
+
+fn server_request_result(
+    method: &str,
+    params: Option<&Value>,
+    workspace_folders: &[Value],
+) -> Value {
+    match method {
+        "workspace/configuration" => workspace_configuration_result(params),
+        "workspace/workspaceFolders" => Value::Array(workspace_folders.to_vec()),
+        "workspace/applyEdit" => json!({ "applied": false }),
+        "window/showMessageRequest" => Value::Null,
+        "window/workDoneProgress/create" => Value::Null,
+        "client/registerCapability" | "client/unregisterCapability" => Value::Null,
+        _ => Value::Null,
+    }
+}
+
+fn workspace_configuration_result(params: Option<&Value>) -> Value {
+    let item_count = params
+        .and_then(|params| params.get("items"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+
+    Value::Array((0..item_count).map(|_| json!({})).collect())
 }
 
 fn send_response(io: &mut LspIo, id: Value, result: Value) -> Result<(), String> {
@@ -1409,6 +1639,78 @@ mod tests {
     }
 
     #[test]
+    fn resolves_managed_web_and_config_server_specs() {
+        let cases = [
+            (
+                "src/index.html",
+                "html",
+                ManagedServerKind::VscodeHtmlLanguageServer,
+            ),
+            (
+                "src/styles.scss",
+                "scss",
+                ManagedServerKind::VscodeCssLanguageServer,
+            ),
+            (
+                "package.json",
+                "json",
+                ManagedServerKind::VscodeJsonLanguageServer,
+            ),
+            (
+                "README.md",
+                "markdown",
+                ManagedServerKind::VscodeMarkdownLanguageServer,
+            ),
+            ("config.yaml", "yaml", ManagedServerKind::YamlLanguageServer),
+            (
+                "scripts/build.sh",
+                "shellscript",
+                ManagedServerKind::BashLanguageServer,
+            ),
+            (
+                "Dockerfile",
+                "dockerfile",
+                ManagedServerKind::DockerfileLanguageServer,
+            ),
+            ("src/index.php", "php", ManagedServerKind::Intelephense),
+            (
+                "src/App.svelte",
+                "svelte",
+                ManagedServerKind::SvelteLanguageServer,
+            ),
+        ];
+
+        for (path, language_id, managed) in cases {
+            let spec = language_server_spec_for_path(path).expect("expected spec");
+            assert_eq!(spec.language_id, language_id);
+            assert!(matches!(spec.managed, Some(kind) if kind == managed));
+        }
+    }
+
+    #[test]
+    fn resolves_path_based_native_server_specs() {
+        let cases = [
+            ("src/main.c", "c", "clangd"),
+            ("src/main.cpp", "cpp", "clangd"),
+            ("src/main.swift", "swift", "sourcekit-lsp"),
+            ("src/main.zig", "zig", "zls"),
+            ("flake.nix", "nix", "nil"),
+            ("taplo.toml", "toml", "taplo"),
+            ("main.tf", "terraform", "terraform-ls"),
+            ("schema.graphql", "graphql", "graphql-lsp"),
+            ("query.sql", "sql", "sqls"),
+            ("lib/app.rb", "ruby", "ruby-lsp"),
+        ];
+
+        for (path, language_id, command) in cases {
+            let spec = language_server_spec_for_path(path).expect("expected spec");
+            assert_eq!(spec.language_id, language_id);
+            assert_eq!(spec.command_candidates.first().copied(), Some(command));
+            assert!(spec.managed.is_none());
+        }
+    }
+
+    #[test]
     fn parses_server_capabilities_from_initialize_result() {
         let capabilities = parse_server_capabilities(&json!({
             "capabilities": {
@@ -1425,6 +1727,35 @@ mod tests {
         assert!(capabilities.hover_supported);
         assert!(capabilities.signature_help_supported);
         assert!(capabilities.definition_supported);
+    }
+
+    #[test]
+    fn answers_workspace_configuration_requests_with_empty_settings() {
+        let result = server_request_result(
+            "workspace/configuration",
+            Some(&json!({
+                "items": [
+                    { "section": "rust-analyzer" },
+                    { "section": "gopls" }
+                ]
+            })),
+            &[],
+        );
+
+        assert_eq!(result, json!([{}, {}]));
+    }
+
+    #[test]
+    fn answers_workspace_folder_requests_with_current_folders() {
+        let folders = vec![json!({
+            "uri": "file:///tmp/remiss",
+            "name": "remiss",
+        })];
+
+        assert_eq!(
+            server_request_result("workspace/workspaceFolders", None, &folders),
+            Value::Array(folders)
+        );
     }
 
     #[test]

@@ -752,37 +752,39 @@ mod tests {
     #[test]
     fn merge_tour_honors_response_overrides() {
         let input = sample_input();
-        let mut response = TourResponse::default();
-        response.summary = Some("Custom summary".into());
-        response.review_focus = Some("Custom focus".into());
-        response.overview = Some(TourResponseOverview {
-            title: Some("Custom overview".into()),
-            summary: Some("Overview summary".into()),
-            detail: Some("Overview detail".into()),
-            badge: Some("custom".into()),
-        });
-        response.steps = vec![TourResponseStep {
-            source_step_id: Some("file:a".into()),
-            title: Some("Inspected A".into()),
-            summary: Some("A summary".into()),
-            detail: Some("A detail".into()),
-            badge: Some("focus".into()),
-        }];
-        response.sections = vec![TourResponseSection {
-            title: Some("Section 1".into()),
-            summary: Some("Section summary".into()),
-            detail: Some("Section detail".into()),
-            badge: Some("badge".into()),
-            step_ids: vec!["file:a".into(), "file:a".into(), "file:b".into()],
-            review_points: vec!["point".into()],
-            callsites: vec![TourResponseCallsite {
-                title: None,
-                path: Some("a".into()),
-                line: Some(10),
-                summary: Some("do the thing".into()),
-                snippet: Some("code".into()),
+        let response = TourResponse {
+            summary: Some("Custom summary".into()),
+            review_focus: Some("Custom focus".into()),
+            overview: Some(TourResponseOverview {
+                title: Some("Custom overview".into()),
+                summary: Some("Overview summary".into()),
+                detail: Some("Overview detail".into()),
+                badge: Some("custom".into()),
+            }),
+            steps: vec![TourResponseStep {
+                source_step_id: Some("file:a".into()),
+                title: Some("Inspected A".into()),
+                summary: Some("A summary".into()),
+                detail: Some("A detail".into()),
+                badge: Some("focus".into()),
             }],
-        }];
+            sections: vec![TourResponseSection {
+                title: Some("Section 1".into()),
+                summary: Some("Section summary".into()),
+                detail: Some("Section detail".into()),
+                badge: Some("badge".into()),
+                step_ids: vec!["file:a".into(), "file:a".into(), "file:b".into()],
+                review_points: vec!["point".into()],
+                callsites: vec![TourResponseCallsite {
+                    title: None,
+                    path: Some("a".into()),
+                    line: Some(10),
+                    summary: Some("do the thing".into()),
+                    snippet: Some("code".into()),
+                }],
+            }],
+            ..Default::default()
+        };
 
         let tour = merge_tour(response, &input, Some("gpt-5".into()));
         assert_eq!(tour.summary, "Custom summary");

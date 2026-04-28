@@ -15,13 +15,15 @@ pub enum ReviewCenterMode {
     #[default]
     SemanticDiff,
     SourceBrowser,
+    AiTour,
 }
 
 impl ReviewCenterMode {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::SemanticDiff => "Semantic diff",
-            Self::SourceBrowser => "Source browser",
+            Self::SemanticDiff => "Diff",
+            Self::SourceBrowser => "File",
+            Self::AiTour => "AI Tour",
         }
     }
 }
@@ -105,6 +107,12 @@ impl ReviewLocation {
         }
     }
 
+    pub fn from_ai_tour(file_path: impl Into<String>, anchor: Option<DiffAnchor>) -> Self {
+        let mut location = Self::from_diff(file_path, anchor);
+        location.mode = ReviewCenterMode::AiTour;
+        location
+    }
+
     pub fn as_source_target(&self) -> Option<ReviewSourceTarget> {
         (self.mode == ReviewCenterMode::SourceBrowser).then(|| ReviewSourceTarget {
             path: self.file_path.clone(),
@@ -115,7 +123,7 @@ impl ReviewLocation {
 
     pub fn stable_key(&self) -> String {
         match self.mode {
-            ReviewCenterMode::SemanticDiff => format!(
+            ReviewCenterMode::SemanticDiff | ReviewCenterMode::AiTour => format!(
                 "diff:{}:{}:{}:{}",
                 self.file_path,
                 self.anchor
@@ -175,7 +183,7 @@ pub struct ReviewSessionDocument {
     pub inspector_mode: ReviewInspectorMode,
     #[serde(default = "default_true")]
     pub show_file_tree: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "default_false")]
     pub show_inspector: bool,
     #[serde(default)]
     pub source_target: Option<ReviewSourceTarget>,
@@ -221,7 +229,7 @@ impl Default for ReviewSessionState {
             center_mode: ReviewCenterMode::SemanticDiff,
             inspector_mode: ReviewInspectorMode::Graph,
             show_file_tree: true,
-            show_inspector: true,
+            show_inspector: false,
             source_target: None,
             waymarks: Vec::new(),
             task_route: None,
@@ -286,6 +294,10 @@ impl ReviewSessionState {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_false() -> bool {
+    false
 }
 
 pub fn location_label(file_path: &str, line: Option<usize>) -> String {

@@ -473,6 +473,7 @@ pub struct AppState {
     pub settings_scroll_handle: ScrollHandle,
     pub tour_content_scroll_handle: ScrollHandle,
     pub tour_content_list_state: ListState,
+    pub ai_tour_section_list_state: ListState,
     pub code_tour_settings: CodeTourSettingsState,
     pub managed_lsp_settings: ManagedLspSettingsState,
 }
@@ -556,6 +557,7 @@ impl AppState {
             settings_scroll_handle: ScrollHandle::new(),
             tour_content_scroll_handle: ScrollHandle::new(),
             tour_content_list_state: ListState::new(0, ListAlignment::Top, px(600.0)),
+            ai_tour_section_list_state: ListState::new(0, ListAlignment::Top, px(720.0)),
             code_tour_settings: CodeTourSettingsState::default(),
             managed_lsp_settings: ManagedLspSettingsState::default(),
         };
@@ -782,7 +784,14 @@ impl AppState {
         }
 
         self.selected_file_path.clone().map(|file_path| {
-            ReviewLocation::from_diff(file_path, self.selected_diff_anchor.clone())
+            if session
+                .map(|session| session.center_mode == ReviewCenterMode::AiTour)
+                .unwrap_or(false)
+            {
+                ReviewLocation::from_ai_tour(file_path, self.selected_diff_anchor.clone())
+            } else {
+                ReviewLocation::from_diff(file_path, self.selected_diff_anchor.clone())
+            }
         })
     }
 
@@ -853,7 +862,7 @@ impl AppState {
             .unwrap_or(false);
 
         match location.mode {
-            ReviewCenterMode::SemanticDiff => {
+            ReviewCenterMode::SemanticDiff | ReviewCenterMode::AiTour => {
                 self.selected_file_path = Some(location.file_path.clone());
                 self.selected_diff_anchor = location.anchor.clone();
             }
@@ -975,7 +984,7 @@ impl AppState {
     pub fn set_review_center_mode(&mut self, mode: ReviewCenterMode) {
         if let Some(session) = self.active_review_session_mut() {
             session.center_mode = mode;
-            if mode == ReviewCenterMode::SemanticDiff {
+            if mode != ReviewCenterMode::SourceBrowser {
                 session.source_target = None;
             }
         }

@@ -260,12 +260,16 @@ mod tests {
                     summary("acme/web", 7, "2026-04-17T12:00:00Z"),
                 ],
                 total_count: 2,
+                is_complete: true,
+                truncated_reason: None,
             },
             PullRequestQueue {
                 id: "involved".to_string(),
                 label: "Involved".to_string(),
                 items: vec![summary("acme/api", 42, "2026-04-17T12:05:00Z")],
                 total_count: 1,
+                is_complete: true,
+                truncated_reason: None,
             },
         ]);
 

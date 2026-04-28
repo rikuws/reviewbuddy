@@ -8,7 +8,10 @@ use crate::code_display::{
     build_interactive_code_tokens, build_lsp_hover_tooltip_view, code_text_runs,
     render_highlighted_code_block, render_highlighted_code_content, InteractiveCodeToken,
 };
-use crate::code_tour::{line_matches_diff_anchor, thread_matches_diff_anchor, DiffAnchor};
+use crate::code_tour::{
+    line_matches_diff_anchor, thread_matches_diff_anchor, CodeTourProvider, CodeTourProviderStatus,
+    DiffAnchor, GeneratedCodeTour, TourSection, TourStep,
+};
 use crate::diff::{
     build_diff_render_rows, find_parsed_diff_file, find_parsed_diff_file_with_index, DiffLineKind,
     DiffRenderRow, ParsedDiffFile, ParsedDiffHunk, ParsedDiffLine,
@@ -21,7 +24,7 @@ use crate::local_documents;
 use crate::local_repo;
 use crate::lsp;
 use crate::markdown::render_markdown;
-use crate::review_context::{build_review_context, ReviewContextData};
+use crate::review_context::ReviewContextData;
 use crate::review_graph::{
     build_review_symbol_graph, load_symbol_evolution_timeline, ReviewGraphEdgeKind,
     ReviewGraphNodeState, ReviewSymbolGraph, ReviewSymbolGraphNode,
@@ -43,9 +46,10 @@ use crate::theme::*;
 use crate::{github, notifications};
 
 use super::sections::{
-    badge, badge_success, error_text, ghost_button, nested_panel, panel_state_text, review_button,
-    user_avatar,
+    badge, badge_success, error_text, eyebrow, ghost_button, nested_panel, panel_state_text,
+    review_button, success_text, user_avatar,
 };
+use super::tour_view::{refresh_active_tour, trigger_generate_tour};
 
 pub fn enter_files_surface(state: &Entity<AppState>, window: &mut Window, cx: &mut App) {
     state.update(cx, |s, cx| {
@@ -653,92 +657,37 @@ pub fn render_files_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement
     };
 
     let files = &detail.files;
-    let review_queue = prepare_review_queue(&s, detail);
     let selected_anchor = s.selected_diff_anchor.clone();
-    let review_session = s.active_review_session().cloned().unwrap_or_default();
     let waypoint_spotlight_open = s.waypoint_spotlight_open;
     let line_action_target = s.active_review_line_action.clone();
     let line_action_position = s.active_review_line_action_position;
     let line_action_mode = s.review_line_action_mode.clone();
-    let review_graph_expanded = s.review_graph_expanded;
 
+    let default_path = prepare_review_queue(&s, detail)
+        .default_item()
+        .map(|item| item.file_path.clone())
+        .or_else(|| detail.parsed_diff.first().map(|file| file.path.clone()));
     let selected_path = s
         .selected_file_path
-        .as_deref()
-        .and_then(|path| files.iter().find(|file| file.path == path))
-        .map(|file| file.path.as_str())
-        .or_else(|| {
-            review_queue
-                .as_ref()
-                .default_item()
-                .map(|item| item.file_path.as_str())
-                .or_else(|| detail.parsed_diff.first().map(|file| file.path.as_str()))
-        });
-
-    let selected_file = selected_path.and_then(|path| files.iter().find(|file| file.path == path));
-    let selected_parsed =
-        selected_file.and_then(|file| find_parsed_diff_file(&detail.parsed_diff, &file.path));
-    let semantic_file = selected_file.map(|file| prepare_semantic_diff_file(&s, detail, file));
-    let prepared_file = selected_file.and_then(|file| {
-        s.active_detail_state()
-            .and_then(|detail_state| detail_state.file_content_states.get(&file.path))
-            .and_then(|file_state| file_state.prepared.as_ref())
-    });
-    let selected_queue_item = selected_file.and_then(|file| {
-        review_queue
-            .as_ref()
-            .all_items()
-            .find(|item| item.file_path == file.path)
-            .cloned()
-    });
-    let review_context = selected_file
-        .zip(semantic_file.as_ref())
-        .map(|(file, semantic)| {
-            build_review_context(
-                detail,
-                selected_queue_item.clone(),
-                semantic.as_ref(),
-                file.path.as_str(),
-                selected_anchor.as_ref(),
-            )
-        });
-    let graph_selected_section = review_context
         .as_ref()
-        .and_then(|context| context.selected_section.as_ref());
-    let graph_line_focus_term = prepared_file
-        .and_then(|prepared_file| {
-            build_anchor_symbol_focus(selected_anchor.as_ref(), prepared_file)
-        })
-        .or_else(|| build_diff_anchor_symbol_focus(selected_anchor.as_ref(), selected_parsed))
-        .map(|focus| focus.term);
-    let graph_symbol_query = selected_file.and_then(|file| {
-        graph_selected_section.and_then(|_| {
-            build_review_symbol_route_query(
-                state,
-                file.path.as_str(),
-                selected_anchor.as_ref(),
-                graph_selected_section,
-                selected_parsed,
-                prepared_file,
-                cx,
-            )
-        })
-    });
+        .filter(|path| files.iter().any(|file| file.path == **path))
+        .cloned()
+        .or(default_path);
+    let selected_path = selected_path.as_deref();
+    let selected_file = selected_path.and_then(|path| files.iter().find(|file| file.path == path));
+    let semantic_file = selected_file.map(|file| prepare_semantic_diff_file(&s, detail, file));
 
     div()
         .relative()
         .flex()
         .flex_grow()
         .min_h_0()
-        .when(review_session.show_file_tree, |el| {
-            el.child(render_review_file_tree_pane(
-                state,
-                detail,
-                selected_path,
-                &review_session,
-                cx,
-            ))
-        })
+        .child(render_review_file_tree_pane(
+            state,
+            detail,
+            selected_path,
+            cx,
+        ))
         .child(
             div()
                 .flex()
@@ -756,31 +705,6 @@ pub fn render_files_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                     cx,
                 )),
         )
-        .when(review_session.show_inspector, |el| {
-            el.child(render_review_inspector_pane(
-                state,
-                detail,
-                review_queue.as_ref(),
-                selected_path,
-                selected_file,
-                selected_parsed,
-                semantic_file.as_deref(),
-                prepared_file,
-                review_context.as_ref(),
-                &review_session,
-                cx,
-            ))
-        })
-        .child(render_review_panel_toggle(
-            state,
-            ReviewPanelToggleSide::FileTree,
-            review_session.show_file_tree,
-        ))
-        .child(render_review_panel_toggle(
-            state,
-            ReviewPanelToggleSide::Inspector,
-            review_session.show_inspector,
-        ))
         .when(waypoint_spotlight_open, |el| {
             el.child(render_waypoint_spotlight(state, cx))
         })
@@ -799,23 +723,10 @@ pub fn render_files_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                 ))
             },
         )
-        .when(review_graph_expanded, |el| {
-            el.child(render_review_graph_overlay(
-                state,
-                detail,
-                selected_file,
-                review_context.as_ref(),
-                graph_line_focus_term.as_deref(),
-                graph_symbol_query.as_ref(),
-                review_session.show_file_tree,
-                review_session.show_inspector,
-                cx,
-            ))
-        })
         .into_any_element()
 }
 
-const REVIEW_INSPECTOR_PANE_WIDTH: f32 = 320.0;
+const REVIEW_INSPECTOR_PANE_WIDTH: f32 = 300.0;
 const REVIEW_PANEL_TOGGLE_SIZE: f32 = 22.0;
 const REVIEW_PANEL_TOGGLE_HIDDEN_INSET: f32 = 10.0;
 const REVIEW_PANEL_TOGGLE_OVERLAP: f32 = REVIEW_PANEL_TOGGLE_SIZE / 2.0;
@@ -978,7 +889,6 @@ fn render_review_file_tree_pane(
     state: &Entity<AppState>,
     detail: &PullRequestDetail,
     selected_path: Option<&str>,
-    _review_session: &crate::review_session::ReviewSessionState,
     cx: &App,
 ) -> impl IntoElement {
     render_file_tree(state, detail, selected_path, cx)
@@ -1078,17 +988,17 @@ fn render_review_inspector_pane(
         .flex()
         .flex_col()
         .bg(bg_surface())
-        .border_r(px(1.0))
+        .border_l(px(1.0))
         .border_color(border_default())
         .child(
             div()
-                .p(px(14.0))
-                .pb(px(12.0))
+                .p(px(12.0))
+                .pb(px(10.0))
                 .border_b(px(1.0))
                 .border_color(border_default())
                 .flex()
                 .flex_col()
-                .gap(px(12.0))
+                .gap(px(10.0))
                 .child(
                     div()
                         .flex()
@@ -1099,13 +1009,14 @@ fn render_review_inspector_pane(
                                 .text_size(px(10.0))
                                 .font_family("Fira Code")
                                 .text_color(fg_subtle())
-                                .child("INSPECTOR"),
+                                .child("CONTEXT"),
                         )
                         .child(
                             div()
                                 .text_size(px(14.0))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(fg_emphasis())
+                                .min_w_0()
                                 .whitespace_nowrap()
                                 .overflow_x_hidden()
                                 .text_ellipsis()
@@ -1880,6 +1791,15 @@ fn open_review_location_card(
             window,
             cx,
         ),
+        ReviewCenterMode::AiTour => {
+            state.update(cx, |state, cx| {
+                state.navigate_to_review_location(location.clone(), true);
+                state.persist_active_review_session();
+                cx.notify();
+            });
+            ensure_active_review_focus_loaded(state, window, cx);
+            refresh_active_tour(state, window, cx, true);
+        }
         ReviewCenterMode::SourceBrowser => open_review_source_location(
             state,
             location.file_path.clone(),
@@ -1962,26 +1882,20 @@ fn render_file_tree(
         .flex_col()
         .child(
             div()
-                .px(px(16.0))
-                .py(px(12.0))
+                .px(px(10.0))
+                .py(px(8.0))
                 .border_b(px(1.0))
                 .border_color(border_default())
                 .flex()
-                .flex_col()
-                .gap(px(4.0))
+                .items_center()
+                .justify_between()
+                .gap(px(10.0))
                 .child(
                     div()
-                        .text_size(px(11.0))
-                        .font_family("Fira Code")
-                        .text_color(fg_subtle())
-                        .child("FILE TREE"),
-                )
-                .child(
-                    div()
-                        .text_size(px(13.0))
+                        .text_size(px(12.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(fg_emphasis())
-                        .child("Changed files"),
+                        .child("Files"),
                 )
                 .child(
                     div()
@@ -1993,7 +1907,7 @@ fn render_file_tree(
                         .child(
                             div()
                                 .text_color(fg_muted())
-                                .child(format!("{} files", detail.files.len())),
+                                .child(detail.files.len().to_string()),
                         )
                         .child(div().text_color(fg_subtle()).child("\u{2022}"))
                         .child(
@@ -2016,8 +1930,8 @@ fn render_file_tree(
                 .min_h_0()
                 .flex()
                 .flex_col()
-                .px(px(8.0))
-                .py(px(8.0))
+                .px(px(6.0))
+                .py(px(6.0))
                 .child(
                     list(list_state, {
                         let state = state.clone();
@@ -2180,21 +2094,21 @@ fn render_file_tree_diff_summary(additions: i64, deletions: i64) -> impl IntoEle
         .flex_shrink_0()
         .child(
             div()
-                .text_size(px(10.0))
+                .text_size(px(9.0))
                 .font_family("Fira Code")
                 .text_color(success())
                 .child(format!("+{additions}")),
         )
         .child(
             div()
-                .text_size(px(10.0))
+                .text_size(px(9.0))
                 .font_family("Fira Code")
                 .text_color(fg_subtle())
                 .child("/"),
         )
         .child(
             div()
-                .text_size(px(10.0))
+                .text_size(px(9.0))
                 .font_family("Fira Code")
                 .text_color(danger())
                 .child(format!("-{deletions}")),
@@ -2233,9 +2147,9 @@ fn render_file_tree_directory_row(name: String, depth: usize) -> impl IntoElemen
     div()
         .w_full()
         .flex_shrink_0()
-        .mb(px(2.0))
+        .mb(px(1.0))
         .px(px(6.0))
-        .py(px(4.0))
+        .py(px(3.0))
         .rounded(radius_sm())
         .hover(|style| style.bg(bg_overlay()))
         .child(
@@ -2255,7 +2169,7 @@ fn render_file_tree_directory_row(name: String, depth: usize) -> impl IntoElemen
                         .child(render_file_tree_directory_icon())
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(px(10.0))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(fg_default())
                                 .min_w_0()
@@ -2288,9 +2202,9 @@ fn render_file_tree_file_row(
     div()
         .w_full()
         .flex_shrink_0()
-        .mb(px(2.0))
+        .mb(px(1.0))
         .px(px(6.0))
-        .py(px(4.0))
+        .py(px(3.0))
         .rounded(radius_sm())
         .bg(if is_active {
             bg_selected()
@@ -3100,12 +3014,12 @@ fn render_diff_panel(
             reason: Some("Current review focus".to_string()),
         })
     });
+    let source_parsed = source_target
+        .as_ref()
+        .and_then(|target| find_parsed_diff_file(&detail.parsed_diff, &target.path));
     let has_waymark = app_state.current_waymark().is_some();
     let can_go_back = !review_session.history_back.is_empty();
     let can_go_forward = !review_session.history_forward.is_empty();
-    let has_task_route = review_session.task_route.is_some();
-    let show_file_tree = review_session.show_file_tree;
-    let show_inspector = review_session.show_inspector;
 
     div()
         .flex_grow()
@@ -3130,9 +3044,6 @@ fn render_diff_panel(
             can_go_back,
             can_go_forward,
             has_waymark,
-            has_task_route,
-            show_file_tree,
-            show_inspector,
             selected_anchor,
         ))
         .child(
@@ -3145,13 +3056,15 @@ fn render_diff_panel(
                 .child(if center_mode == ReviewCenterMode::SourceBrowser {
                     source_target
                         .as_ref()
-                        .map(|target| render_source_browser(state, target, cx))
+                        .map(|target| render_source_browser(state, target, source_parsed, cx))
                         .unwrap_or_else(|| {
                             panel_state_text(
                                 "Select a file or definition to open the source browser.",
                             )
                             .into_any_element()
                         })
+                } else if center_mode == ReviewCenterMode::AiTour {
+                    render_ai_tour_view(state, detail, cx)
                 } else if let (Some(file), Some(diff_view_state)) = (selected_file, diff_view_state)
                 {
                     render_file_diff(
@@ -3187,43 +3100,24 @@ fn render_diff_toolbar(
     lsp_status: Option<&lsp::LspServerStatus>,
     lsp_loading: bool,
     center_mode: ReviewCenterMode,
-    _can_go_back: bool,
-    _can_go_forward: bool,
+    can_go_back: bool,
+    can_go_forward: bool,
     has_waymark: bool,
-    has_task_route: bool,
-    show_file_tree: bool,
-    show_inspector: bool,
     selected_anchor: Option<&DiffAnchor>,
 ) -> impl IntoElement {
     let selected_section =
         semantic_file.and_then(|semantic| semantic.section_for_anchor(selected_anchor));
-    let focus_title = selected_section
-        .map(|section| section.title.clone())
-        .or_else(|| selected_file.map(|file| file.path.clone()))
+    let focus_title = selected_file
+        .map(|file| file.path.clone())
         .unwrap_or_else(|| format!("{total_files} changed files"));
     let mut focus_meta = Vec::new();
     if let Some(file) = selected_file {
-        if selected_section.is_some() {
-            focus_meta.push(file.path.clone());
-        }
+        focus_meta.push(format!("{} file", label_for_change_type(&file.change_type)));
+        focus_meta.push(format!("+{} / -{}", file.additions, file.deletions));
         focus_meta.push(
             selected_section
-                .map(|section| {
-                    format!(
-                        "{} section • +{} / -{}",
-                        section.kind.label(),
-                        section.additions,
-                        section.deletions
-                    )
-                })
-                .unwrap_or_else(|| {
-                    format!(
-                        "{} file • +{} / -{}",
-                        label_for_change_type(&file.change_type),
-                        file.additions,
-                        file.deletions
-                    )
-                }),
+                .map(|section| format!("{}: {}", section.kind.label(), section.title.as_str()))
+                .unwrap_or_else(|| format!("{total_files} files changed")),
         );
     } else {
         focus_meta.push(format!("{total_files} changed files"));
@@ -3265,13 +3159,14 @@ fn render_diff_toolbar(
     } else if let Some(status) = lsp_status.filter(|status| !status.is_ready()) {
         focus_meta.push(status.badge_label().to_string());
     }
-    let focus_summary = focus_meta.join(" • ");
+    let focus_summary = focus_meta.join(" / ");
     let state_for_back = state.clone();
     let state_for_forward = state.clone();
     let state_for_waymark = state.clone();
-    let state_for_clear_route = state.clone();
     let state_for_semantic = state.clone();
+    let state_for_ai_tour = state.clone();
     let state_for_source = state.clone();
+    let mark_available = has_waymark || selected_anchor.is_some() || selected_file.is_some();
     let waymark_name = default_waymark_name(
         selected_file.map(|file| file.path.as_str()),
         semantic_file.and_then(|semantic| semantic.section_for_anchor(selected_anchor)),
@@ -3283,62 +3178,50 @@ fn render_diff_toolbar(
         .items_center()
         .justify_between()
         .gap(px(12.0))
-        .pl(if show_file_tree { px(18.0) } else { px(46.0) })
-        .pr(if show_inspector { px(18.0) } else { px(46.0) })
-        .py(px(8.0))
+        .px(px(12.0))
+        .py(px(6.0))
         .bg(bg_surface())
         .border_b(px(1.0))
         .border_color(border_default())
         .child(
-            div()
-                .flex()
-                .items_start()
-                .gap(px(10.0))
-                .flex_grow()
-                .min_w_0()
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap(px(3.0))
-                        .min_w_0()
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .font_family("Fira Code")
-                                .text_color(fg_subtle())
-                                .child(format!("REVIEW • {total_files} changed")),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(13.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(fg_emphasis())
-                                .whitespace_nowrap()
-                                .overflow_x_hidden()
-                                .text_ellipsis()
-                                .child(focus_title),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.0))
-                                .text_color(fg_muted())
-                                .whitespace_nowrap()
-                                .overflow_x_hidden()
-                                .text_ellipsis()
-                                .child(focus_summary),
-                        ),
-                ),
+            div().flex().items_start().flex_grow().min_w_0().child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .min_w_0()
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_family("Fira Code")
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg_emphasis())
+                            .whitespace_nowrap()
+                            .overflow_x_hidden()
+                            .text_ellipsis()
+                            .child(focus_title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_family("Fira Code")
+                            .text_color(fg_muted())
+                            .min_w_0()
+                            .whitespace_nowrap()
+                            .overflow_x_hidden()
+                            .text_ellipsis()
+                            .child(focus_summary),
+                    ),
+            ),
         )
         .child(
             div()
                 .flex()
                 .items_center()
                 .gap(px(6.0))
-                .flex_wrap()
                 .flex_shrink_0()
                 .child(workspace_mode_button(
-                    "Semantic",
+                    "Diff",
                     center_mode == ReviewCenterMode::SemanticDiff,
                     {
                         let state = state_for_semantic.clone();
@@ -3352,7 +3235,22 @@ fn render_diff_toolbar(
                     },
                 ))
                 .child(workspace_mode_button(
-                    "Source",
+                    "AI Tour",
+                    center_mode == ReviewCenterMode::AiTour,
+                    {
+                        let state = state_for_ai_tour.clone();
+                        move |_, window, cx| {
+                            state.update(cx, |state, cx| {
+                                state.set_review_center_mode(ReviewCenterMode::AiTour);
+                                state.persist_active_review_session();
+                                cx.notify();
+                            });
+                            refresh_active_tour(&state, window, cx, true);
+                        }
+                    },
+                ))
+                .child(workspace_mode_button(
+                    "File",
                     center_mode == ReviewCenterMode::SourceBrowser,
                     {
                         let state = state_for_source.clone();
@@ -3366,61 +3264,775 @@ fn render_diff_toolbar(
                         }
                     },
                 ))
-                .child(ghost_button("Back", {
-                    let state = state_for_back.clone();
-                    move |_, window, cx| {
-                        state.update(cx, |state, cx| {
-                            if state.navigate_review_back() {
-                                state.persist_active_review_session();
-                                cx.notify();
-                            }
-                        });
-                        ensure_active_review_focus_loaded(&state, window, cx);
-                    }
-                }))
-                .child(ghost_button("Forward", {
-                    let state = state_for_forward.clone();
-                    move |_, window, cx| {
-                        state.update(cx, |state, cx| {
-                            if state.navigate_review_forward() {
-                                state.persist_active_review_session();
-                                cx.notify();
-                            }
-                        });
-                        ensure_active_review_focus_loaded(&state, window, cx);
-                    }
-                }))
-                .child(ghost_button(
-                    if has_waymark {
-                        "Waypointed"
-                    } else {
-                        "Waypoint"
-                    },
-                    {
-                        let state = state_for_waymark.clone();
-                        let waymark_name = waymark_name.clone();
-                        move |_, _, cx| {
+                .when(can_go_back, |el| {
+                    el.child(workspace_mode_button("Back", false, {
+                        let state = state_for_back.clone();
+                        move |_, window, cx| {
                             state.update(cx, |state, cx| {
-                                state.add_waymark_for_current_review_location(waymark_name.clone());
-                                state.persist_active_review_session();
-                                cx.notify();
+                                if state.navigate_review_back() {
+                                    state.persist_active_review_session();
+                                    cx.notify();
+                                }
                             });
-                        }
-                    },
-                ))
-                .when(has_task_route, |el| {
-                    el.child(ghost_button("Clear route", {
-                        let state = state_for_clear_route.clone();
-                        move |_, _, cx| {
-                            state.update(cx, |state, cx| {
-                                state.set_active_review_task_route(None);
-                                state.persist_active_review_session();
-                                cx.notify();
-                            });
+                            ensure_active_review_focus_loaded(&state, window, cx);
                         }
                     }))
+                })
+                .when(can_go_forward, |el| {
+                    el.child(workspace_mode_button("Forward", false, {
+                        let state = state_for_forward.clone();
+                        move |_, window, cx| {
+                            state.update(cx, |state, cx| {
+                                if state.navigate_review_forward() {
+                                    state.persist_active_review_session();
+                                    cx.notify();
+                                }
+                            });
+                            ensure_active_review_focus_loaded(&state, window, cx);
+                        }
+                    }))
+                })
+                .when(mark_available, |el| {
+                    el.child(workspace_mode_button(
+                        if has_waymark { "Marked" } else { "Mark" },
+                        has_waymark,
+                        {
+                            let state = state_for_waymark.clone();
+                            let waymark_name = waymark_name.clone();
+                            move |_, _, cx| {
+                                state.update(cx, |state, cx| {
+                                    state.add_waymark_for_current_review_location(
+                                        waymark_name.clone(),
+                                    );
+                                    state.persist_active_review_session();
+                                    cx.notify();
+                                });
+                            }
+                        },
+                    ))
                 }),
         )
+}
+
+fn render_ai_tour_view(
+    state: &Entity<AppState>,
+    detail: &PullRequestDetail,
+    cx: &App,
+) -> AnyElement {
+    let (
+        provider,
+        provider_status,
+        provider_loading,
+        provider_error,
+        local_repo_loading,
+        local_repo_error,
+        tour_loading,
+        tour_generating,
+        tour_progress_summary,
+        tour_progress_detail,
+        tour_error,
+        tour_message,
+        tour_success,
+        generated_tour,
+        ai_tour_section_list_state,
+    ) = {
+        let app_state = state.read(cx);
+        let detail_state = app_state.active_detail_state();
+        let tour_state = app_state.active_tour_state();
+
+        (
+            app_state.selected_tour_provider(),
+            app_state.selected_tour_provider_status().cloned(),
+            app_state.code_tour_provider_loading,
+            app_state.code_tour_provider_error.clone(),
+            detail_state
+                .map(|state| state.local_repository_loading)
+                .unwrap_or(false),
+            detail_state.and_then(|state| state.local_repository_error.clone()),
+            tour_state.map(|state| state.loading).unwrap_or(false),
+            tour_state.map(|state| state.generating).unwrap_or(false),
+            tour_state.and_then(|state| state.progress_summary.clone()),
+            tour_state.and_then(|state| state.progress_detail.clone()),
+            tour_state.and_then(|state| state.error.clone()),
+            tour_state.and_then(|state| state.message.clone()),
+            tour_state.map(|state| state.success).unwrap_or(false),
+            tour_state.and_then(|state| state.document.clone()),
+            app_state.ai_tour_section_list_state.clone(),
+        )
+    };
+
+    let state_for_generate = state.clone();
+    let generate_label = ai_tour_generate_label(provider, generated_tour.as_ref(), tour_generating);
+    let has_status_messages = provider_error.is_some()
+        || local_repo_error.is_some()
+        || tour_error.is_some()
+        || tour_message.is_some();
+
+    let shell = div().flex_grow().min_h_0().flex().flex_col().bg(bg_inset());
+
+    match generated_tour {
+        Some(tour) => {
+            let section_count = tour.sections.len();
+            let mut items = Vec::new();
+            items.push(AiTourContentItem::Header);
+            if tour_generating || tour_loading || provider_loading {
+                items.push(AiTourContentItem::Progress);
+            }
+            if has_status_messages {
+                items.push(AiTourContentItem::StatusMessages);
+            }
+            if section_count == 0 {
+                items.push(AiTourContentItem::Empty);
+            } else {
+                items.extend((0..section_count).map(AiTourContentItem::Section));
+            }
+            items.push(AiTourContentItem::Spacer);
+
+            if ai_tour_section_list_state.item_count() != items.len() {
+                ai_tour_section_list_state.reset(items.len());
+            }
+
+            let tour = Arc::new(tour);
+            let detail = Arc::new(detail.clone());
+            let state_for_sections = state.clone();
+            let tour_for_sections = tour.clone();
+            let detail_for_sections = detail.clone();
+            let items = Arc::new(items);
+
+            shell
+                .child(
+                    list(
+                        ai_tour_section_list_state.clone(),
+                        move |ix, _window, cx| match items[ix] {
+                            AiTourContentItem::Header => div()
+                                .pt(px(18.0))
+                                .px(px(18.0))
+                                .pb(px(14.0))
+                                .child(render_ai_tour_header(
+                                    &tour,
+                                    provider,
+                                    provider_status.as_ref(),
+                                    local_repo_loading,
+                                    &generate_label,
+                                    {
+                                        let state = state_for_generate.clone();
+                                        move |_, window, cx| {
+                                            trigger_generate_tour(&state, window, cx, false)
+                                        }
+                                    },
+                                ))
+                                .into_any_element(),
+                            AiTourContentItem::Pending => div().into_any_element(),
+                            AiTourContentItem::Progress => div()
+                                .px(px(18.0))
+                                .pb(px(14.0))
+                                .child(render_ai_tour_progress_panel(
+                                    provider,
+                                    provider_loading,
+                                    tour_loading,
+                                    tour_generating,
+                                    tour_progress_summary.as_deref(),
+                                    tour_progress_detail.as_deref(),
+                                ))
+                                .into_any_element(),
+                            AiTourContentItem::StatusMessages => div()
+                                .px(px(18.0))
+                                .pb(px(14.0))
+                                .child(render_ai_tour_status_messages(
+                                    provider_error.as_deref(),
+                                    local_repo_error.as_deref(),
+                                    tour_error.as_deref(),
+                                    tour_message.as_deref(),
+                                    tour_success,
+                                ))
+                                .into_any_element(),
+                            AiTourContentItem::Empty => div()
+                                .px(px(18.0))
+                                .pb(px(14.0))
+                                .child(nested_panel().child(panel_state_text(
+                                    "No AI tour sections were returned for this pull request.",
+                                )))
+                                .into_any_element(),
+                            AiTourContentItem::Section(section_ix) => {
+                                let section = &tour_for_sections.sections[section_ix];
+                                div()
+                                    .px(px(18.0))
+                                    .pb(px(14.0))
+                                    .child(render_ai_tour_section(
+                                        &state_for_sections,
+                                        detail_for_sections.as_ref(),
+                                        tour_for_sections.as_ref(),
+                                        section,
+                                        cx,
+                                    ))
+                                    .into_any_element()
+                            }
+                            AiTourContentItem::Spacer => {
+                                div().h(px(18.0)).w_full().into_any_element()
+                            }
+                        },
+                    )
+                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                    .flex_grow()
+                    .min_h_0(),
+                )
+                .into_any_element()
+        }
+        None => {
+            let mut items = vec![AiTourContentItem::Pending];
+            if has_status_messages {
+                items.push(AiTourContentItem::StatusMessages);
+            }
+            items.push(AiTourContentItem::Spacer);
+
+            if ai_tour_section_list_state.item_count() != items.len() {
+                ai_tour_section_list_state.reset(items.len());
+            }
+
+            let items = Arc::new(items);
+
+            shell
+                .child(
+                    list(
+                        ai_tour_section_list_state.clone(),
+                        move |ix, _window, _cx| match items[ix] {
+                            AiTourContentItem::Pending => div()
+                                .pt(px(18.0))
+                                .px(px(18.0))
+                                .pb(px(14.0))
+                                .child(render_ai_tour_pending_panel(
+                                    provider,
+                                    provider_status.as_ref(),
+                                    provider_loading,
+                                    local_repo_loading,
+                                    tour_loading,
+                                    tour_generating,
+                                    tour_progress_summary.as_deref(),
+                                    tour_progress_detail.as_deref(),
+                                    &generate_label,
+                                    {
+                                        let state = state_for_generate.clone();
+                                        move |_, window, cx| {
+                                            trigger_generate_tour(&state, window, cx, false)
+                                        }
+                                    },
+                                ))
+                                .into_any_element(),
+                            AiTourContentItem::StatusMessages => div()
+                                .px(px(18.0))
+                                .pb(px(14.0))
+                                .child(render_ai_tour_status_messages(
+                                    provider_error.as_deref(),
+                                    local_repo_error.as_deref(),
+                                    tour_error.as_deref(),
+                                    tour_message.as_deref(),
+                                    tour_success,
+                                ))
+                                .into_any_element(),
+                            AiTourContentItem::Spacer => {
+                                div().h(px(18.0)).w_full().into_any_element()
+                            }
+                            _ => div().into_any_element(),
+                        },
+                    )
+                    .with_sizing_behavior(ListSizingBehavior::Auto)
+                    .flex_grow()
+                    .min_h_0(),
+                )
+                .into_any_element()
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AiTourContentItem {
+    Header,
+    Pending,
+    Progress,
+    StatusMessages,
+    Empty,
+    Section(usize),
+    Spacer,
+}
+
+fn ai_tour_generate_label(
+    provider: CodeTourProvider,
+    generated_tour: Option<&GeneratedCodeTour>,
+    generating: bool,
+) -> String {
+    if generating {
+        format!("Generating with {}...", provider.label())
+    } else if generated_tour
+        .map(|tour| tour.provider == provider)
+        .unwrap_or(false)
+    {
+        format!("Regenerate with {}", provider.label())
+    } else {
+        format!("Generate with {}", provider.label())
+    }
+}
+
+fn render_ai_tour_header(
+    tour: &GeneratedCodeTour,
+    provider: CodeTourProvider,
+    provider_status: Option<&CodeTourProviderStatus>,
+    local_repo_loading: bool,
+    generate_label: &str,
+    on_generate: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    nested_panel()
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .justify_between()
+                .gap(px(16.0))
+                .flex_wrap()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .min_w_0()
+                        .child(eyebrow("AI tour"))
+                        .child(
+                            div()
+                                .text_size(px(20.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg_emphasis())
+                                .child("Guided review"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .text_color(fg_default())
+                                .max_w(px(760.0))
+                                .child(SelectableText::new(
+                                    "ai-tour-summary",
+                                    tour.summary.clone(),
+                                )),
+                        )
+                        .when(!tour.review_focus.trim().is_empty(), |el| {
+                            el.child(div().text_size(px(12.0)).text_color(fg_muted()).child(
+                                SelectableText::new(
+                                    "ai-tour-review-focus",
+                                    tour.review_focus.clone(),
+                                ),
+                            ))
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .flex_wrap()
+                        .child(badge(provider.label()))
+                        .when_some(provider_status, |el, status| {
+                            el.child(badge(ai_tour_provider_status_label(status)))
+                        })
+                        .when(local_repo_loading, |el| {
+                            el.child(badge("Preparing checkout"))
+                        })
+                        .child(review_button(generate_label, on_generate)),
+                ),
+        )
+        .when(
+            !tour.open_questions.is_empty() || !tour.warnings.is_empty(),
+            |el| {
+                el.child(
+                    div()
+                        .mt(px(14.0))
+                        .pt(px(14.0))
+                        .border_t(px(1.0))
+                        .border_color(border_muted())
+                        .flex()
+                        .gap(px(8.0))
+                        .flex_wrap()
+                        .when(!tour.open_questions.is_empty(), |el| {
+                            el.child(badge(&format!(
+                                "{} open question{}",
+                                tour.open_questions.len(),
+                                if tour.open_questions.len() == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            )))
+                        })
+                        .when(!tour.warnings.is_empty(), |el| {
+                            el.child(badge(&format!(
+                                "{} warning{}",
+                                tour.warnings.len(),
+                                if tour.warnings.len() == 1 { "" } else { "s" }
+                            )))
+                        }),
+                )
+            },
+        )
+}
+
+fn ai_tour_provider_status_label(status: &CodeTourProviderStatus) -> &'static str {
+    if status.available && status.authenticated {
+        "ready"
+    } else if status.available {
+        "needs auth"
+    } else {
+        "unavailable"
+    }
+}
+
+fn render_ai_tour_pending_panel(
+    provider: CodeTourProvider,
+    provider_status: Option<&CodeTourProviderStatus>,
+    provider_loading: bool,
+    local_repo_loading: bool,
+    tour_loading: bool,
+    tour_generating: bool,
+    progress_summary: Option<&str>,
+    progress_detail: Option<&str>,
+    generate_label: &str,
+    on_generate: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let (title, body) = if provider_loading {
+        (
+            "Checking AI provider".to_string(),
+            "The app is checking the provider configured in Settings.".to_string(),
+        )
+    } else if tour_loading {
+        (
+            "Looking for a cached AI tour".to_string(),
+            "The app is checking whether this pull request head already has a stored tour."
+                .to_string(),
+        )
+    } else if tour_generating {
+        (
+            progress_summary
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{} is building the AI tour", provider.label())),
+            progress_detail.map(str::to_string).unwrap_or_else(|| {
+                "The provider is reading the diff, review threads, and local checkout.".to_string()
+            }),
+        )
+    } else if let Some(status) = provider_status {
+        if !status.available || !status.authenticated {
+            (
+                "AI provider needs attention".to_string(),
+                status.message.clone(),
+            )
+        } else {
+            (
+                "Generate an AI tour".to_string(),
+                "Create a short guided walkthrough that groups related changes and shows the matching diff under each explanation.".to_string(),
+            )
+        }
+    } else {
+        (
+            "Preparing AI tour".to_string(),
+            "Waiting for the provider configured in Settings to finish loading.".to_string(),
+        )
+    };
+
+    nested_panel().child(
+        div()
+            .flex()
+            .items_start()
+            .justify_between()
+            .gap(px(16.0))
+            .flex_wrap()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .min_w_0()
+                    .child(eyebrow("AI tour"))
+                    .child(
+                        div()
+                            .text_size(px(20.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg_emphasis())
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(fg_muted())
+                            .max_w(px(720.0))
+                            .child(body),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(8.0))
+                    .flex_wrap()
+                    .child(badge(provider.label()))
+                    .when_some(provider_status, |el, status| {
+                        el.child(badge(ai_tour_provider_status_label(status)))
+                    })
+                    .when(provider_loading, |el| el.child(badge("Checking provider")))
+                    .when(local_repo_loading, |el| {
+                        el.child(badge("Preparing checkout"))
+                    })
+                    .child(review_button(generate_label, on_generate)),
+            ),
+    )
+}
+
+fn render_ai_tour_progress_panel(
+    provider: CodeTourProvider,
+    provider_loading: bool,
+    tour_loading: bool,
+    tour_generating: bool,
+    progress_summary: Option<&str>,
+    progress_detail: Option<&str>,
+) -> impl IntoElement {
+    let title = if provider_loading {
+        "Checking provider".to_string()
+    } else if tour_loading {
+        "Loading cached tour".to_string()
+    } else if tour_generating {
+        progress_summary
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("{} is updating the tour", provider.label()))
+    } else {
+        "Preparing AI tour".to_string()
+    };
+    let body = progress_detail
+        .map(str::to_string)
+        .unwrap_or_else(|| "The AI tour will update here when the provider returns.".to_string());
+
+    nested_panel()
+        .child(eyebrow("Status"))
+        .child(
+            div()
+                .text_size(px(16.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(fg_emphasis())
+                .child(title),
+        )
+        .child(
+            div()
+                .text_size(px(12.0))
+                .text_color(fg_muted())
+                .mt(px(8.0))
+                .child(body),
+        )
+}
+
+fn render_ai_tour_status_messages(
+    provider_error: Option<&str>,
+    local_repo_error: Option<&str>,
+    tour_error: Option<&str>,
+    tour_message: Option<&str>,
+    tour_success: bool,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .when_some(provider_error, |el, error| el.child(error_text(error)))
+        .when_some(local_repo_error, |el, error| el.child(error_text(error)))
+        .when_some(tour_error, |el, error| el.child(error_text(error)))
+        .when_some(tour_message, |el, message| {
+            if tour_success {
+                el.child(success_text(message))
+            } else {
+                el.child(error_text(message))
+            }
+        })
+}
+
+fn render_ai_tour_section(
+    state: &Entity<AppState>,
+    detail: &PullRequestDetail,
+    generated_tour: &GeneratedCodeTour,
+    section: &TourSection,
+    cx: &App,
+) -> impl IntoElement {
+    let section_steps = section
+        .step_ids
+        .iter()
+        .filter_map(|step_id| {
+            generated_tour
+                .steps
+                .iter()
+                .find(|step| step.id.as_str() == step_id.as_str())
+        })
+        .collect::<Vec<_>>();
+
+    nested_panel()
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .justify_between()
+                .gap(px(12.0))
+                .flex_wrap()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(6.0))
+                        .min_w_0()
+                        .child(eyebrow("Group"))
+                        .child(
+                            div()
+                                .text_size(px(18.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg_emphasis())
+                                .child(section.title.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.0))
+                        .flex_wrap()
+                        .child(badge(&section.badge))
+                        .child(badge(&format!(
+                            "{} file{}",
+                            section_steps.len(),
+                            if section_steps.len() == 1 { "" } else { "s" }
+                        ))),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(13.0))
+                .text_color(fg_default())
+                .mt(px(10.0))
+                .child(SelectableText::new(
+                    format!("ai-tour-section-summary-{}", section.id),
+                    section.summary.clone(),
+                )),
+        )
+        .when(!section.detail.trim().is_empty(), |el| {
+            el.child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(fg_muted())
+                    .mt(px(8.0))
+                    .child(SelectableText::new(
+                        format!("ai-tour-section-detail-{}", section.id),
+                        section.detail.clone(),
+                    )),
+            )
+        })
+        .when(!section.review_points.is_empty(), |el| {
+            el.child(render_ai_tour_review_points(
+                &section.id,
+                &section.review_points,
+            ))
+        })
+        .child(
+            div()
+                .mt(px(16.0))
+                .pt(px(16.0))
+                .border_t(px(1.0))
+                .border_color(border_muted())
+                .flex()
+                .flex_col()
+                .gap(px(14.0))
+                .children(section_steps.into_iter().map(|step| {
+                    render_ai_tour_step_diff(state, detail, section, step, cx).into_any_element()
+                })),
+        )
+}
+
+fn render_ai_tour_review_points(section_id: &str, review_points: &[String]) -> impl IntoElement {
+    div().mt(px(12.0)).flex().flex_col().gap(px(8.0)).children(
+        review_points.iter().enumerate().map(|(point_ix, point)| {
+            div()
+                .text_size(px(12.0))
+                .text_color(fg_muted())
+                .child(SelectableText::new(
+                    format!("ai-tour-review-point-{section_id}-{point_ix}"),
+                    point.clone(),
+                ))
+        }),
+    )
+}
+
+fn render_ai_tour_step_diff(
+    state: &Entity<AppState>,
+    detail: &PullRequestDetail,
+    section: &TourSection,
+    step: &TourStep,
+    cx: &App,
+) -> impl IntoElement {
+    let preview_key = format!("ai-tour:{}:{}", section.id, step.id);
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .child(
+            div()
+                .flex()
+                .items_start()
+                .justify_between()
+                .gap(px(12.0))
+                .flex_wrap()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg_emphasis())
+                                .font_family("Fira Code")
+                                .whitespace_nowrap()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .child(step.title.clone()),
+                        )
+                        .when(!step.summary.trim().is_empty(), |el| {
+                            el.child(div().text_size(px(12.0)).text_color(fg_muted()).child(
+                                SelectableText::new(
+                                    format!("ai-tour-step-summary-{}", step.id),
+                                    step.summary.clone(),
+                                ),
+                            ))
+                        }),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(6.0))
+                        .flex_wrap()
+                        .child(badge(&format!("+{}", step.additions)))
+                        .child(badge(&format!("-{}", step.deletions)))
+                        .when(step.unresolved_thread_count > 0, |el| {
+                            el.child(badge(&format!(
+                                "{} thread{}",
+                                step.unresolved_thread_count,
+                                if step.unresolved_thread_count == 1 {
+                                    ""
+                                } else {
+                                    "s"
+                                }
+                            )))
+                        }),
+                ),
+        )
+        .child(render_tour_diff_file_compact(
+            state,
+            detail,
+            &preview_key,
+            step.file_path.as_deref(),
+            step.snippet.as_deref(),
+            step.anchor.as_ref(),
+            cx,
+        ))
 }
 
 fn workspace_mode_button(
@@ -3436,9 +4048,9 @@ fn workspace_mode_button(
         .border_color(if active {
             border_default()
         } else {
-            border_muted()
+            transparent()
         })
-        .bg(if active { bg_selected() } else { bg_surface() })
+        .bg(if active { bg_selected() } else { transparent() })
         .text_size(px(11.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(if active { fg_emphasis() } else { fg_muted() })
@@ -7603,26 +8215,26 @@ fn render_semantic_section_header(
     let collapsed = state.read(cx).is_review_section_collapsed(&section.id);
 
     div()
-        .px(px(14.0))
-        .py(px(10.0))
+        .px(px(12.0))
+        .py(px(6.0))
         .border_b(px(1.0))
         .border_color(border_muted())
         .bg(if is_selected {
             bg_selected()
         } else {
-            bg_surface()
+            diff_hunk_bg()
         })
         .child(
             div()
                 .flex()
-                .items_start()
+                .items_center()
                 .justify_between()
-                .gap(px(12.0))
+                .gap(px(10.0))
                 .child(
                     div()
                         .flex()
-                        .flex_col()
-                        .gap(px(4.0))
+                        .items_center()
+                        .gap(px(8.0))
                         .min_w_0()
                         .cursor_pointer()
                         .hover(|style| style.text_color(fg_emphasis()))
@@ -7637,27 +8249,29 @@ fn render_semantic_section_header(
                         })
                         .child(
                             div()
-                                .text_size(px(11.0))
+                                .text_size(px(10.0))
                                 .font_family("Fira Code")
                                 .text_color(accent())
+                                .flex_shrink_0()
                                 .child(section.kind.label().to_ascii_uppercase()),
                         )
                         .child(
                             div()
-                                .text_size(px(13.0))
+                                .text_size(px(12.0))
+                                .font_family("Fira Code")
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(fg_emphasis())
+                                .flex_grow()
+                                .min_w_0()
+                                .whitespace_nowrap()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
                                 .child(section.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(11.0))
-                                .text_color(fg_muted())
-                                .child(section.summary.clone()),
                         ),
                 )
-                .child(ghost_button(
+                .child(workspace_mode_button(
                     if collapsed { "Expand" } else { "Fold" },
+                    false,
                     move |_, _, cx| {
                         state_for_toggle.update(cx, |state, cx| {
                             state.toggle_review_section_collapse(&section_id);
@@ -9463,7 +10077,50 @@ pub fn render_tour_diff_file(
     snippet: Option<&str>,
     anchor: Option<&DiffAnchor>,
     cx: &App,
-) -> impl IntoElement {
+) -> AnyElement {
+    render_tour_diff_file_with_options(
+        state,
+        detail,
+        preview_key,
+        file_path,
+        snippet,
+        anchor,
+        true,
+        cx,
+    )
+}
+
+fn render_tour_diff_file_compact(
+    state: &Entity<AppState>,
+    detail: &PullRequestDetail,
+    preview_key: &str,
+    file_path: Option<&str>,
+    snippet: Option<&str>,
+    anchor: Option<&DiffAnchor>,
+    cx: &App,
+) -> AnyElement {
+    render_tour_diff_file_with_options(
+        state,
+        detail,
+        preview_key,
+        file_path,
+        snippet,
+        anchor,
+        false,
+        cx,
+    )
+}
+
+fn render_tour_diff_file_with_options(
+    state: &Entity<AppState>,
+    detail: &PullRequestDetail,
+    preview_key: &str,
+    file_path: Option<&str>,
+    snippet: Option<&str>,
+    anchor: Option<&DiffAnchor>,
+    show_header: bool,
+    cx: &App,
+) -> AnyElement {
     let Some(file_path) = file_path else {
         return div().into_any_element();
     };
@@ -9487,89 +10144,54 @@ pub fn render_tour_diff_file(
                 prepare_tour_diff_view_state(&app_state, detail, preview_key, &file.path)
             })
         };
-        let file_lsp_context = build_diff_file_lsp_context(
-            state,
-            parsed_file.path.as_str(),
-            prepared_file.as_ref(),
-            cx,
-        );
-
-        return nested_panel()
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .mb(px(12.0))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(fg_subtle())
-                                    .font_family("Fira Code")
-                                    .child("CHANGESET"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(14.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(fg_emphasis())
-                                    .child(
-                                        if parsed_file.previous_path.is_some()
-                                            && parsed_file.previous_path.as_deref()
-                                                != Some(&parsed_file.path)
-                                        {
-                                            format!(
-                                                "{} -> {}",
-                                                parsed_file.previous_path.as_deref().unwrap_or(""),
-                                                parsed_file.path
-                                            )
-                                        } else {
-                                            parsed_file.path.clone()
-                                        },
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(6.0))
-                            .when_some(file, |el, file| {
-                                el.child(render_change_type_chip(&file.change_type))
-                                    .child(badge(&format!(
-                                        "+{} / -{}",
-                                        file.additions, file.deletions
-                                    )))
-                            })
-                            .when(parsed_file.is_binary, |el| el.child(badge("binary"))),
-                    ),
-            )
-            .child(if parsed_file.hunks.is_empty() {
-                panel_state_text("No textual hunks available for this file.").into_any_element()
-            } else if let (Some(file), Some(diff_view_state)) = (file, diff_view_state) {
-                render_tour_diff_preview(
+        let file_lsp_context = show_header
+            .then(|| {
+                build_diff_file_lsp_context(
                     state,
-                    file,
-                    parsed_file,
+                    parsed_file.path.as_str(),
                     prepared_file.as_ref(),
-                    anchor,
-                    diff_view_state,
-                    file_lsp_context,
                     cx,
                 )
-                .into_any_element()
-            } else {
-                render_full_tour_diff_preview(parsed_file, anchor, file_lsp_context.as_ref())
-                    .into_any_element()
             })
+            .flatten();
+
+        let diff_body = if parsed_file.hunks.is_empty() {
+            panel_state_text("No textual hunks available for this file.").into_any_element()
+        } else if let (Some(file), Some(diff_view_state)) = (file, diff_view_state) {
+            render_tour_diff_preview(
+                state,
+                file,
+                parsed_file,
+                prepared_file.as_ref(),
+                anchor,
+                diff_view_state,
+                file_lsp_context,
+                cx,
+            )
+            .into_any_element()
+        } else {
+            render_full_tour_diff_preview(parsed_file, anchor, file_lsp_context.as_ref())
+                .into_any_element()
+        };
+
+        if !show_header {
+            return diff_body;
+        }
+
+        return nested_panel()
+            .child(render_tour_diff_file_header(file, parsed_file))
+            .child(diff_body)
             .into_any_element();
     }
 
     if let Some(snippet) = snippet {
+        let snippet_body = div()
+            .child(render_highlighted_code_block("diff.patch", snippet))
+            .into_any_element();
+        if !show_header {
+            return snippet_body;
+        }
+
         return nested_panel()
             .child(
                 div()
@@ -9580,11 +10202,64 @@ pub fn render_tour_diff_file(
                     .mb(px(8.0))
                     .child("CHANGESET"),
             )
-            .child(div().child(render_highlighted_code_block("diff.patch", snippet)))
+            .child(snippet_body)
             .into_any_element();
     }
 
     panel_state_text("No parsed diff is available for this file.").into_any_element()
+}
+
+fn render_tour_diff_file_header(
+    file: Option<&PullRequestFile>,
+    parsed_file: &ParsedDiffFile,
+) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .justify_between()
+        .mb(px(12.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg_subtle())
+                        .font_family("Fira Code")
+                        .child("CHANGESET"),
+                )
+                .child(
+                    div()
+                        .text_size(px(14.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg_emphasis())
+                        .child(
+                            if parsed_file.previous_path.is_some()
+                                && parsed_file.previous_path.as_deref() != Some(&parsed_file.path)
+                            {
+                                format!(
+                                    "{} -> {}",
+                                    parsed_file.previous_path.as_deref().unwrap_or(""),
+                                    parsed_file.path
+                                )
+                            } else {
+                                parsed_file.path.clone()
+                            },
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .gap(px(6.0))
+                .when_some(file, |el, file| {
+                    el.child(render_change_type_chip(&file.change_type))
+                        .child(badge(&format!("+{} / -{}", file.additions, file.deletions)))
+                })
+                .when(parsed_file.is_binary, |el| el.child(badge("binary"))),
+        )
 }
 
 fn render_tour_diff_preview(

@@ -30,7 +30,7 @@ pub fn parse_tolerant<T: DeserializeOwned>(raw: &str) -> Result<T, JsonParseErro
         candidates.push(unwrapped);
     }
     if let Some(ref slice) = extracted {
-        if !candidates.iter().any(|value| *value == slice.as_str()) {
+        if !candidates.contains(&slice.as_str()) {
             candidates.push(slice);
         }
     }
@@ -53,7 +53,7 @@ pub fn parse_tolerant<T: DeserializeOwned>(raw: &str) -> Result<T, JsonParseErro
             }
         }
 
-        return Err(JsonParseError {
+        Err(JsonParseError {
             message: format!(
                 "Failed to parse the LLM response as JSON: {}{}",
                 last_serde_error
@@ -63,7 +63,7 @@ pub fn parse_tolerant<T: DeserializeOwned>(raw: &str) -> Result<T, JsonParseErro
                     .map(|error| format!(" (json5 repair also failed: {error})"))
                     .unwrap_or_default(),
             ),
-        });
+        })
     }
 
     #[cfg(not(feature = "tolerant-json"))]

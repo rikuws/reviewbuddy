@@ -876,6 +876,19 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .as_ref()
         .map(|q| q.label.clone())
         .unwrap_or_else(|| "Pull Requests".to_string());
+    let queue_truncation_message = current_queue.as_ref().and_then(|queue| {
+        if queue.is_complete {
+            None
+        } else {
+            Some(queue.truncated_reason.clone().unwrap_or_else(|| {
+                format!(
+                    "Loaded {} of {} pull requests.",
+                    queue.items.len(),
+                    queue.total_count
+                )
+            }))
+        }
+    });
     let loaded_from_cache = s
         .workspace
         .as_ref()
@@ -1062,6 +1075,9 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                 })
                 .when_some(workspace_error, |el, err| {
                     el.child(div().px(px(28.0)).child(error_text(&err)))
+                })
+                .when_some(queue_truncation_message, |el, message| {
+                    el.child(div().px(px(28.0)).pb(px(12.0)).child(error_text(&message)))
                 })
                 .when(!workspace_loading && !has_any_lanes, |el| {
                     el.child(div().px(px(28.0)).child(panel_state_text(if has_muted {

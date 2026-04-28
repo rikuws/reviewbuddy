@@ -528,6 +528,7 @@ mod tests {
             files: Vec::new(),
             raw_diff: String::new(),
             parsed_diff: Vec::new(),
+            data_completeness: crate::github::PullRequestDataCompleteness::default(),
         }
     }
 

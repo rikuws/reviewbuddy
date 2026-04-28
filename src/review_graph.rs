@@ -1600,6 +1600,7 @@ index 1111111..2222222 100644
             ],
             raw_diff: raw_diff.to_string(),
             parsed_diff: parse_unified_diff(raw_diff),
+            data_completeness: crate::github::PullRequestDataCompleteness::default(),
         }
     }
 }

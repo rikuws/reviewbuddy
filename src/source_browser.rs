@@ -1,22 +1,24 @@
+use std::{collections::BTreeMap, sync::Arc};
+
 use gpui::prelude::*;
 use gpui::*;
 
 use crate::{
     code_display::{
-        build_prepared_file_lsp_context, prepared_file_has_line,
-        render_prepared_file_excerpt_with_line_numbers, render_prepared_file_with_line_numbers,
+        build_prepared_file_lsp_context, render_prepared_file_with_line_numbers,
+        render_prepared_file_with_line_numbers_and_diffs, PreparedFileLineDiffKind,
+        PreparedFileLineDiffs,
     },
+    diff::{DiffLineKind, ParsedDiffFile},
     review_session::ReviewSourceTarget,
     state::AppState,
     theme::*,
 };
 
-const SOURCE_FOCUS_CONTEXT_LINES: usize = 24;
-const MAX_FULL_SOURCE_LINES: usize = 220;
-
 pub fn render_source_browser(
     state: &Entity<AppState>,
     target: &ReviewSourceTarget,
+    parsed: Option<&ParsedDiffFile>,
     cx: &App,
 ) -> AnyElement {
     let prepared_file = {
@@ -61,7 +63,7 @@ pub fn render_source_browser(
                                 .text_size(px(10.0))
                                 .font_family("Fira Code")
                                 .text_color(fg_subtle())
-                                .child("SOURCE BROWSER"),
+                                .child("FULL FILE"),
                         )
                         .child(
                             div()
@@ -88,8 +90,7 @@ pub fn render_source_browser(
                         .gap(px(6.0))
                         .flex_wrap()
                         .flex_shrink_0()
-                        .child(source_badge("read-only"))
-                        .child(source_badge("local checkout")),
+                        .child(source_badge("read-only")),
                 ),
         );
 
@@ -109,62 +110,15 @@ pub fn render_source_browser(
 
     let lsp_context =
         build_prepared_file_lsp_context(state, target.path.as_str(), Some(&prepared_file), cx);
-    let show_focus_excerpt = focus_line
-        .filter(|line| prepared_file_has_line(&prepared_file, *line))
-        .is_some();
-    let show_full_file = prepared_file.lines.len() <= MAX_FULL_SOURCE_LINES;
-    let focus_panel = show_focus_excerpt.then(|| {
-        let line = focus_line.unwrap_or(1);
-        let start_line = line.saturating_sub(6).max(1);
-
-        source_panel("Focused context")
-            .child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(fg_muted())
-                    .mb(px(10.0))
-                    .child(format!(
-                        "Showing the selected definition around line {}.",
-                        line
-                    )),
-            )
-            .child(render_prepared_file_excerpt_with_line_numbers(
-                &prepared_file,
-                start_line,
-                SOURCE_FOCUS_CONTEXT_LINES,
-                lsp_context.as_ref(),
-            ))
-            .into_any_element()
-    });
-    let expanded_panel = source_panel(if show_full_file {
-        "Full file"
-    } else {
-        "Expanded excerpt"
-    })
-    .when(!show_full_file, |el| {
-        el.child(
-            div()
-                .text_size(px(12.0))
-                .text_color(fg_muted())
-                .mb(px(10.0))
-                .child(format!(
-                    "This file is large, so the source browser is showing a focused excerpt instead of all {} lines.",
-                    prepared_file.lines.len()
-                )),
-        )
-    })
-    .child(if show_full_file {
-        render_prepared_file_with_line_numbers(&prepared_file, lsp_context.as_ref())
-    } else {
-        let start_line = focus_line.unwrap_or(1).saturating_sub(12).max(1);
-        render_prepared_file_excerpt_with_line_numbers(
+    let full_file = if let Some(parsed) = parsed {
+        render_prepared_file_with_line_numbers_and_diffs(
             &prepared_file,
-            start_line,
-            80,
             lsp_context.as_ref(),
+            build_full_file_diff_lines(parsed),
         )
-    })
-    .into_any_element();
+    } else {
+        render_prepared_file_with_line_numbers(&prepared_file, lsp_context.as_ref())
+    };
 
     shell
         .child(
@@ -177,10 +131,29 @@ pub fn render_source_browser(
                 .flex()
                 .flex_col()
                 .gap(px(16.0))
-                .when_some(focus_panel, |el, panel| el.child(panel))
-                .child(expanded_panel),
+                .child(source_panel("Full file").child(full_file)),
         )
         .into_any_element()
+}
+
+fn build_full_file_diff_lines(parsed: &ParsedDiffFile) -> PreparedFileLineDiffs {
+    let mut lines = BTreeMap::new();
+
+    for line in parsed.hunks.iter().flat_map(|hunk| hunk.lines.iter()) {
+        if line.kind != DiffLineKind::Addition {
+            continue;
+        }
+
+        if let Some(line_number) = line
+            .right_line_number
+            .and_then(|line_number| usize::try_from(line_number).ok())
+            .filter(|line_number| *line_number > 0)
+        {
+            lines.insert(line_number, PreparedFileLineDiffKind::Addition);
+        }
+    }
+
+    Arc::new(lines)
 }
 
 fn source_location_label(path: &str, line: Option<usize>) -> String {

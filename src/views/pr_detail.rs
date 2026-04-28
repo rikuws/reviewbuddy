@@ -1842,6 +1842,11 @@ fn render_details_panel(
     fetched_at_ms: Option<i64>,
 ) -> impl IntoElement {
     let review_decision = detail.review_decision.as_deref().unwrap_or("PENDING");
+    let completeness_warnings = if detail.data_completeness.is_complete() {
+        Vec::new()
+    } else {
+        detail.data_completeness.warnings()
+    };
 
     nested_panel()
         .child(
@@ -1889,6 +1894,15 @@ fn render_details_panel(
                     el.child(detail_row("Cached at", detail_value_text(&format_ms(ms))))
                 }),
         )
+        .when(!completeness_warnings.is_empty(), |el| {
+            el.child(
+                div().mt(px(12.0)).flex().flex_col().gap(px(6.0)).children(
+                    completeness_warnings
+                        .into_iter()
+                        .map(|warning| error_text(&warning)),
+                ),
+            )
+        })
 }
 
 fn detail_row(label: &str, value: AnyElement) -> impl IntoElement {
@@ -3179,6 +3193,7 @@ mod tests {
             }],
             raw_diff: String::new(),
             parsed_diff: Vec::new(),
+            data_completeness: crate::github::PullRequestDataCompleteness::default(),
         }
     }
 }

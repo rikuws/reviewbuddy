@@ -1,16 +1,16 @@
 use std::{
     fs,
     path::{Component, Path, PathBuf},
-    process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::{
     cache::CacheStore,
+    command_runner::CommandRunner,
     github::{RepositoryFileContent, REPOSITORY_FILE_SOURCE_LOCAL_CHECKOUT},
 };
 
-const LOCAL_DOCUMENT_CACHE_KEY_PREFIX: &str = "local-document-v1";
+const LOCAL_DOCUMENT_CACHE_KEY_PREFIX: &str = "local-document-v2";
 
 pub fn load_local_repository_file_content(
     cache: &CacheStore,
@@ -20,27 +20,40 @@ pub fn load_local_repository_file_content(
     path: &str,
     prefer_worktree: bool,
 ) -> Result<RepositoryFileContent, String> {
-    let key = local_document_cache_key(repository, reference, path);
+    if prefer_worktree {
+        return match read_worktree_file(checkout_root, path) {
+            Ok(bytes) => Ok(repository_file_content_from_bytes(
+                repository, reference, path, bytes,
+            )),
+            Err(_) => load_git_file_cached(cache, repository, checkout_root, reference, path),
+        };
+    }
+
+    load_git_file_cached(cache, repository, checkout_root, reference, path)
+}
+
+fn load_git_file_cached(
+    cache: &CacheStore,
+    repository: &str,
+    checkout_root: &Path,
+    reference: &str,
+    path: &str,
+) -> Result<RepositoryFileContent, String> {
+    let git_path = validated_git_path(path)?;
+    let blob_oid = git_blob_oid(checkout_root, reference, &git_path)?;
+    let key = local_document_cache_key(repository, &blob_oid, &git_path);
     if let Some(cached) = cache.get::<RepositoryFileContent>(&key)? {
         return Ok(cached.value);
     }
 
-    let bytes = if prefer_worktree {
-        match read_worktree_file(checkout_root, path) {
-            Ok(bytes) => bytes,
-            Err(_) => read_git_file(checkout_root, reference, path)?,
-        }
-    } else {
-        read_git_file(checkout_root, reference, path)?
-    };
-
+    let bytes = read_git_blob(checkout_root, &blob_oid, path)?;
     let document = repository_file_content_from_bytes(repository, reference, path, bytes);
     cache.put(&key, &document, now_ms())?;
     Ok(document)
 }
 
-fn local_document_cache_key(repository: &str, reference: &str, path: &str) -> String {
-    format!("{LOCAL_DOCUMENT_CACHE_KEY_PREFIX}:{repository}:{reference}:{path}")
+fn local_document_cache_key(repository: &str, blob_oid: &str, path: &str) -> String {
+    format!("{LOCAL_DOCUMENT_CACHE_KEY_PREFIX}:{repository}:{blob_oid}:{path}")
 }
 
 fn read_worktree_file(checkout_root: &Path, path: &str) -> Result<Vec<u8>, String> {
@@ -55,25 +68,68 @@ fn read_worktree_file(checkout_root: &Path, path: &str) -> Result<Vec<u8>, Strin
     })
 }
 
-fn read_git_file(checkout_root: &Path, reference: &str, path: &str) -> Result<Vec<u8>, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(checkout_root)
-        .args(["show", &format!("{reference}:{path}")])
-        .output()
-        .map_err(|error| format!("Failed to launch git: {error}"))?;
+fn git_blob_oid(checkout_root: &Path, reference: &str, git_path: &str) -> Result<String, String> {
+    let output = CommandRunner::new("git")
+        .args([
+            "-C".to_string(),
+            checkout_root.display().to_string(),
+            "rev-parse".to_string(),
+            format!("{reference}:{git_path}"),
+        ])
+        .run()?;
 
-    if !output.status.success() {
+    if output.timed_out {
+        return Err("Timed out resolving git object id.".to_string());
+    }
+    if output.exit_code != Some(0) {
         return Err(format!(
-            "Failed to read {} from {} at {}: {}",
-            path,
+            "Failed to resolve {} from {} at {}: {}",
+            git_path,
             checkout_root.display(),
             reference,
-            String::from_utf8_lossy(&output.stderr).trim()
+            output.stderr
         ));
     }
 
-    Ok(output.stdout)
+    let oid = output.stdout.trim().to_string();
+    if oid.is_empty() {
+        return Err(format!(
+            "Git did not return an object id for {} at {}.",
+            git_path, reference
+        ));
+    }
+    Ok(oid)
+}
+
+fn read_git_blob(
+    checkout_root: &Path,
+    blob_oid: &str,
+    display_path: &str,
+) -> Result<Vec<u8>, String> {
+    let output = CommandRunner::new("git")
+        .args([
+            "-C".to_string(),
+            checkout_root.display().to_string(),
+            "cat-file".to_string(),
+            "-p".to_string(),
+            blob_oid.to_string(),
+        ])
+        .run()?;
+
+    if output.timed_out {
+        return Err("Timed out reading git object.".to_string());
+    }
+    if output.exit_code != Some(0) {
+        return Err(format!(
+            "Failed to read {} from {} at {}: {}",
+            display_path,
+            checkout_root.display(),
+            blob_oid,
+            output.stderr
+        ));
+    }
+
+    Ok(output.stdout_bytes)
 }
 
 fn validated_repo_relative_path(path: &str) -> Result<PathBuf, String> {
@@ -95,6 +151,18 @@ fn validated_repo_relative_path(path: &str) -> Result<PathBuf, String> {
     }
 
     Ok(result)
+}
+
+fn validated_git_path(path: &str) -> Result<String, String> {
+    let relative_path = validated_repo_relative_path(path)?;
+    Ok(relative_path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(segment) => Some(segment.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/"))
 }
 
 fn repository_file_content_from_bytes(
@@ -257,6 +325,45 @@ mod tests {
         );
         assert_eq!(document.source, REPOSITORY_FILE_SOURCE_LOCAL_CHECKOUT);
         assert!(!document.is_binary);
+    }
+
+    #[test]
+    fn worktree_reads_do_not_return_stale_cached_content() {
+        let repository = GitTestRepository::new();
+        repository.write_file("src/lib.rs", "pub fn value() -> i32 { 1 }\n");
+        let head = repository.commit_all("initial");
+        let cache =
+            CacheStore::new(unique_test_directory("local-documents-cache").join("cache.sqlite3"))
+                .expect("failed to create cache");
+
+        let first = load_local_repository_file_content(
+            &cache,
+            "openai/example",
+            &repository.root,
+            &head,
+            "src/lib.rs",
+            true,
+        )
+        .expect("failed to load first worktree file");
+        repository.write_file("src/lib.rs", "pub fn value() -> i32 { 2 }\n");
+        let second = load_local_repository_file_content(
+            &cache,
+            "openai/example",
+            &repository.root,
+            &head,
+            "src/lib.rs",
+            true,
+        )
+        .expect("failed to load changed worktree file");
+
+        assert_eq!(
+            first.content.as_deref(),
+            Some("pub fn value() -> i32 { 1 }\n")
+        );
+        assert_eq!(
+            second.content.as_deref(),
+            Some("pub fn value() -> i32 { 2 }\n")
+        );
     }
 
     #[test]

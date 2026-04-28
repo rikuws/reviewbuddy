@@ -1,12 +1,11 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use serde::{Deserialize, Serialize};
 
-use crate::{app_storage, cache::CacheStore, gh};
+use crate::{app_storage, cache::CacheStore, command_runner::CommandRunner, gh};
 
 const LOCAL_REPO_LINK_KEY_PREFIX: &str = "local-repo-link-v1:";
 
@@ -430,23 +429,31 @@ fn sync_managed_repository_to_pull_request(
     Ok(())
 }
 
+fn run_git(
+    path: &Path,
+    args: impl IntoIterator<Item = impl Into<String>>,
+) -> Result<gh::CommandOutput, String> {
+    let mut command_args = vec!["-C".to_string(), path.display().to_string()];
+    command_args.extend(args.into_iter().map(Into::into));
+    let output = CommandRunner::new("git").args(command_args).run()?;
+    if output.timed_out {
+        return Err("git command timed out after 120 seconds.".to_string());
+    }
+    Ok(output)
+}
+
 fn resolve_git_root(path: &Path) -> Result<Option<PathBuf>, String> {
     if !path.exists() {
         return Ok(None);
     }
 
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .map_err(|error| format!("Failed to launch git: {error}"))?;
+    let output = run_git(path, ["rev-parse", "--show-toplevel"])?;
 
-    if !output.status.success() {
+    if output.exit_code != Some(0) {
         return Ok(None);
     }
 
-    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let root = output.stdout.trim().to_string();
     if root.is_empty() {
         return Ok(None);
     }
@@ -455,18 +462,13 @@ fn resolve_git_root(path: &Path) -> Result<Option<PathBuf>, String> {
 }
 
 fn current_head_oid(path: &Path) -> Result<Option<String>, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .map_err(|error| format!("Failed to launch git: {error}"))?;
+    let output = run_git(path, ["rev-parse", "HEAD"])?;
 
-    if !output.status.success() {
+    if output.exit_code != Some(0) {
         return Ok(None);
     }
 
-    let head = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let head = output.stdout.trim().to_string();
     if head.is_empty() {
         return Ok(None);
     }
@@ -475,49 +477,34 @@ fn current_head_oid(path: &Path) -> Result<Option<String>, String> {
 }
 
 fn worktree_is_clean(path: &Path) -> Result<bool, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["status", "--porcelain", "--untracked-files=normal"])
-        .output()
-        .map_err(|error| format!("Failed to launch git: {error}"))?;
+    let output = run_git(path, ["status", "--porcelain", "--untracked-files=normal"])?;
 
-    if !output.status.success() {
+    if output.exit_code != Some(0) {
         return Ok(false);
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().is_empty())
+    Ok(output.stdout.trim().is_empty())
 }
 
 fn repository_matches_git_remote(repository: &str, path: &Path) -> Result<bool, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .arg("remote")
-        .output()
-        .map_err(|error| format!("Failed to launch git: {error}"))?;
+    let output = run_git(path, ["remote"])?;
 
-    if !output.status.success() {
+    if output.exit_code != Some(0) {
         return Ok(false);
     }
 
     let target = repository.to_ascii_lowercase();
-    let remote_names = String::from_utf8_lossy(&output.stdout);
+    let remote_names = output.stdout;
 
     for remote_name in remote_names.lines().filter(|line| !line.trim().is_empty()) {
-        let remote_output = Command::new("git")
-            .arg("-C")
-            .arg(path)
-            .args(["remote", "get-url", remote_name])
-            .output()
-            .map_err(|error| format!("Failed to launch git: {error}"))?;
+        let remote_output = run_git(path, ["remote", "get-url", remote_name])?;
 
-        if !remote_output.status.success() {
+        if remote_output.exit_code != Some(0) {
             continue;
         }
 
-        let remote_url = String::from_utf8_lossy(&remote_output.stdout);
-        if normalized_remote_repository(&remote_url).is_some_and(|normalized| normalized == target)
+        if normalized_remote_repository(&remote_output.stdout)
+            .is_some_and(|normalized| normalized == target)
         {
             return Ok(true);
         }

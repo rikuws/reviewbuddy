@@ -322,10 +322,9 @@ fn render_app_sidebar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                 .gap(px(10.0))
                                 .pb(px(8.0))
                                 .child(
-                                    svg()
-                                        .path(APP_MARK_ASSET.to_string())
-                                        .size(px(22.0))
-                                        .text_color(fg_emphasis()),
+                                    img(APP_MARK_ASSET)
+                                        .size(px(30.0))
+                                        .object_fit(ObjectFit::Contain),
                                 )
                                 .child(sidebar_utility_button(SIDEBAR_EXPAND_ASSET, false, true, {
                                     let state = state_for_toggle.clone();
@@ -351,10 +350,9 @@ fn render_app_sidebar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                         .gap(px(10.0))
                                         .min_w_0()
                                         .child(
-                                            svg()
-                                                .path(APP_MARK_ASSET.to_string())
-                                                .size(px(24.0))
-                                                .text_color(fg_emphasis()),
+                                            img(APP_MARK_ASSET)
+                                                .size(px(30.0))
+                                                .object_fit(ObjectFit::Contain),
                                         )
                                         .child(
                                             div()

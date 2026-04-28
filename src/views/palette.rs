@@ -69,10 +69,9 @@ pub fn render_palette(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                         .items_center()
                                         .gap(px(10.0))
                                         .child(
-                                            svg()
-                                                .path(APP_MARK_ASSET.to_string())
-                                                .size(px(18.0))
-                                                .text_color(accent()),
+                                            img(APP_MARK_ASSET)
+                                                .size(px(24.0))
+                                                .object_fit(ObjectFit::Contain),
                                         )
                                         .child(
                                             div()

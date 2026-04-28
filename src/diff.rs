@@ -320,14 +320,13 @@ enum DiffThreadSide {
     Right,
 }
 
+type InlineThreadIndex = HashMap<(DiffThreadSide, i64), Vec<usize>>;
+type ReviewThreadIndex = (Vec<usize>, InlineThreadIndex, Vec<usize>);
+
 fn index_review_threads(
     review_threads: &[PullRequestReviewThread],
     file_path: &str,
-) -> (
-    Vec<usize>,
-    HashMap<(DiffThreadSide, i64), Vec<usize>>,
-    Vec<usize>,
-) {
+) -> ReviewThreadIndex {
     let mut file_comment_threads = Vec::new();
     let mut inline_threads = HashMap::<(DiffThreadSide, i64), Vec<usize>>::new();
     let mut outdated_threads = Vec::new();

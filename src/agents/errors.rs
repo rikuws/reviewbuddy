@@ -33,7 +33,7 @@ pub fn generation_abort_message(provider_label: &str, reason: &AbortReason) -> S
 
 pub fn format_duration(timeout_ms: u64) -> String {
     let total_seconds = (timeout_ms as f64 / 1000.0).round() as u64;
-    if total_seconds % 60 == 0 {
+    if total_seconds.is_multiple_of(60) {
         let minutes = total_seconds / 60;
         format!("{minutes} minute{}", if minutes == 1 { "" } else { "s" })
     } else {

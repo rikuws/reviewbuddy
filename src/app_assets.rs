@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use gpui::{AssetSource, Result, SharedString};
 
-pub const APP_MARK_ASSET: &str = "brand/remiss-route.svg";
+pub const APP_MARK_ASSET: &str = "brand/app-icon.png";
 pub const BRAND_HERO_LANDSCAPE_ASSET: &str = "brand/hero_landscape.png";
 pub const OVERVIEW_OPEN_PULL_REQUESTS_ASSET: &str = "icons/overview-open-pull-requests.svg";
 pub const OVERVIEW_MY_PULL_REQUESTS_ASSET: &str = "icons/overview-my-pull-requests.svg";

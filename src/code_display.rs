@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ops::Range,
     path::PathBuf,
     sync::{
@@ -51,6 +52,13 @@ pub struct InteractiveCodeToken {
     pub column_start: usize,
     pub text: String,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreparedFileLineDiffKind {
+    Addition,
+}
+
+pub type PreparedFileLineDiffs = Arc<BTreeMap<usize, PreparedFileLineDiffKind>>;
 
 #[derive(Clone)]
 struct PreparedFileLspQuery {
@@ -205,14 +213,26 @@ pub fn render_prepared_file_excerpt_with_line_numbers(
         .map(|range| prepared_file.lines[range].to_vec())
         .unwrap_or_default();
 
-    render_prepared_code_block_lines(lines, lsp_context)
+    render_prepared_code_block_lines(lines, lsp_context, None)
 }
 
 pub fn render_prepared_file_with_line_numbers(
     prepared_file: &PreparedFileContent,
     lsp_context: Option<&PreparedFileLspContext>,
 ) -> AnyElement {
-    render_prepared_code_block_lines(prepared_file.lines.as_ref().clone(), lsp_context)
+    render_prepared_code_block_lines(prepared_file.lines.as_ref().clone(), lsp_context, None)
+}
+
+pub fn render_prepared_file_with_line_numbers_and_diffs(
+    prepared_file: &PreparedFileContent,
+    lsp_context: Option<&PreparedFileLspContext>,
+    diff_lines: PreparedFileLineDiffs,
+) -> AnyElement {
+    render_prepared_code_block_lines(
+        prepared_file.lines.as_ref().clone(),
+        lsp_context,
+        Some(diff_lines),
+    )
 }
 
 fn numbered_highlighted_code_lines(
@@ -258,6 +278,7 @@ fn render_highlighted_code_lines(lines: Vec<HighlightedCodeLine>) -> impl IntoEl
 fn render_prepared_code_block_lines(
     lines: Vec<PreparedFileLine>,
     lsp_context: Option<&PreparedFileLspContext>,
+    diff_lines: Option<PreparedFileLineDiffs>,
 ) -> AnyElement {
     div()
         .w_full()
@@ -269,7 +290,7 @@ fn render_prepared_code_block_lines(
             div()
                 .px(px(16.0))
                 .py(px(12.0))
-                .child(render_prepared_code_lines(lines, lsp_context)),
+                .child(render_prepared_code_lines(lines, lsp_context, diff_lines)),
         )
         .into_any_element()
 }
@@ -277,8 +298,10 @@ fn render_prepared_code_block_lines(
 fn render_prepared_code_lines(
     lines: Vec<PreparedFileLine>,
     lsp_context: Option<&PreparedFileLspContext>,
+    diff_lines: Option<PreparedFileLineDiffs>,
 ) -> impl IntoElement {
     let block_id = CODE_BLOCK_ID.fetch_add(1, Ordering::Relaxed);
+    let show_diff_markers = diff_lines.is_some();
 
     div()
         .w_full()
@@ -297,12 +320,22 @@ fn render_prepared_code_lines(
                 .text_color(fg_default())
                 .flex()
                 .flex_col()
-                .children(lines.into_iter().map(|line| {
+                .children(lines.into_iter().map(move |line| {
                     let line_lsp_context = lsp_context.map(|context| PreparedFileLineLspContext {
                         file: context.clone(),
                         line_number: line.line_number,
                     });
-                    render_prepared_code_line(block_id, line, line_lsp_context)
+                    let diff_kind = diff_lines
+                        .as_ref()
+                        .and_then(|diff_lines| diff_lines.get(&line.line_number))
+                        .copied();
+                    render_prepared_code_line_with_diff(
+                        block_id,
+                        line,
+                        line_lsp_context,
+                        diff_kind,
+                        show_diff_markers,
+                    )
                 })),
         )
 }
@@ -366,26 +399,60 @@ fn render_code_line_content(
     }
 }
 
-fn render_prepared_code_line(
+fn render_prepared_code_line_with_diff(
     block_id: usize,
     line: PreparedFileLine,
     lsp_context: Option<PreparedFileLineLspContext>,
+    diff_kind: Option<PreparedFileLineDiffKind>,
+    show_diff_markers: bool,
 ) -> Div {
+    let (row_bg, gutter_bg, row_border, marker, marker_color) = match diff_kind {
+        Some(PreparedFileLineDiffKind::Addition) => (
+            diff_add_bg(),
+            diff_add_gutter_bg(),
+            diff_add_border(),
+            "+",
+            success(),
+        ),
+        None => (
+            transparent(),
+            transparent(),
+            transparent(),
+            " ",
+            fg_subtle(),
+        ),
+    };
+
     div()
         .w_full()
         .min_w_0()
+        .min_h(px(22.0))
         .font_family("Fira Code")
         .flex()
         .items_start()
+        .bg(row_bg)
+        .border_b(px(1.0))
+        .border_color(row_border)
         .child(
             div()
                 .w(px(56.0))
                 .flex_shrink_0()
                 .pr(px(12.0))
+                .bg(gutter_bg)
                 .text_align(TextAlign::Right)
                 .text_color(fg_subtle())
                 .child(line.line_number.to_string()),
         )
+        .when(show_diff_markers, |el| {
+            el.child(
+                div()
+                    .w(px(16.0))
+                    .flex_shrink_0()
+                    .py(px(1.0))
+                    .text_color(marker_color)
+                    .child(marker.to_string()),
+            )
+        })
         .child(render_prepared_code_line_content(
             block_id,
             line,
