@@ -110,9 +110,22 @@ pub fn validate_ai_stack_plan(
     }
 
     if plan.layers.is_empty() {
-        return Err(AiStackPlanValidationError::new(
-            "AI stack plan did not return any layers.",
-        ));
+        let known_count = known_ids.len();
+        let manual_count = plan
+            .manual_review_atom_ids
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len();
+        let all_in_manual_review = manual_count >= known_count
+            && known_ids
+                .iter()
+                .all(|id| plan.manual_review_atom_ids.iter().any(|m| m == id));
+        if !(matches!(plan.strategy, AiStackPlanStrategy::FlatManualReview) && all_in_manual_review)
+        {
+            return Err(AiStackPlanValidationError::new(
+                "AI stack plan did not return any layers.",
+            ));
+        }
     }
 
     let mut plan = plan.clone();
@@ -205,11 +218,15 @@ pub fn validate_ai_stack_plan(
         .cloned()
         .collect::<Vec<ChangeAtomId>>();
     if !missing.is_empty() {
-        return Err(AiStackPlanValidationError::new(format!(
-            "AI stack plan omitted {} atom{}.",
+        plan.warnings.push(format!(
+            "AI stack plan omitted {} atom{}; auto-routed to manual_review_atom_ids.",
             missing.len(),
             if missing.len() == 1 { "" } else { "s" }
-        )));
+        ));
+        for atom_id in &missing {
+            plan.manual_review_atom_ids.push(atom_id.clone());
+            seen.insert(atom_id.clone());
+        }
     }
 
     let manual_ids = plan
@@ -747,16 +764,26 @@ mod tests {
     use crate::stacks::model::{LineRange, StackWarning};
 
     #[test]
-    fn rejects_omitted_atoms() {
+    fn auto_routes_omitted_atoms_to_manual_review() {
         let atoms = vec![
             atom("atom_1", ChangeRole::CoreLogic),
             atom("atom_2", ChangeRole::Tests),
         ];
         let plan = plan_with_layers(vec![vec!["atom_1"]], vec![]);
 
-        let error =
-            validate_ai_stack_plan(&plan, &atoms, 120).expect_err("missing atom should reject");
-        assert!(error.message.contains("omitted"));
+        let validated = validate_ai_stack_plan(&plan, &atoms, 120)
+            .expect("missing atoms should be auto-routed, not rejected");
+        assert!(validated
+            .plan
+            .manual_review_atom_ids
+            .iter()
+            .any(|id| id == "atom_2"));
+        assert!(validated
+            .plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("omitted")
+                && warning.contains("manual_review_atom_ids")));
     }
 
     #[test]

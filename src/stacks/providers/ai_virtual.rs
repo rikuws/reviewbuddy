@@ -4,7 +4,11 @@ use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
 
 use crate::{
-    agents::{self, jsonrepair::parse_tolerant, prompt::build_stack_planning_prompt},
+    agents::{
+        self,
+        jsonrepair::parse_tolerant,
+        prompt::{build_stack_planning_prompt, build_stack_planning_refinement_prompt},
+    },
     app_storage,
     code_tour::CodeTourProvider,
     github::PullRequestDetail,
@@ -12,7 +16,7 @@ use crate::{
 
 use super::super::{
     atoms::extract_change_atoms,
-    dependencies::{build_atom_dependencies, dependency_depths, AtomDependency},
+    dependencies::{build_atom_dependencies, dependency_depths, AtomDependency, DependencyKind},
     model::{
         stack_now_ms, ChangeAtom, ChangeAtomId, ChangeAtomSource, ChangeRole, Confidence,
         LayerMetrics, LayerReviewStatus, RepoContext, ReviewStack, ReviewStackLayer,
@@ -28,6 +32,7 @@ use super::super::{
 use super::virtual_commits::{self, CommitContext, CommitSuitability, CommitSummary};
 
 const MAX_AI_STACK_ATOMS: usize = 180;
+const MAX_AI_STACK_ATTEMPTS: usize = 5;
 
 pub struct AiVirtualStackProvider;
 
@@ -106,132 +111,191 @@ pub fn discover(
     }
 
     let input_json = build_stack_planning_input(selected_pr, &atoms, &commit_context);
-    let prompt = build_stack_planning_prompt(&input_json);
-    let response = match agents::run_json_prompt(
-        provider,
-        working_directory.to_string_lossy().as_ref(),
-        prompt.clone(),
-    ) {
-        Ok(response) => response,
-        Err(error) => {
-            let diagnostic_log_path = write_ai_stack_diagnostic_log(AiStackDiagnosticLogInput {
-                selected_pr,
-                provider,
-                stage: "provider_error",
-                working_directory: working_directory.to_string_lossy().as_ref(),
-                input_json: &input_json,
-                prompt: &prompt,
-                response_text: None,
-                model: None,
-                parse_error: None,
-                validation_error: None,
-                parsed_plan: None,
-                extracted_plan_value: None,
-                normalized_plan_value: None,
-                provider_error: Some(&error),
-            });
-            return ai_unavailable_stack(
-                selected_pr,
-                &format!(
-                    "AI stack planning was unavailable.{} Remiss did not generate a non-AI stack.",
-                    diagnostic_log_suffix(diagnostic_log_path.as_deref())
-                ),
-                Some(json!({
-                    "provider": provider.slug(),
-                    "error": error,
-                    "diagnosticLogPath": diagnostic_log_path,
-                    "commitSuitability": commit_context.suitability,
-                })),
-            )
-            .map(Some);
-        }
-    };
+    let initial_prompt = build_stack_planning_prompt(&input_json);
 
-    let parse_result = match parse_ai_stack_plan_response(&response.text) {
-        Ok(result) => result,
-        Err(error) => {
-            let diagnostic_log_path = write_ai_stack_diagnostic_log(AiStackDiagnosticLogInput {
-                selected_pr,
-                provider,
-                stage: "parse_error",
-                working_directory: working_directory.to_string_lossy().as_ref(),
-                input_json: &input_json,
-                prompt: &prompt,
-                response_text: Some(&response.text),
-                model: response.model.as_deref(),
-                parse_error: Some(&error),
-                validation_error: None,
-                parsed_plan: None,
-                extracted_plan_value: error.extracted_plan_value.as_ref(),
-                normalized_plan_value: error.normalized_plan_value.as_ref(),
-                provider_error: None,
-            });
-            return ai_unavailable_stack(
-                selected_pr,
-                &format!(
-                    "AI stack planning returned invalid output: {}.{} Remiss did not generate a non-AI stack.",
-                    error.message,
-                    diagnostic_log_suffix(diagnostic_log_path.as_deref())
-                ),
-                Some(json!({
-                    "provider": provider.slug(),
-                    "modelOrAgent": response.model,
-                    "error": error.message,
-                    "diagnosticLogPath": diagnostic_log_path,
-                    "commitSuitability": commit_context.suitability,
-                })),
-            )
-            .map(Some);
-        }
-    };
-    let plan = parse_result.plan.clone();
+    let mut prompt = initial_prompt.clone();
+    let mut attempt: usize = 0;
+    let mut prior_failures: Vec<Value> = Vec::new();
 
-    let validated = match validate_ai_stack_plan(&plan, &atoms, total_changed_lines) {
-        Ok(validated) => validated,
-        Err(error) => {
-            let diagnostic_log_path = write_ai_stack_diagnostic_log(AiStackDiagnosticLogInput {
-                selected_pr,
-                provider,
-                stage: "validation_error",
-                working_directory: working_directory.to_string_lossy().as_ref(),
-                input_json: &input_json,
-                prompt: &prompt,
-                response_text: Some(&response.text),
-                model: response.model.as_deref(),
-                parse_error: None,
-                validation_error: Some(&error.message),
-                parsed_plan: Some(&plan),
-                extracted_plan_value: Some(&parse_result.extracted_plan_value),
-                normalized_plan_value: Some(&parse_result.normalized_plan_value),
-                provider_error: None,
-            });
-            return ai_unavailable_stack(
-                selected_pr,
-                &format!(
-                    "AI stack planning returned invalid output: {}.{} Remiss did not generate a non-AI stack.",
-                    error.message,
-                    diagnostic_log_suffix(diagnostic_log_path.as_deref())
-                ),
-                Some(json!({
-                    "provider": provider.slug(),
-                    "modelOrAgent": response.model,
-                    "validationError": error.message,
-                    "diagnosticLogPath": diagnostic_log_path,
-                    "commitSuitability": commit_context.suitability,
-                })),
-            )
-            .map(Some);
-        }
-    };
+    loop {
+        attempt += 1;
+        let response = match agents::run_json_prompt(
+            provider,
+            working_directory.to_string_lossy().as_ref(),
+            prompt.clone(),
+        ) {
+            Ok(response) => response,
+            Err(error) => {
+                let diagnostic_log_path =
+                    write_ai_stack_diagnostic_log(AiStackDiagnosticLogInput {
+                        selected_pr,
+                        provider,
+                        stage: "provider_error",
+                        working_directory: working_directory.to_string_lossy().as_ref(),
+                        input_json: &input_json,
+                        prompt: &prompt,
+                        response_text: None,
+                        model: None,
+                        parse_error: None,
+                        validation_error: None,
+                        parsed_plan: None,
+                        extracted_plan_value: None,
+                        normalized_plan_value: None,
+                        provider_error: Some(&error),
+                        attempt,
+                        max_attempts: MAX_AI_STACK_ATTEMPTS,
+                        prior_failures: &prior_failures,
+                    });
+                return ai_unavailable_stack(
+                    selected_pr,
+                    &format!(
+                        "AI stack planning was unavailable.{} Remiss did not generate a non-AI stack.",
+                        diagnostic_log_suffix(diagnostic_log_path.as_deref())
+                    ),
+                    Some(json!({
+                        "provider": provider.slug(),
+                        "error": error,
+                        "diagnosticLogPath": diagnostic_log_path,
+                        "commitSuitability": commit_context.suitability,
+                        "attempts": attempt,
+                    })),
+                )
+                .map(Some);
+            }
+        };
 
-    Ok(Some(build_stack_from_validated_plan(
-        selected_pr,
-        atoms,
-        validated,
-        response.model,
-        provider,
-        commit_context,
-    )))
+        let parse_result = match parse_ai_stack_plan_response(&response.text) {
+            Ok(result) => result,
+            Err(error) => {
+                if attempt < MAX_AI_STACK_ATTEMPTS {
+                    prior_failures.push(json!({
+                        "attempt": attempt,
+                        "stage": "parse_error",
+                        "message": error.message,
+                        "model": response.model,
+                    }));
+                    prompt = build_stack_planning_refinement_prompt(
+                        &input_json,
+                        &response.text,
+                        "Parse error",
+                        &error.message,
+                        attempt + 1,
+                        MAX_AI_STACK_ATTEMPTS,
+                    );
+                    continue;
+                }
+                let diagnostic_log_path =
+                    write_ai_stack_diagnostic_log(AiStackDiagnosticLogInput {
+                        selected_pr,
+                        provider,
+                        stage: "parse_error",
+                        working_directory: working_directory.to_string_lossy().as_ref(),
+                        input_json: &input_json,
+                        prompt: &prompt,
+                        response_text: Some(&response.text),
+                        model: response.model.as_deref(),
+                        parse_error: Some(&error),
+                        validation_error: None,
+                        parsed_plan: None,
+                        extracted_plan_value: error.extracted_plan_value.as_ref(),
+                        normalized_plan_value: error.normalized_plan_value.as_ref(),
+                        provider_error: None,
+                        attempt,
+                        max_attempts: MAX_AI_STACK_ATTEMPTS,
+                        prior_failures: &prior_failures,
+                    });
+                return ai_unavailable_stack(
+                    selected_pr,
+                    &format!(
+                        "AI stack planning returned invalid output after {} attempts: {}.{} Remiss did not generate a non-AI stack.",
+                        attempt,
+                        error.message,
+                        diagnostic_log_suffix(diagnostic_log_path.as_deref())
+                    ),
+                    Some(json!({
+                        "provider": provider.slug(),
+                        "modelOrAgent": response.model,
+                        "error": error.message,
+                        "diagnosticLogPath": diagnostic_log_path,
+                        "commitSuitability": commit_context.suitability,
+                        "attempts": attempt,
+                    })),
+                )
+                .map(Some);
+            }
+        };
+        let plan = parse_result.plan.clone();
+
+        match validate_ai_stack_plan(&plan, &atoms, total_changed_lines) {
+            Ok(validated) => {
+                return Ok(Some(build_stack_from_validated_plan(
+                    selected_pr,
+                    atoms,
+                    validated,
+                    response.model,
+                    provider,
+                    commit_context,
+                )));
+            }
+            Err(error) => {
+                if attempt < MAX_AI_STACK_ATTEMPTS {
+                    prior_failures.push(json!({
+                        "attempt": attempt,
+                        "stage": "validation_error",
+                        "message": error.message,
+                        "model": response.model,
+                    }));
+                    prompt = build_stack_planning_refinement_prompt(
+                        &input_json,
+                        &response.text,
+                        "Validation error",
+                        &error.message,
+                        attempt + 1,
+                        MAX_AI_STACK_ATTEMPTS,
+                    );
+                    continue;
+                }
+                let diagnostic_log_path =
+                    write_ai_stack_diagnostic_log(AiStackDiagnosticLogInput {
+                        selected_pr,
+                        provider,
+                        stage: "validation_error",
+                        working_directory: working_directory.to_string_lossy().as_ref(),
+                        input_json: &input_json,
+                        prompt: &prompt,
+                        response_text: Some(&response.text),
+                        model: response.model.as_deref(),
+                        parse_error: None,
+                        validation_error: Some(&error.message),
+                        parsed_plan: Some(&plan),
+                        extracted_plan_value: Some(&parse_result.extracted_plan_value),
+                        normalized_plan_value: Some(&parse_result.normalized_plan_value),
+                        provider_error: None,
+                        attempt,
+                        max_attempts: MAX_AI_STACK_ATTEMPTS,
+                        prior_failures: &prior_failures,
+                    });
+                return ai_unavailable_stack(
+                    selected_pr,
+                    &format!(
+                        "AI stack planning returned invalid output after {} attempts: {}.{} Remiss did not generate a non-AI stack.",
+                        attempt,
+                        error.message,
+                        diagnostic_log_suffix(diagnostic_log_path.as_deref())
+                    ),
+                    Some(json!({
+                        "provider": provider.slug(),
+                        "modelOrAgent": response.model,
+                        "validationError": error.message,
+                        "diagnosticLogPath": diagnostic_log_path,
+                        "commitSuitability": commit_context.suitability,
+                        "attempts": attempt,
+                    })),
+                )
+                .map(Some);
+            }
+        }
+    }
 }
 
 pub fn should_attempt_ai_planning(
@@ -537,6 +601,9 @@ struct AiStackDiagnosticLogInput<'a> {
     extracted_plan_value: Option<&'a Value>,
     normalized_plan_value: Option<&'a Value>,
     provider_error: Option<&'a str>,
+    attempt: usize,
+    max_attempts: usize,
+    prior_failures: &'a [Value],
 }
 
 fn write_ai_stack_diagnostic_log(input: AiStackDiagnosticLogInput<'_>) -> Option<String> {
@@ -577,6 +644,9 @@ fn write_ai_stack_diagnostic_log(input: AiStackDiagnosticLogInput<'_>) -> Option
         "providerError": input.provider_error,
         "parseError": parse_error,
         "validationError": input.validation_error,
+        "attempt": input.attempt,
+        "maxAttempts": input.max_attempts,
+        "priorFailures": input.prior_failures,
         "promptBytes": input.prompt.len(),
         "rawResponseBytes": input.response_text.map(str::len),
         "input": input.input_json,
@@ -878,6 +948,10 @@ fn build_stack_planning_input(
             .collect::<Vec<_>>(),
         "dependency_edges": dependencies
             .iter()
+            .filter(|dep| matches!(
+                dep.kind,
+                DependencyKind::SymbolReference | DependencyKind::TestTarget
+            ))
             .map(dependency_json)
             .collect::<Vec<_>>(),
         "candidate_layers": candidate_layers_json(atoms, &depths),
@@ -1042,45 +1116,85 @@ fn atom_summary_json(
     depths: &BTreeMap<ChangeAtomId, usize>,
 ) -> Value {
     let commits = commits_by_path.get(&atom.path).cloned().unwrap_or_default();
-    let commit_oids = commits
-        .iter()
-        .map(|commit| commit.oid.clone())
-        .collect::<Vec<_>>();
     let commit_messages = commits
         .iter()
         .map(|commit| commit.subject.clone())
         .collect::<Vec<_>>();
-
-    json!({
-        "id": &atom.id,
-        "path": &atom.path,
-        "previous_path": &atom.previous_path,
-        "source_kind": atom.source.stable_kind(),
-        "role": atom.role.label(),
-        "semantic_kind": &atom.semantic_kind,
-        "substantive": atom_is_substantive(atom),
-        "noise_kind": atom_noise_kind(atom),
-        "dependency_depth": depths.get(&atom.id).copied().unwrap_or_default(),
-        "title": atom_title(atom),
-        "summary": atom_summary(atom),
-        "symbol_name": &atom.symbol_name,
-        "defined_symbols": &atom.defined_symbols,
-        "referenced_symbols": atom.referenced_symbols.iter().take(24).collect::<Vec<_>>(),
-        "hunk_headers": atom.hunk_headers.iter().take(4).collect::<Vec<_>>(),
-        "old_range": &atom.old_range,
-        "new_range": &atom.new_range,
-        "additions": atom.additions,
-        "deletions": atom.deletions,
-        "changed_line_count": atom.additions + atom.deletions,
-        "commit_oids": commit_oids,
-        "commit_messages": commit_messages,
-        "review_thread_count": atom.review_thread_ids.len(),
-        "risk_score": atom.risk_score,
-        "is_generated": atom.role == ChangeRole::Generated
-            || matches!(atom.source, ChangeAtomSource::GeneratedPlaceholder),
-        "is_binary": matches!(atom.source, ChangeAtomSource::BinaryPlaceholder),
-        "confidence": if requires_manual_review(atom) { "low" } else { "medium" },
-    })
+    let mut object = serde_json::Map::new();
+    object.insert("id".into(), json!(&atom.id));
+    object.insert("path".into(), json!(&atom.path));
+    if atom
+        .previous_path
+        .as_ref()
+        .map(|previous| previous != &atom.path)
+        .unwrap_or(false)
+    {
+        object.insert("previous_path".into(), json!(&atom.previous_path));
+    }
+    object.insert("source_kind".into(), json!(atom.source.stable_kind()));
+    object.insert("role".into(), json!(atom.role.label()));
+    if let Some(kind) = &atom.semantic_kind {
+        object.insert("semantic_kind".into(), json!(kind));
+    }
+    object.insert("substantive".into(), json!(atom_is_substantive(atom)));
+    if let Some(noise) = atom_noise_kind(atom) {
+        object.insert("noise_kind".into(), json!(noise));
+    }
+    object.insert(
+        "dependency_depth".into(),
+        json!(depths.get(&atom.id).copied().unwrap_or_default()),
+    );
+    object.insert("title".into(), json!(atom_title(atom)));
+    object.insert("summary".into(), json!(atom_summary(atom)));
+    if let Some(symbol) = &atom.symbol_name {
+        object.insert("symbol_name".into(), json!(symbol));
+    }
+    if !atom.defined_symbols.is_empty() {
+        object.insert("defined_symbols".into(), json!(&atom.defined_symbols));
+    }
+    if !atom.referenced_symbols.is_empty() {
+        object.insert(
+            "referenced_symbols".into(),
+            json!(atom.referenced_symbols.iter().take(12).collect::<Vec<_>>()),
+        );
+    }
+    if !atom.hunk_headers.is_empty() {
+        object.insert(
+            "hunk_headers".into(),
+            json!(atom.hunk_headers.iter().take(2).collect::<Vec<_>>()),
+        );
+    }
+    object.insert(
+        "changed_line_count".into(),
+        json!(atom.additions + atom.deletions),
+    );
+    if !commit_messages.is_empty() {
+        object.insert("commit_messages".into(), json!(commit_messages));
+    }
+    if atom.review_thread_ids.len() > 0 {
+        object.insert(
+            "review_thread_count".into(),
+            json!(atom.review_thread_ids.len()),
+        );
+    }
+    object.insert("risk_score".into(), json!(atom.risk_score));
+    let is_generated = atom.role == ChangeRole::Generated
+        || matches!(atom.source, ChangeAtomSource::GeneratedPlaceholder);
+    if is_generated {
+        object.insert("is_generated".into(), json!(true));
+    }
+    if matches!(atom.source, ChangeAtomSource::BinaryPlaceholder) {
+        object.insert("is_binary".into(), json!(true));
+    }
+    object.insert(
+        "confidence".into(),
+        json!(if requires_manual_review(atom) {
+            "low"
+        } else {
+            "medium"
+        }),
+    );
+    Value::Object(object)
 }
 
 fn commits_by_path(commits: &[CommitSummary]) -> BTreeMap<String, Vec<&CommitSummary>> {

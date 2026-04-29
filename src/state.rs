@@ -4,8 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::cache::CacheStore;
 use crate::code_tour::{
-    build_tour_request_key, CodeTourProvider, CodeTourProviderStatus, CodeTourSettings, DiffAnchor,
-    GeneratedCodeTour,
+    self, build_tour_request_key, CodeTourProvider, CodeTourProviderStatus, CodeTourSettings,
+    DiffAnchor, GeneratedCodeTour,
 };
 use crate::diff::DiffRenderRow;
 use crate::github::{
@@ -531,6 +531,17 @@ impl AppState {
         let cache_path = cache.path().display().to_string();
         let unread_review_comment_ids =
             notifications::load_unread_review_comment_ids(&cache).unwrap_or_default();
+        let initial_code_tour_settings = match code_tour::load_code_tour_settings(&cache) {
+            Ok(settings) => CodeTourSettingsState {
+                settings,
+                loaded: true,
+                ..CodeTourSettingsState::default()
+            },
+            Err(error) => CodeTourSettingsState {
+                error: Some(error),
+                ..CodeTourSettingsState::default()
+            },
+        };
         let mut state = Self {
             cache: Arc::new(cache),
             lsp_session_manager: Arc::new(LspSessionManager::new()),
@@ -597,7 +608,7 @@ impl AppState {
             automatic_tour_request_keys: std::collections::HashSet::new(),
             settings_scroll_handle: ScrollHandle::new(),
             ai_tour_section_list_state: ListState::new(0, ListAlignment::Top, px(720.0)),
-            code_tour_settings: CodeTourSettingsState::default(),
+            code_tour_settings: initial_code_tour_settings,
             managed_lsp_settings: ManagedLspSettingsState::default(),
         };
 

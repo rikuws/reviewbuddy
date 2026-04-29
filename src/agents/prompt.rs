@@ -90,9 +90,11 @@ pub fn build_stack_planning_prompt(input_json: &Value) -> String {
         "- Do not invent atom IDs.",
         "- Do not omit atom IDs.",
         "- Assign every atom exactly once.",
+        "- Every atom id from input.atoms MUST appear exactly once across all layer atom_ids and manual_review_atom_ids combined. If you are unsure where an atom belongs, put it in manual_review_atom_ids rather than dropping it.",
         "- Do not create Git branches or PRs.",
         "- Do not suggest rewriting history.",
         "- Start from candidate_layers, dependency_edges, and atom metadata. Repair them when needed; do not perform free-form clustering from raw file categories.",
+        "- dependency_edges only contains symbol-reference and test-target relationships; role-based ordering (foundation/types -> core -> integration -> tests) is implicit in atoms[*].role and must be preserved without explicit edges.",
         "- Prefer semantic review order over commit boundaries when commits are too coarse.",
         "- Commits are signals, not authoritative layers.",
         "- If a PR has only 1-2 commits and many changed lines, usually create semantic layers instead of commit layers.",
@@ -151,6 +153,44 @@ pub fn build_stack_planning_prompt(input_json: &Value) -> String {
   "manual_review_atom_ids": ["existing atom IDs only"],
   "warnings": ["short warning strings"]
 }"#,
+    ]
+    .join("\n")
+}
+
+/// Build a follow-up prompt that asks the model to refine an earlier stack plan
+/// after the response was produced but failed parsing or post-validation.
+///
+/// `failure_kind` should be a short label like "Parse error" or "Validation error".
+/// `failure_message` is the specific failure reason from the parser/validator.
+/// `previous_response` is the model's last raw response (typically JSON).
+pub fn build_stack_planning_refinement_prompt(
+    input_json: &Value,
+    previous_response: &str,
+    failure_kind: &str,
+    failure_message: &str,
+    attempt_number: usize,
+    max_attempts: usize,
+) -> String {
+    const MAX_PREVIOUS_RESPONSE_CHARS: usize = 32_000;
+    let trimmed_previous = trim_text(previous_response, MAX_PREVIOUS_RESPONSE_CHARS);
+    let base = build_stack_planning_prompt(input_json);
+    [
+        base.as_str(),
+        "",
+        "Refinement instructions:",
+        &format!(
+            "This is attempt {} of {}. Your previous response was rejected by post-validation.",
+            attempt_number, max_attempts
+        ),
+        &format!("{}: {}", failure_kind, failure_message),
+        "",
+        "Your previous response was:",
+        &trimmed_previous,
+        "",
+        "Produce a corrected JSON plan that fixes only the specific problem above. Keep the rest of the plan intact when it was already correct.",
+        "Do not over-correct: keep coherent multi-atom layers. Prefer fewer coherent layers over many single-atom layers. If atoms belong together by feature or dependency, keep them together even after the fix.",
+        "If the failure is a tail-dump-style validation issue, prefer moving the offending atoms into the earlier layer whose behavior they support, rather than splitting them into many tiny layers.",
+        "Return strict JSON only. No markdown, no prose outside JSON.",
     ]
     .join("\n")
 }
