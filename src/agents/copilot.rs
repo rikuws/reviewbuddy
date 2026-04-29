@@ -18,13 +18,16 @@ use super::jsonrepair::parse_tolerant;
 use super::merge::{build_copilot_fallback_tour, merge_tour, TourResponse};
 use super::progress::{limit_text, make_progress};
 use super::prompt::build_tour_prompt;
-use super::CodingAgentBackend;
+use super::{AgentTextResponse, CodingAgentBackend};
 
 const OVERALL_TIMEOUT_MS: u64 = 480_000;
 const INACTIVITY_TIMEOUT_MS: u64 = 120_000;
+const STACK_PLAN_OVERALL_TIMEOUT_MS: u64 = 120_000;
+const STACK_PLAN_INACTIVITY_TIMEOUT_MS: u64 = 45_000;
 const RUNNING_TICKER_MS: u64 = 10_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(120);
 const MAX_PROMPT_BYTES: usize = 120_000;
+const MAX_STACK_PLAN_PROMPT_BYTES: usize = 140_000;
 const AVAILABLE_TOOLS: &str = "view,rg,glob";
 
 pub struct CopilotBackend;
@@ -311,6 +314,154 @@ impl CodingAgentBackend for CopilotBackend {
             )),
         }
     }
+}
+
+pub fn run_json_prompt(
+    working_directory: &str,
+    mut prompt: String,
+) -> Result<AgentTextResponse, String> {
+    let Some(binary) = find_copilot_binary() else {
+        return Err("GitHub Copilot CLI is not installed on PATH.".to_string());
+    };
+
+    if !Path::new(working_directory).is_dir() {
+        return Err(format!(
+            "The local checkout '{working_directory}' does not exist."
+        ));
+    }
+
+    if prompt.len() > MAX_STACK_PLAN_PROMPT_BYTES {
+        prompt.truncate(MAX_STACK_PLAN_PROMPT_BYTES);
+    }
+
+    let mut child = Command::new(&binary)
+        .arg("-p")
+        .arg(&prompt)
+        .arg("--output-format")
+        .arg("json")
+        .arg("--stream")
+        .arg("on")
+        .arg("--allow-all-tools")
+        .arg("--available-tools")
+        .arg(AVAILABLE_TOOLS)
+        .arg("--no-ask-user")
+        .arg("--no-color")
+        .arg("--log-level")
+        .arg("error")
+        .current_dir(working_directory)
+        .env("NO_COLOR", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("Failed to launch the Copilot CLI: {error}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture the Copilot CLI stdout.".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture the Copilot CLI stderr.".to_string())?;
+
+    let (line_tx, line_rx) = mpsc::channel::<StreamLine>();
+    let stdout_handle = spawn_line_reader(stdout, StreamKind::Stdout, line_tx.clone());
+    let stderr_handle = spawn_line_reader(stderr, StreamKind::Stderr, line_tx);
+
+    let start = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut exit_status: Option<ExitStatus> = None;
+    let mut outcome = CopilotOutcome::default();
+    let mut ignore_progress = |_progress: CodeTourProgressUpdate| {};
+
+    loop {
+        while let Ok(line) = line_rx.try_recv() {
+            handle_stream_line(line, &mut outcome, &mut ignore_progress);
+            last_activity = Instant::now();
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                outcome.exit_code = status.code();
+                exit_status = Some(status);
+                break;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                return Err(format!("Failed to poll the Copilot CLI: {error}"));
+            }
+        }
+
+        let now = Instant::now();
+        if now.duration_since(start) > Duration::from_millis(STACK_PLAN_OVERALL_TIMEOUT_MS) {
+            outcome.abort = Some(AbortReason {
+                kind: AbortKind::Overall,
+                timeout_ms: STACK_PLAN_OVERALL_TIMEOUT_MS,
+                last_visible_activity: outcome.last_visible_activity.clone(),
+            });
+            break;
+        }
+
+        if !outcome.saw_meaningful_progress
+            && now.duration_since(last_activity)
+                > Duration::from_millis(STACK_PLAN_INACTIVITY_TIMEOUT_MS)
+        {
+            outcome.abort = Some(AbortReason {
+                kind: AbortKind::Inactivity,
+                timeout_ms: STACK_PLAN_INACTIVITY_TIMEOUT_MS,
+                last_visible_activity: outcome.last_visible_activity.clone(),
+            });
+            break;
+        }
+
+        match line_rx.recv_timeout(POLL_INTERVAL) {
+            Ok(line) => {
+                handle_stream_line(line, &mut outcome, &mut ignore_progress);
+                last_activity = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+    }
+
+    let timed_out = outcome.abort.clone();
+    if timed_out.is_some() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let _ = stdout_handle.join();
+    let _ = stderr_handle.join();
+    while let Ok(line) = line_rx.try_recv() {
+        handle_stream_line(line, &mut outcome, &mut ignore_progress);
+    }
+    promote_stream_to_final(&mut outcome);
+
+    if let Some(abort) = timed_out {
+        if !has_usable_final_text(&outcome) {
+            return Err(generation_abort_message("GitHub Copilot", &abort));
+        }
+    }
+
+    if let Some(error) = &outcome.error {
+        return Err(error.clone());
+    }
+
+    let Some(final_text) = outcome.final_text.as_deref() else {
+        return Err(fallback_reason(&outcome, exit_status.as_ref()));
+    };
+
+    let trimmed = final_text.trim();
+    if trimmed.is_empty() {
+        return Err(fallback_reason(&outcome, exit_status.as_ref()));
+    }
+
+    Ok(AgentTextResponse {
+        text: trimmed.to_string(),
+        model: outcome.model,
+    })
 }
 
 fn handle_stream_line(

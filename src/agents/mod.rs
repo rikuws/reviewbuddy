@@ -25,6 +25,23 @@ pub trait CodingAgentBackend: Send + Sync {
     ) -> Result<GeneratedCodeTour, String>;
 }
 
+#[derive(Clone, Debug)]
+pub struct AgentTextResponse {
+    pub text: String,
+    pub model: Option<String>,
+}
+
+pub fn run_json_prompt(
+    provider: CodeTourProvider,
+    working_directory: &str,
+    prompt: String,
+) -> Result<AgentTextResponse, String> {
+    match provider {
+        CodeTourProvider::Codex => codex::run_json_prompt(working_directory, prompt),
+        CodeTourProvider::Copilot => copilot::run_json_prompt(working_directory, prompt),
+    }
+}
+
 pub fn backend_for(provider: CodeTourProvider) -> Box<dyn CodingAgentBackend> {
     match provider {
         CodeTourProvider::Codex => Box::new(codex::CodexBackend::new()),

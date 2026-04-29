@@ -2,6 +2,7 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::stacks::model::{ChangeAtomId, ReviewStackLayerId, StackDiffMode};
 use crate::{cache::CacheStore, code_tour::DiffAnchor};
 
 const REVIEW_SESSION_CACHE_KEY_PREFIX: &str = "review-session-v2";
@@ -201,6 +202,14 @@ pub struct ReviewSessionDocument {
     pub last_read: Option<ReviewLocation>,
     #[serde(default)]
     pub collapsed_sections: Vec<String>,
+    #[serde(default)]
+    pub selected_stack_layer_id: Option<ReviewStackLayerId>,
+    #[serde(default)]
+    pub stack_diff_mode: StackDiffMode,
+    #[serde(default)]
+    pub reviewed_stack_layer_ids: Vec<ReviewStackLayerId>,
+    #[serde(default)]
+    pub reviewed_stack_atom_ids: Vec<ChangeAtomId>,
 }
 
 #[derive(Clone, Debug)]
@@ -219,6 +228,10 @@ pub struct ReviewSessionState {
     pub history_forward: Vec<ReviewLocation>,
     pub last_read: Option<ReviewLocation>,
     pub collapsed_sections: HashSet<String>,
+    pub selected_stack_layer_id: Option<ReviewStackLayerId>,
+    pub stack_diff_mode: StackDiffMode,
+    pub reviewed_stack_layer_ids: HashSet<ReviewStackLayerId>,
+    pub reviewed_stack_atom_ids: HashSet<ChangeAtomId>,
 }
 
 impl Default for ReviewSessionState {
@@ -238,6 +251,10 @@ impl Default for ReviewSessionState {
             history_forward: Vec::new(),
             last_read: None,
             collapsed_sections: HashSet::new(),
+            selected_stack_layer_id: None,
+            stack_diff_mode: StackDiffMode::WholePr,
+            reviewed_stack_layer_ids: HashSet::new(),
+            reviewed_stack_atom_ids: HashSet::new(),
         }
     }
 }
@@ -259,6 +276,10 @@ impl ReviewSessionState {
             history_forward: document.history_forward,
             last_read: document.last_read,
             collapsed_sections: document.collapsed_sections.into_iter().collect(),
+            selected_stack_layer_id: document.selected_stack_layer_id,
+            stack_diff_mode: document.stack_diff_mode,
+            reviewed_stack_layer_ids: document.reviewed_stack_layer_ids.into_iter().collect(),
+            reviewed_stack_atom_ids: document.reviewed_stack_atom_ids.into_iter().collect(),
         }
     }
 
@@ -282,6 +303,10 @@ impl ReviewSessionState {
             history_forward: self.history_forward.clone(),
             last_read: self.last_read.clone(),
             collapsed_sections: self.collapsed_sections.iter().cloned().collect(),
+            selected_stack_layer_id: self.selected_stack_layer_id.clone(),
+            stack_diff_mode: self.stack_diff_mode,
+            reviewed_stack_layer_ids: self.reviewed_stack_layer_ids.iter().cloned().collect(),
+            reviewed_stack_atom_ids: self.reviewed_stack_atom_ids.iter().cloned().collect(),
         }
     }
 

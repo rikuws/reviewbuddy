@@ -29,10 +29,12 @@ use super::merge::{merge_tour, TourResponse};
 use super::progress::make_progress;
 use super::prompt::build_tour_prompt;
 use super::runtime;
-use super::CodingAgentBackend;
+use super::{AgentTextResponse, CodingAgentBackend};
 
 const OVERALL_TIMEOUT_MS: u64 = 240_000;
 const INACTIVITY_TIMEOUT_MS: u64 = 60_000;
+const STACK_PLAN_OVERALL_TIMEOUT_MS: u64 = 90_000;
+const STACK_PLAN_INACTIVITY_TIMEOUT_MS: u64 = 35_000;
 const RUNNING_TICKER_MS: u64 = 10_000;
 const NEXT_MESSAGE_POLL: Duration = Duration::from_millis(250);
 
@@ -115,6 +117,8 @@ impl CodingAgentBackend for CodexBackend {
                 working_directory,
                 prompt,
                 progress_tx,
+                OVERALL_TIMEOUT_MS,
+                INACTIVITY_TIMEOUT_MS,
             ));
             let _ = result_tx.send(outcome);
         });
@@ -144,12 +148,91 @@ impl CodingAgentBackend for CodexBackend {
     }
 }
 
+pub fn run_json_prompt(
+    working_directory: &str,
+    prompt: String,
+) -> Result<AgentTextResponse, String> {
+    let Some(binary) = find_codex_binary() else {
+        return Err("Codex CLI is not installed on PATH.".to_string());
+    };
+
+    if !std::path::Path::new(working_directory).is_dir() {
+        return Err(format!(
+            "The local checkout '{working_directory}' does not exist."
+        ));
+    }
+
+    let working_directory = PathBuf::from(working_directory);
+    let (progress_tx, progress_rx) = mpsc::channel::<CodeTourProgressUpdate>();
+    let (result_tx, result_rx) = mpsc::channel::<Result<CodexTurnOutcome, String>>();
+
+    let worker = thread::spawn(move || {
+        let outcome = runtime::shared().block_on(run_codex_turn(
+            binary,
+            working_directory,
+            prompt,
+            progress_tx,
+            STACK_PLAN_OVERALL_TIMEOUT_MS,
+            STACK_PLAN_INACTIVITY_TIMEOUT_MS,
+        ));
+        let _ = result_tx.send(outcome);
+    });
+
+    loop {
+        while progress_rx.try_recv().is_ok() {}
+
+        match result_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(outcome) => {
+                while progress_rx.try_recv().is_ok() {}
+                let _ = worker.join();
+                return finalize_text_turn(outcome);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = worker.join();
+                return Err("Codex worker thread exited without reporting a result.".to_string());
+            }
+        }
+    }
+}
+
 struct CodexTurnOutcome {
     final_text: Option<String>,
     last_visible_activity: Option<String>,
     abort: Option<AbortReason>,
     model: Option<String>,
     error: Option<String>,
+}
+
+fn finalize_text_turn(
+    outcome: Result<CodexTurnOutcome, String>,
+) -> Result<AgentTextResponse, String> {
+    let outcome = outcome?;
+
+    if let Some(abort) = &outcome.abort {
+        return Err(generation_abort_message("Codex", abort));
+    }
+
+    if let Some(error) = &outcome.error {
+        return Err(format!("Codex reported an error: {error}"));
+    }
+
+    let Some(final_text) = outcome.final_text.as_deref() else {
+        let reason = outcome
+            .last_visible_activity
+            .unwrap_or_else(|| "Codex did not return a final message.".to_string());
+        return Err(format!("Codex returned no final agent message: {reason}"));
+    };
+
+    let trimmed = final_text.trim();
+    if trimmed.is_empty() {
+        return Err("Codex returned an empty JSON response.".to_string());
+    }
+
+    Ok(AgentTextResponse {
+        text: trimmed.to_string(),
+        model: outcome.model,
+    })
 }
 
 fn finalize_turn(
@@ -212,6 +295,8 @@ async fn run_codex_turn(
     working_directory: PathBuf,
     prompt: String,
     progress_tx: mpsc::Sender<CodeTourProgressUpdate>,
+    overall_timeout_ms: u64,
+    inactivity_timeout_ms: u64,
 ) -> Result<CodexTurnOutcome, String> {
     let builder = AppServerBuilder::new()
         .command(&binary)
@@ -253,18 +338,18 @@ async fn run_codex_turn(
 
     loop {
         let now = Instant::now();
-        if now.duration_since(start) > Duration::from_millis(OVERALL_TIMEOUT_MS) {
+        if now.duration_since(start) > Duration::from_millis(overall_timeout_ms) {
             outcome.abort = Some(AbortReason {
                 kind: AbortKind::Overall,
-                timeout_ms: OVERALL_TIMEOUT_MS,
+                timeout_ms: overall_timeout_ms,
                 last_visible_activity: outcome.last_visible_activity.clone(),
             });
             break;
         }
-        if now.duration_since(last_activity) > Duration::from_millis(INACTIVITY_TIMEOUT_MS) {
+        if now.duration_since(last_activity) > Duration::from_millis(inactivity_timeout_ms) {
             outcome.abort = Some(AbortReason {
                 kind: AbortKind::Inactivity,
-                timeout_ms: INACTIVITY_TIMEOUT_MS,
+                timeout_ms: inactivity_timeout_ms,
                 last_visible_activity: outcome.last_visible_activity.clone(),
             });
             break;

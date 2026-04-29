@@ -6,6 +6,7 @@ use crate::{
     cache::{CacheStore, CachedDocument},
     diff::ParsedDiffFile,
     gh::{self, CommandOutput},
+    stacks::model::StackPullRequestRef,
 };
 
 const WORKSPACE_CACHE_KEY: &str = "workspace-snapshot-v3";
@@ -374,6 +375,73 @@ pub fn sync_pull_request_detail(
         fetched_at_ms: Some(fetched_at_ms),
         detail: Some(detail),
     })
+}
+
+pub fn fetch_open_pull_request_stack_refs(
+    repository: &str,
+) -> Result<Vec<StackPullRequestRef>, String> {
+    let (owner, name) = split_repository(repository)?;
+    let query = r#"
+        query($owner: String!, $name: String!, $count: Int!, $cursor: String) {
+          repository(owner: $owner, name: $name) {
+            pullRequests(states: OPEN, first: $count, after: $cursor, orderBy: {field: UPDATED_AT, direction: DESC}) {
+              pageInfo { hasNextPage endCursor }
+              nodes {
+                number
+                title
+                url
+                state
+                isDraft
+                reviewDecision
+                baseRefName
+                headRefName
+                baseRefOid
+                headRefOid
+                repository { nameWithOwner }
+              }
+            }
+          }
+        }
+    "#;
+
+    let mut refs = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    loop {
+        let response = gh::graphql(
+            query,
+            json!({
+                "owner": owner,
+                "name": name,
+                "count": GITHUB_GRAPHQL_PAGE_SIZE,
+                "cursor": cursor,
+            }),
+        )?;
+        if let Some(error_message) = graphql_error_message(&response) {
+            return Err(error_message);
+        }
+
+        let connection = response
+            .get("data")
+            .and_then(|data| data.get("repository"))
+            .and_then(|repo| repo.get("pullRequests"))
+            .ok_or_else(|| "Missing pullRequests data in GraphQL response.".to_string())?;
+
+        if let Some(nodes) = connection_nodes(connection) {
+            refs.extend(nodes.iter().filter_map(map_stack_pull_request_ref));
+        }
+
+        let page_info = page_info(connection);
+        if !page_info.has_next_page {
+            break;
+        }
+        let Some(next_cursor) = page_info.end_cursor else {
+            break;
+        };
+        cursor = Some(next_cursor);
+    }
+
+    Ok(refs)
 }
 
 pub fn submit_pull_request_review(
@@ -1572,6 +1640,39 @@ fn map_pull_request_summary(node: &Value) -> Option<PullRequestSummary> {
             .map(str::to_string),
         updated_at: str_field(node, "updatedAt"),
         url: node.get("url")?.as_str()?.to_string(),
+    })
+}
+
+fn map_stack_pull_request_ref(node: &Value) -> Option<StackPullRequestRef> {
+    Some(StackPullRequestRef {
+        repository: node
+            .get("repository")
+            .and_then(|repo| repo.get("nameWithOwner"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        number: i64_field(node, "number"),
+        title: str_field(node, "title"),
+        url: str_field(node, "url"),
+        base_ref_name: str_field(node, "baseRefName"),
+        head_ref_name: str_field(node, "headRefName"),
+        base_ref_oid: node
+            .get("baseRefOid")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        head_ref_oid: node
+            .get("headRefOid")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        review_decision: node
+            .get("reviewDecision")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        state: str_field_or(node, "state", "OPEN"),
+        is_draft: node
+            .get("isDraft")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 

@@ -73,6 +73,77 @@ pub fn build_tour_prompt(input: &GenerateCodeTourInput) -> String {
     lines.join("\n")
 }
 
+pub fn build_stack_planning_prompt(input_json: &Value) -> String {
+    let context_pretty = serde_json::to_string_pretty(input_json).expect("context must serialize");
+    [
+        "You are helping Remiss, a read-only pull request review IDE, create virtual review stacks.",
+        "",
+        "Your task is to group deterministic change atoms from one pull request into ordered review layers.",
+        "",
+        "A virtual stack is not a Git branch stack. It is a local review lens. It must help a reviewer understand a large PR in a sensible order.",
+        "",
+        "Critical rules:",
+        "- Do not invent atom IDs.",
+        "- Do not omit atom IDs.",
+        "- Assign every atom exactly once.",
+        "- Do not create Git branches or PRs.",
+        "- Do not suggest rewriting history.",
+        "- Prefer semantic review order over commit boundaries when commits are too coarse.",
+        "- Commits are signals, not authoritative layers.",
+        "- If a PR has only 1-2 commits and many changed lines, usually create semantic layers instead of commit layers.",
+        "- Keep risky or behavior-changing code visible early.",
+        "- Put tests after the code they validate unless the tests are the main change.",
+        "- Put docs and trivial config near the end unless they define critical behavior.",
+        "- Use a manual-review layer for generated, binary, huge, ambiguous, or low-confidence atoms.",
+        "- Preserve reviewer trust by making uncertainty explicit.",
+        "",
+        "Layering guidance:",
+        "- Good virtual stacks usually have 3-8 layers.",
+        "- A layer should be coherent enough to review as one unit.",
+        "- A layer should not be merely \"Commit 1\" unless that commit is genuinely coherent and appropriately sized.",
+        "- Order layers by dependency and review usefulness:",
+        "  1. foundation: schemas, models, types, config, migrations",
+        "  2. core behavior: business logic, algorithms, state transitions, permissions",
+        "  3. integration: API, persistence, adapters, wiring",
+        "  4. presentation: UI, views, display, client integration",
+        "  5. tests: tests validating prior layers",
+        "  6. docs and cleanup",
+        "  7. manual review / uncertain changes",
+        "",
+        "Use dependency reasoning:",
+        "- If atom B references a symbol defined by atom A, A should usually come before B.",
+        "- If tests reference changed code, tests should usually come after that code.",
+        "- If a layer depends on another layer, list that dependency.",
+        "- If there are cycles, group the cyclic atoms into one layer or lower confidence.",
+        "",
+        "Return strict JSON only. No markdown, no prose outside JSON.",
+        "",
+        "Input:",
+        &context_pretty,
+        "",
+        "Required output schema:",
+        r#"{
+  "strategy": "commit_virtual_stack | semantic_virtual_stack | hybrid_virtual_stack | flat_manual_review",
+  "confidence": "high | medium | low",
+  "rationale": "short explanation",
+  "layers": [
+    {
+      "title": "short human-readable layer title",
+      "summary": "what this layer contains",
+      "rationale": "why these atoms belong together and why this layer appears here",
+      "atom_ids": ["existing atom IDs only"],
+      "depends_on_layer_indexes": [0],
+      "confidence": "high | medium | low",
+      "review_priority": "start_here | normal | quick_pass | manual_review"
+    }
+  ],
+  "manual_review_atom_ids": ["existing atom IDs only"],
+  "warnings": ["short warning strings"]
+}"#,
+    ]
+    .join("\n")
+}
+
 pub fn trim_text(value: &str, max_length: usize) -> String {
     let normalized = value.trim();
     if normalized.chars().count() <= max_length {

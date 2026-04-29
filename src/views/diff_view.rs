@@ -45,6 +45,13 @@ use crate::review_session::{
 use crate::selectable_text::{AppTextFieldKind, AppTextInput, SelectableText};
 use crate::semantic_diff::{build_semantic_diff_file, SemanticDiffFile, SemanticDiffSection};
 use crate::source_browser::render_source_browser;
+use crate::stacks::{
+    discover_review_stack,
+    model::{
+        ChangeAtomId, Confidence, LayerDiffFilter, RepoContext, ReviewStack, ReviewStackLayer,
+        StackDiffMode, StackDiscoveryOptions,
+    },
+};
 use crate::state::*;
 use crate::syntax::{self, SyntaxSpan};
 use crate::theme::*;
@@ -72,6 +79,7 @@ pub fn enter_files_surface(state: &Entity<AppState>, window: &mut Window, cx: &m
     });
 
     ensure_active_review_focus_loaded(state, window, cx);
+    ensure_active_stack_refs_loaded(state, window, cx);
 }
 
 pub fn open_review_diff_location(
@@ -136,6 +144,72 @@ pub fn ensure_active_review_focus_loaded(
     } else {
         ensure_selected_file_content_loaded(state, window, cx);
     }
+}
+
+pub fn ensure_active_stack_refs_loaded(
+    state: &Entity<AppState>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let request = {
+        let app_state = state.read(cx);
+        let Some(detail) = app_state.active_detail() else {
+            return;
+        };
+        let Some(detail_key) = app_state.active_pr_key.clone() else {
+            return;
+        };
+        let detail_state = app_state.detail_states.get(&detail_key);
+        if detail_state
+            .map(|state| {
+                state.stack_open_pull_requests.is_some()
+                    || state.stack_open_pull_requests_loading
+                    || state.stack_open_pull_requests_error.is_some()
+            })
+            .unwrap_or(false)
+        {
+            return;
+        }
+        (detail_key, detail.repository.clone())
+    };
+
+    let (detail_key, repository) = request;
+    state.update(cx, |state, cx| {
+        if let Some(detail_state) = state.detail_states.get_mut(&detail_key) {
+            detail_state.stack_open_pull_requests_loading = true;
+            detail_state.stack_open_pull_requests_error = None;
+        }
+        cx.notify();
+    });
+
+    let model = state.clone();
+    window
+        .spawn(cx, async move |cx: &mut AsyncWindowContext| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { github::fetch_open_pull_request_stack_refs(&repository) })
+                .await;
+
+            model
+                .update(cx, |state, cx| {
+                    if let Some(detail_state) = state.detail_states.get_mut(&detail_key) {
+                        detail_state.stack_open_pull_requests_loading = false;
+                        match result {
+                            Ok(open_prs) => {
+                                detail_state.stack_open_pull_requests = Some(open_prs);
+                                detail_state.stack_open_pull_requests_error = None;
+                                state.review_stack_cache.borrow_mut().clear();
+                            }
+                            Err(error) => {
+                                detail_state.stack_open_pull_requests_error = Some(error);
+                            }
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+        })
+        .detach();
 }
 
 pub fn close_review_line_action(state: &Entity<AppState>, cx: &mut App) {
@@ -667,6 +741,7 @@ pub fn render_files_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement
     let line_action_target = s.active_review_line_action.clone();
     let line_action_position = s.active_review_line_action_position;
     let line_action_mode = s.review_line_action_mode.clone();
+    let review_stack = prepare_review_stack(&s, detail);
 
     let default_path = prepare_review_queue(&s, detail)
         .default_item()
@@ -691,6 +766,7 @@ pub fn render_files_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement
             state,
             detail,
             selected_path,
+            review_stack.as_ref(),
             cx,
         ))
         .child(
@@ -707,6 +783,7 @@ pub fn render_files_view(state: &Entity<AppState>, cx: &App) -> impl IntoElement
                     selected_path,
                     selected_anchor.as_ref(),
                     semantic_file.as_deref(),
+                    review_stack.clone(),
                     cx,
                 )),
         )
@@ -827,6 +904,139 @@ fn review_cache_key(active_pr_key: Option<&str>, scope: &str) -> String {
     format!("{}:{scope}", active_pr_key.unwrap_or("detached"))
 }
 
+fn prepare_review_stack(app_state: &AppState, detail: &PullRequestDetail) -> Arc<ReviewStack> {
+    let cache_key = review_cache_key(app_state.active_pr_key.as_deref(), "review-stack");
+    let revision = format!(
+        "{}:{}:{}:{}:{}",
+        detail.updated_at,
+        detail.base_ref_oid.as_deref().unwrap_or_default(),
+        detail.head_ref_oid.as_deref().unwrap_or_default(),
+        local_stack_revision(app_state),
+        ai_stack_revision(app_state)
+    );
+    let open_pr_revision = stack_open_pr_revision(app_state);
+
+    if let Some(cached) = app_state
+        .review_stack_cache
+        .borrow()
+        .get(&cache_key)
+        .filter(|cached| cached.revision == revision && cached.open_pr_revision == open_pr_revision)
+        .cloned()
+    {
+        return cached.stack;
+    }
+
+    let repo_context = build_repo_context(app_state, detail);
+    let mut options = StackDiscoveryOptions::default();
+    options.ai_provider = enabled_ai_stack_provider(app_state);
+    options.enable_ai_virtual = options.ai_provider.is_some();
+    let stack = discover_review_stack(detail, &repo_context, options)
+        .unwrap_or_else(|error| fallback_stack_for_error(detail, error.message));
+    let stack = Arc::new(stack);
+    app_state.review_stack_cache.borrow_mut().insert(
+        cache_key,
+        CachedReviewStack {
+            revision,
+            open_pr_revision,
+            stack: stack.clone(),
+        },
+    );
+    stack
+}
+
+fn enabled_ai_stack_provider(app_state: &AppState) -> Option<CodeTourProvider> {
+    let status = app_state.selected_tour_provider_status()?;
+    (status.available && status.authenticated).then(|| app_state.selected_tour_provider())
+}
+
+fn ai_stack_revision(app_state: &AppState) -> String {
+    enabled_ai_stack_provider(app_state)
+        .map(|provider| format!("ai:{}", provider.slug()))
+        .unwrap_or_else(|| format!("ai:off:{}", app_state.code_tour_provider_statuses_loaded))
+}
+
+fn stack_open_pr_revision(app_state: &AppState) -> usize {
+    app_state
+        .active_detail_state()
+        .and_then(|detail_state| detail_state.stack_open_pull_requests.as_ref())
+        .map(|open_prs| {
+            open_prs.iter().fold(open_prs.len(), |acc, pr| {
+                acc.wrapping_mul(31)
+                    .wrapping_add(pr.number as usize)
+                    .wrapping_add(pr.base_ref_name.len())
+                    .wrapping_add(pr.head_ref_name.len())
+            })
+        })
+        .unwrap_or(0)
+}
+
+fn local_stack_revision(app_state: &AppState) -> String {
+    app_state
+        .active_detail_state()
+        .and_then(|detail_state| detail_state.local_repository_status.as_ref())
+        .map(|status| {
+            format!(
+                "{}:{}:{}",
+                status.ready_for_snapshot_features(),
+                status.path.as_deref().unwrap_or_default(),
+                status.current_head_oid.as_deref().unwrap_or_default()
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn build_repo_context(app_state: &AppState, _detail: &PullRequestDetail) -> RepoContext {
+    let detail_state = app_state.active_detail_state();
+    RepoContext {
+        open_pull_requests: detail_state
+            .and_then(|state| state.stack_open_pull_requests.clone())
+            .unwrap_or_default(),
+        local_repo_path: detail_state
+            .and_then(|state| state.local_repository_status.as_ref())
+            .and_then(|status| {
+                status
+                    .ready_for_snapshot_features()
+                    .then(|| status.path.clone())
+            })
+            .flatten()
+            .map(PathBuf::from),
+        trunk_branch: None,
+    }
+}
+
+fn fallback_stack_for_error(detail: &PullRequestDetail, message: String) -> ReviewStack {
+    let mut stack = crate::stacks::providers::virtual_semantic::discover(
+        detail,
+        &RepoContext::empty(),
+        &Default::default(),
+    )
+    .ok()
+    .flatten()
+    .unwrap_or_else(|| ReviewStack {
+        id: format!("stack-error:{}#{}", detail.repository, detail.number),
+        repository: detail.repository.clone(),
+        selected_pr_number: detail.number,
+        source: crate::stacks::model::StackSource::VirtualSemantic,
+        kind: crate::stacks::model::StackKind::Virtual,
+        confidence: Confidence::Low,
+        trunk_branch: Some(detail.base_ref_name.clone()),
+        base_oid: detail.base_ref_oid.clone(),
+        head_oid: detail.head_ref_oid.clone(),
+        layers: Vec::new(),
+        atoms: Vec::new(),
+        warnings: Vec::new(),
+        provider: None,
+        generated_at_ms: crate::stacks::model::stack_now_ms(),
+        generator_version: crate::stacks::model::STACK_GENERATOR_VERSION.to_string(),
+    });
+    stack.confidence = stack.confidence.min(Confidence::Low);
+    stack.warnings.push(crate::stacks::model::StackWarning::new(
+        "stack-discovery-error",
+        message,
+    ));
+    stack
+}
+
 fn prepare_review_queue(app_state: &AppState, detail: &PullRequestDetail) -> Arc<ReviewQueue> {
     let cache_key = review_cache_key(app_state.active_pr_key.as_deref(), "review-queue");
     let revision = detail.updated_at.clone();
@@ -894,9 +1104,10 @@ fn render_review_file_tree_pane(
     state: &Entity<AppState>,
     detail: &PullRequestDetail,
     selected_path: Option<&str>,
+    review_stack: &ReviewStack,
     cx: &App,
 ) -> impl IntoElement {
-    render_file_tree(state, detail, selected_path, cx)
+    render_file_tree(state, detail, selected_path, review_stack, cx)
 }
 
 fn render_review_inspector_pane(
@@ -1859,10 +2070,306 @@ fn queue_metric(label: String, fg: gpui::Rgba, bg: gpui::Rgba) -> impl IntoEleme
     metric_pill(label, fg, bg)
 }
 
+fn render_stack_rail(
+    state: &Entity<AppState>,
+    detail: &PullRequestDetail,
+    stack: &ReviewStack,
+    cx: &App,
+) -> impl IntoElement {
+    let session = state
+        .read(cx)
+        .active_review_session()
+        .cloned()
+        .unwrap_or_default();
+    let selected_layer_id = stack
+        .selected_layer(session.selected_stack_layer_id.as_deref())
+        .map(|layer| layer.id.clone());
+    let reviewed_layer_ids = session.reviewed_stack_layer_ids.clone();
+    let stack_label = match (&stack.kind, stack.source) {
+        (crate::stacks::model::StackKind::Real, _) => "Real stack".to_string(),
+        (
+            crate::stacks::model::StackKind::Virtual,
+            crate::stacks::model::StackSource::VirtualAi,
+        ) => format!(
+            "Virtual stack · AI-assisted · {} layers",
+            stack.layers.len()
+        ),
+        (crate::stacks::model::StackKind::Virtual, _) => "Virtual stack".to_string(),
+    };
+    let source_label = match (&stack.kind, stack.source) {
+        (crate::stacks::model::StackKind::Real, _) => "Backed by GitHub PRs",
+        (
+            crate::stacks::model::StackKind::Virtual,
+            crate::stacks::model::StackSource::VirtualAi,
+        ) => "Generated locally by Remiss as a review lens, not GitHub PRs",
+        (crate::stacks::model::StackKind::Virtual, _) => "Generated locally by Remiss",
+    };
+    let stack_refs_loading = state
+        .read(cx)
+        .active_detail_state()
+        .map(|detail_state| detail_state.stack_open_pull_requests_loading)
+        .unwrap_or(false);
+    let stack_refs_error = state
+        .read(cx)
+        .active_detail_state()
+        .and_then(|detail_state| detail_state.stack_open_pull_requests_error.clone());
+
+    div()
+        .px(px(8.0))
+        .py(px(8.0))
+        .border_b(px(1.0))
+        .border_color(border_muted())
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .px(px(4.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg_emphasis())
+                                .child(stack_label),
+                        )
+                        .child(
+                            div()
+                                .mt(px(2.0))
+                                .text_size(px(10.0))
+                                .text_color(fg_muted())
+                                .whitespace_nowrap()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .child(source_label),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .gap(px(4.0))
+                        .items_center()
+                        .child(badge(&stack.layers.len().to_string()))
+                        .when(stack_refs_loading, |el| el.child(badge("Checking"))),
+                ),
+        )
+        .children(stack.layers.iter().map(|layer| {
+            render_stack_layer_row(
+                state,
+                detail,
+                stack,
+                layer,
+                selected_layer_id.as_deref() == Some(layer.id.as_str()),
+                reviewed_layer_ids.contains(&layer.id),
+            )
+        }))
+        .when(!stack.warnings.is_empty(), |el| {
+            el.child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .rounded(radius_sm())
+                    .bg(warning_muted())
+                    .border_1()
+                    .border_color(warning())
+                    .text_size(px(11.0))
+                    .line_height(px(16.0))
+                    .text_color(fg_emphasis())
+                    .child(stack.warnings[0].message.clone()),
+            )
+        })
+        .when_some(stack_refs_error, |el, error| {
+            el.child(
+                div()
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .rounded(radius_sm())
+                    .bg(bg_subtle())
+                    .border_1()
+                    .border_color(border_muted())
+                    .text_size(px(11.0))
+                    .line_height(px(16.0))
+                    .text_color(fg_muted())
+                    .child(format!("Real stack lookup unavailable: {error}")),
+            )
+        })
+}
+
+fn render_stack_layer_row(
+    state: &Entity<AppState>,
+    detail: &PullRequestDetail,
+    stack: &ReviewStack,
+    layer: &ReviewStackLayer,
+    is_active: bool,
+    is_reviewed: bool,
+) -> impl IntoElement {
+    let state_for_open = state.clone();
+    let layer_id = layer.id.clone();
+    let first_file = stack.first_file_for_layer(layer);
+    let line_count = layer.metrics.changed_lines;
+    let thread_count = layer.metrics.unresolved_thread_count;
+    let confidence = layer.confidence;
+    let is_current_pr_layer = layer
+        .pr
+        .as_ref()
+        .map(|pr| pr.number == detail.number)
+        .unwrap_or(true);
+
+    div()
+        .px(px(8.0))
+        .py(px(7.0))
+        .rounded(radius_sm())
+        .border_1()
+        .border_color(if is_active {
+            focus_border()
+        } else {
+            border_muted()
+        })
+        .bg(if is_active {
+            bg_selected()
+        } else {
+            bg_surface()
+        })
+        .cursor_pointer()
+        .hover(|style| style.bg(hover_bg()))
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            state_for_open.update(cx, |state, cx| {
+                state.set_selected_stack_layer(Some(layer_id.clone()));
+                state.set_stack_diff_mode(StackDiffMode::CurrentLayerOnly);
+                state.set_review_center_mode(ReviewCenterMode::SemanticDiff);
+                if is_current_pr_layer {
+                    if let Some(path) = first_file.clone() {
+                        state.selected_file_path = Some(path);
+                        state.selected_diff_anchor = None;
+                    }
+                }
+                state.persist_active_review_session();
+                cx.notify();
+            });
+            if is_current_pr_layer {
+                ensure_selected_file_content_loaded(&state_for_open, window, cx);
+            }
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .min_w_0()
+                        .child(
+                            div()
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .rounded(radius_sm())
+                                .bg(if is_active {
+                                    accent_muted()
+                                } else {
+                                    bg_subtle()
+                                })
+                                .border_1()
+                                .border_color(if is_active { accent() } else { border_muted() })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(10.0))
+                                .font_family(mono_font_family())
+                                .text_color(if is_active { accent() } else { fg_muted() })
+                                .child((layer.index + 1).to_string()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(if is_active {
+                                    fg_emphasis()
+                                } else {
+                                    fg_default()
+                                })
+                                .whitespace_nowrap()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .child(layer.title.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_family(mono_font_family())
+                        .text_color(if is_reviewed { success() } else { fg_subtle() })
+                        .child(if is_reviewed {
+                            "done"
+                        } else {
+                            layer.status.label()
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .mt(px(6.0))
+                .flex()
+                .gap(px(4.0))
+                .flex_wrap()
+                .child(subtle_stack_chip(&format!(
+                    "{} file{}",
+                    layer.metrics.file_count,
+                    if layer.metrics.file_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )))
+                .child(subtle_stack_chip(&format!(
+                    "{line_count} line{}",
+                    if line_count == 1 { "" } else { "s" }
+                )))
+                .when(thread_count > 0, |el| {
+                    el.child(subtle_stack_chip(&format!(
+                        "{thread_count} thread{}",
+                        if thread_count == 1 { "" } else { "s" }
+                    )))
+                })
+                .when(confidence != Confidence::High, |el| {
+                    el.child(subtle_stack_chip(match confidence {
+                        Confidence::High => "high",
+                        Confidence::Medium => "medium",
+                        Confidence::Low => "low",
+                    }))
+                }),
+        )
+}
+
+fn subtle_stack_chip(label: &str) -> impl IntoElement {
+    div()
+        .px(px(5.0))
+        .py(px(1.0))
+        .rounded(px(999.0))
+        .bg(bg_subtle())
+        .border_1()
+        .border_color(border_muted())
+        .text_size(px(9.0))
+        .font_family(mono_font_family())
+        .text_color(fg_muted())
+        .child(label.to_string())
+}
+
 fn render_file_tree(
     state: &Entity<AppState>,
     detail: &PullRequestDetail,
     selected_path: Option<&str>,
+    review_stack: &ReviewStack,
     cx: &App,
 ) -> impl IntoElement {
     let tree_rows = {
@@ -1887,6 +2394,7 @@ fn render_file_tree(
         .border_color(border_muted())
         .flex()
         .flex_col()
+        .child(render_stack_rail(state, detail, review_stack, cx))
         .child(
             div()
                 .px(px(12.0))
@@ -2960,6 +3468,7 @@ fn render_diff_panel(
     selected_path: Option<&str>,
     selected_anchor: Option<&DiffAnchor>,
     semantic_file: Option<&SemanticDiffFile>,
+    review_stack: Arc<ReviewStack>,
     cx: &App,
 ) -> impl IntoElement {
     let files = &detail.files;
@@ -3016,6 +3525,20 @@ fn render_diff_panel(
         .active_review_session()
         .cloned()
         .unwrap_or_default();
+    let stack_filter = build_layer_diff_filter(
+        review_stack.as_ref(),
+        review_session.stack_diff_mode,
+        review_session.selected_stack_layer_id.as_deref(),
+        &review_session.reviewed_stack_atom_ids,
+    );
+    let selected_stack_layer = review_stack
+        .selected_layer(review_session.selected_stack_layer_id.as_deref())
+        .cloned();
+    let selected_stack_layer_id = selected_stack_layer.as_ref().map(|layer| layer.id.clone());
+    let selected_stack_layer_reviewed = selected_stack_layer
+        .as_ref()
+        .map(|layer| review_session.reviewed_stack_layer_ids.contains(&layer.id))
+        .unwrap_or(false);
     let center_mode = review_session.center_mode;
     let source_target = review_session.source_target.clone().or_else(|| {
         selected_file.map(|file| ReviewSourceTarget {
@@ -3058,6 +3581,10 @@ fn render_diff_panel(
             can_go_forward,
             has_waymark,
             selected_anchor,
+            review_stack.clone(),
+            review_session.stack_diff_mode,
+            selected_stack_layer_id,
+            selected_stack_layer_reviewed,
         ))
         .child(
             div()
@@ -3090,6 +3617,8 @@ fn render_diff_panel(
                             .and_then(|state| state.prepared.as_ref()),
                         selected_anchor,
                         diff_view_state,
+                        review_stack.clone(),
+                        stack_filter.clone(),
                         cx,
                     )
                     .into_any_element()
@@ -3117,6 +3646,10 @@ fn render_diff_toolbar(
     can_go_forward: bool,
     has_waymark: bool,
     selected_anchor: Option<&DiffAnchor>,
+    review_stack: Arc<ReviewStack>,
+    stack_diff_mode: StackDiffMode,
+    selected_stack_layer_id: Option<String>,
+    selected_stack_layer_reviewed: bool,
 ) -> impl IntoElement {
     let selected_section =
         semantic_file.and_then(|semantic| semantic.section_for_anchor(selected_anchor));
@@ -3179,6 +3712,10 @@ fn render_diff_toolbar(
     let state_for_semantic = state.clone();
     let state_for_ai_tour = state.clone();
     let state_for_source = state.clone();
+    let state_for_stack_whole = state.clone();
+    let state_for_stack_current = state.clone();
+    let state_for_stack_upto = state.clone();
+    let state_for_stack_reviewed = state.clone();
     let mark_available = has_waymark || selected_anchor.is_some() || selected_file.is_some();
     let waymark_name = default_waymark_name(
         selected_file.map(|file| file.path.as_str()),
@@ -3277,6 +3814,65 @@ fn render_diff_toolbar(
                         }
                     },
                 ))
+                .child(div().w(px(1.0)).h(px(18.0)).bg(border_muted()))
+                .child(workspace_mode_button(
+                    StackDiffMode::WholePr.label(),
+                    stack_diff_mode == StackDiffMode::WholePr,
+                    move |_, _, cx| {
+                        state_for_stack_whole.update(cx, |state, cx| {
+                            state.set_stack_diff_mode(StackDiffMode::WholePr);
+                            state.persist_active_review_session();
+                            cx.notify();
+                        });
+                    },
+                ))
+                .child(workspace_mode_button(
+                    StackDiffMode::CurrentLayerOnly.label(),
+                    stack_diff_mode == StackDiffMode::CurrentLayerOnly,
+                    move |_, _, cx| {
+                        state_for_stack_current.update(cx, |state, cx| {
+                            state.set_stack_diff_mode(StackDiffMode::CurrentLayerOnly);
+                            state.persist_active_review_session();
+                            cx.notify();
+                        });
+                    },
+                ))
+                .child(workspace_mode_button(
+                    StackDiffMode::UpToCurrentLayer.label(),
+                    stack_diff_mode == StackDiffMode::UpToCurrentLayer,
+                    move |_, _, cx| {
+                        state_for_stack_upto.update(cx, |state, cx| {
+                            state.set_stack_diff_mode(StackDiffMode::UpToCurrentLayer);
+                            state.persist_active_review_session();
+                            cx.notify();
+                        });
+                    },
+                ))
+                .when_some(selected_stack_layer_id, |el, layer_id| {
+                    el.child(workspace_mode_button(
+                        if selected_stack_layer_reviewed {
+                            "Reviewed"
+                        } else {
+                            "Mark layer"
+                        },
+                        selected_stack_layer_reviewed,
+                        {
+                            let stack = review_stack.clone();
+                            let state = state_for_stack_reviewed.clone();
+                            move |_, _, cx| {
+                                state.update(cx, |state, cx| {
+                                    state.set_stack_layer_reviewed(
+                                        stack.as_ref(),
+                                        &layer_id,
+                                        !selected_stack_layer_reviewed,
+                                    );
+                                    state.persist_active_review_session();
+                                    cx.notify();
+                                });
+                            }
+                        },
+                    ))
+                })
                 .when(can_go_back, |el| {
                     el.child(workspace_mode_button("Back", false, {
                         let state = state_for_back.clone();
@@ -7292,6 +7888,8 @@ fn render_file_diff(
     prepared_file: Option<&PreparedFileContent>,
     selected_anchor: Option<&DiffAnchor>,
     diff_view_state: DiffFileViewState,
+    review_stack: Arc<ReviewStack>,
+    stack_filter: Option<LayerDiffFilter>,
     cx: &App,
 ) -> impl IntoElement {
     let rows = diff_view_state.rows.clone();
@@ -7315,6 +7913,9 @@ fn render_file_diff(
         build_diff_file_lsp_context(state, file.path.as_str(), prepared_file.as_ref(), cx);
     let semantic_sections =
         semantic_file.map(|semantic_file| Arc::new(semantic_file.sections.clone()));
+    let stack_visibility = stack_filter
+        .as_ref()
+        .map(|filter| stack_file_visibility(review_stack.as_ref(), filter, &file.path, parsed));
 
     let items = build_diff_view_items(
         state,
@@ -7323,6 +7924,7 @@ fn render_file_diff(
         semantic_file,
         prepared_file.as_ref(),
         &rows,
+        stack_visibility.as_ref(),
         cx,
     );
 
@@ -7372,6 +7974,12 @@ fn render_file_diff(
                 .flex_grow()
                 .min_h_0()
                 .bg(bg_inset())
+                .when_some(stack_visibility.clone(), |el, visibility| {
+                    el.child(render_stack_layer_diff_notice(
+                        review_stack.as_ref(),
+                        &visibility,
+                    ))
+                })
                 .child(
                     render_virtualized_diff_rows(
                         &state,
@@ -7416,6 +8024,10 @@ fn render_virtualized_diff_rows(
             })
             .unwrap_or_else(|| div().into_any_element()),
         DiffViewItem::Gap(gap) => render_diff_gap_row(gap, gutter_layout).into_any_element(),
+        DiffViewItem::StackLayerEmpty => render_diff_state_row(
+            "No changed hunks in this file belong to the selected stack layer.",
+        )
+        .into_any_element(),
         DiffViewItem::Row(row_ix) => render_virtualized_diff_row(
             &state,
             gutter_layout,
@@ -7435,6 +8047,137 @@ enum DiffViewItem {
     Row(usize),
     Gap(DiffGapSummary),
     SemanticSection(usize),
+    StackLayerEmpty,
+}
+
+#[derive(Clone)]
+struct StackFileVisibility {
+    mode: StackDiffMode,
+    layer_id: Option<String>,
+    layer_title: String,
+    layer_rationale: String,
+    layer_warnings: Vec<crate::stacks::model::StackWarning>,
+    confidence: Confidence,
+    ai_assisted: bool,
+    visible_hunk_indices: Option<BTreeSet<usize>>,
+    visible_atom_count: usize,
+    total_hunk_count: usize,
+    hidden_hunk_count: usize,
+    file_has_visible_atoms: bool,
+}
+
+fn build_layer_diff_filter(
+    stack: &ReviewStack,
+    mode: StackDiffMode,
+    selected_layer_id: Option<&str>,
+    reviewed_atom_ids: &std::collections::HashSet<ChangeAtomId>,
+) -> Option<LayerDiffFilter> {
+    if mode == StackDiffMode::WholePr {
+        return None;
+    }
+
+    let selected_index = stack.selected_layer_index(selected_layer_id)?;
+    let mut visible_atom_ids = BTreeSet::<ChangeAtomId>::new();
+
+    for (index, layer) in stack.layers.iter().enumerate() {
+        let include = match mode {
+            StackDiffMode::WholePr => false,
+            StackDiffMode::CurrentLayerOnly => index == selected_index,
+            StackDiffMode::UpToCurrentLayer => index <= selected_index,
+            StackDiffMode::CurrentAndDependents => index >= selected_index,
+            StackDiffMode::SinceLastReviewed => true,
+        };
+
+        if !include {
+            continue;
+        }
+
+        for atom_id in &layer.atom_ids {
+            if mode == StackDiffMode::SinceLastReviewed && reviewed_atom_ids.contains(atom_id) {
+                continue;
+            }
+            visible_atom_ids.insert(atom_id.clone());
+        }
+    }
+
+    if visible_atom_ids.is_empty() && stack.kind == crate::stacks::model::StackKind::Real {
+        return None;
+    }
+
+    Some(LayerDiffFilter {
+        mode,
+        selected_layer_id: stack
+            .selected_layer(selected_layer_id)
+            .map(|layer| layer.id.clone()),
+        visible_atom_ids,
+    })
+}
+
+fn stack_file_visibility(
+    stack: &ReviewStack,
+    filter: &LayerDiffFilter,
+    file_path: &str,
+    parsed: Option<&ParsedDiffFile>,
+) -> StackFileVisibility {
+    let selected_layer = stack.selected_layer(filter.selected_layer_id.as_deref());
+    let mut visible_hunks = BTreeSet::<usize>::new();
+    let mut show_whole_file = false;
+    let mut visible_atom_count = 0usize;
+
+    for atom_id in &filter.visible_atom_ids {
+        let Some(atom) = stack.atom(atom_id) else {
+            continue;
+        };
+        if atom.path != file_path {
+            continue;
+        }
+        visible_atom_count += 1;
+        if atom.hunk_indices.is_empty() {
+            show_whole_file = true;
+        } else {
+            visible_hunks.extend(atom.hunk_indices.iter().copied());
+        }
+    }
+
+    let total_hunk_count = parsed.map(|parsed| parsed.hunks.len()).unwrap_or(0);
+    let file_has_visible_atoms = visible_atom_count > 0;
+    let visible_hunk_indices = if show_whole_file {
+        None
+    } else {
+        Some(visible_hunks)
+    };
+    let visible_hunk_count = visible_hunk_indices
+        .as_ref()
+        .map(|hunks| hunks.len())
+        .unwrap_or(total_hunk_count);
+    let hidden_hunk_count = if file_has_visible_atoms {
+        total_hunk_count.saturating_sub(visible_hunk_count)
+    } else {
+        total_hunk_count
+    };
+
+    StackFileVisibility {
+        mode: filter.mode,
+        layer_id: selected_layer.map(|layer| layer.id.clone()),
+        layer_title: selected_layer
+            .map(|layer| layer.title.clone())
+            .unwrap_or_else(|| "Stack layer".to_string()),
+        layer_rationale: selected_layer
+            .map(|layer| layer.rationale.clone())
+            .unwrap_or_default(),
+        layer_warnings: selected_layer
+            .map(|layer| layer.warnings.clone())
+            .unwrap_or_default(),
+        confidence: selected_layer
+            .map(|layer| layer.confidence)
+            .unwrap_or(stack.confidence),
+        ai_assisted: stack.source == crate::stacks::model::StackSource::VirtualAi,
+        visible_hunk_indices,
+        visible_atom_count,
+        total_hunk_count,
+        hidden_hunk_count,
+        file_has_visible_atoms,
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -8264,6 +9007,7 @@ fn build_diff_view_items(
     semantic_file: Option<&SemanticDiffFile>,
     prepared_file: Option<&PreparedFileContent>,
     rows: &[DiffRenderRow],
+    stack_visibility: Option<&StackFileVisibility>,
     cx: &App,
 ) -> Vec<DiffViewItem> {
     let mut items = Vec::with_capacity(rows.len() + 4);
@@ -8280,13 +9024,24 @@ fn build_diff_view_items(
         .active_review_session()
         .map(|session| session.collapsed_sections.clone())
         .unwrap_or_default();
+    let mut current_hunk_visible = true;
+    let mut emitted_visible_stack_hunk = false;
 
     for (row_index, row) in rows.iter().enumerate() {
         if let DiffRenderRow::HunkHeader { hunk_index } = row {
+            current_hunk_visible = stack_visibility
+                .map(|visibility| {
+                    visibility
+                        .visible_hunk_indices
+                        .as_ref()
+                        .map(|visible| visible.contains(hunk_index))
+                        .unwrap_or(visibility.file_has_visible_atoms)
+                })
+                .unwrap_or(true);
             if let Some(section_ix) = semantic_file
                 .and_then(|semantic_file| semantic_file.section_index_for_hunk(*hunk_index))
             {
-                if current_section_ix != Some(section_ix) {
+                if current_hunk_visible && current_section_ix != Some(section_ix) {
                     items.push(DiffViewItem::SemanticSection(section_ix));
                     current_section_ix = Some(section_ix);
                 }
@@ -8294,12 +9049,15 @@ fn build_diff_view_items(
                 current_section_ix = None;
             }
 
-            if let Some(gap) =
-                diff_gap_before_hunk(file, parsed, prepared_file, last_hunk_index, *hunk_index)
-            {
-                items.push(DiffViewItem::Gap(gap));
+            if current_hunk_visible {
+                if let Some(gap) =
+                    diff_gap_before_hunk(file, parsed, prepared_file, last_hunk_index, *hunk_index)
+                {
+                    items.push(DiffViewItem::Gap(gap));
+                }
+                last_hunk_index = Some(*hunk_index);
+                emitted_visible_stack_hunk = true;
             }
-            last_hunk_index = Some(*hunk_index);
         }
 
         let is_collapsed = current_section_ix
@@ -8315,6 +9073,14 @@ fn build_diff_view_items(
                     | DiffRenderRow::Line { .. }
                     | DiffRenderRow::InlineThread { .. }
             );
+        let should_skip = should_skip
+            || (!current_hunk_visible
+                && matches!(
+                    row,
+                    DiffRenderRow::HunkHeader { .. }
+                        | DiffRenderRow::Line { .. }
+                        | DiffRenderRow::InlineThread { .. }
+                ));
 
         if !should_skip {
             items.push(DiffViewItem::Row(row_index));
@@ -8329,6 +9095,13 @@ fn build_diff_view_items(
                 }
             }
         }
+    }
+
+    if stack_visibility
+        .map(|visibility| !visibility.file_has_visible_atoms || !emitted_visible_stack_hunk)
+        .unwrap_or(false)
+    {
+        items.push(DiffViewItem::StackLayerEmpty);
     }
 
     items
@@ -8504,6 +9277,137 @@ fn render_diff_gap_row(
                         .text_color(fg_muted())
                         .child(render_diff_gap_label(summary)),
                 ),
+        )
+}
+
+fn render_stack_layer_diff_notice(
+    stack: &ReviewStack,
+    visibility: &StackFileVisibility,
+) -> impl IntoElement {
+    let stack_kind = match stack.kind {
+        crate::stacks::model::StackKind::Real => "Real stack",
+        crate::stacks::model::StackKind::Virtual => "Virtual stack",
+    };
+    let hidden = visibility.hidden_hunk_count;
+    let visible = visibility
+        .total_hunk_count
+        .saturating_sub(visibility.hidden_hunk_count);
+    let mode_label = visibility.mode.label();
+
+    div()
+        .px(px(14.0))
+        .py(px(10.0))
+        .bg(bg_overlay())
+        .border_b(px(1.0))
+        .border_color(border_muted())
+        .flex()
+        .items_start()
+        .justify_between()
+        .gap(px(12.0))
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .min_w_0()
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_family(mono_font_family())
+                        .text_color(accent())
+                        .child(format!("{stack_kind} / {mode_label}").to_uppercase()),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg_emphasis())
+                        .whitespace_nowrap()
+                        .overflow_x_hidden()
+                        .text_ellipsis()
+                        .child(visibility.layer_title.clone()),
+                )
+                .when(!visibility.layer_rationale.is_empty(), |el| {
+                    el.child(
+                        div()
+                            .text_size(px(12.0))
+                            .line_height(px(18.0))
+                            .text_color(fg_muted())
+                            .line_clamp(2)
+                            .child(if visibility.ai_assisted {
+                                format!("Why this layer: {}", visibility.layer_rationale)
+                            } else {
+                                visibility.layer_rationale.clone()
+                            }),
+                    )
+                })
+                .when(visibility.ai_assisted, |el| {
+                    el.child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_family(mono_font_family())
+                            .text_color(fg_subtle())
+                            .child(format!(
+                                "Confidence: {}",
+                                match visibility.confidence {
+                                    Confidence::High => "High",
+                                    Confidence::Medium => "Medium",
+                                    Confidence::Low => "Low",
+                                }
+                            )),
+                    )
+                })
+                .when_some(
+                    visibility
+                        .layer_warnings
+                        .first()
+                        .map(|warning| warning.message.clone()),
+                    |el, warning_message| {
+                        el.child(
+                            div()
+                                .text_size(px(11.0))
+                                .line_height(px(16.0))
+                                .text_color(warning())
+                                .line_clamp(2)
+                                .child(warning_message),
+                        )
+                    },
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap(px(6.0))
+                .flex_wrap()
+                .flex_shrink_0()
+                .child(badge(visibility.confidence.label()))
+                .child(badge(&format!(
+                    "{} atom{}",
+                    visibility.visible_atom_count,
+                    if visibility.visible_atom_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )))
+                .child(badge(&format!(
+                    "{} of {} hunk{}",
+                    visible,
+                    visibility.total_hunk_count,
+                    if visibility.total_hunk_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )))
+                .when(hidden > 0, |el| {
+                    el.child(badge(&format!(
+                        "{hidden} hidden from other layer{}",
+                        if hidden == 1 { "" } else { "s" }
+                    )))
+                }),
         )
 }
 
@@ -10637,6 +11541,7 @@ fn render_tour_diff_preview(
         .map(|item| match item {
             DiffViewItem::SemanticSection(_) => div().into_any_element(),
             DiffViewItem::Gap(gap) => render_diff_gap_row(*gap, gutter_layout).into_any_element(),
+            DiffViewItem::StackLayerEmpty => div().into_any_element(),
             DiffViewItem::Row(row_ix) => render_virtualized_diff_row(
                 state,
                 gutter_layout,
@@ -10751,6 +11656,7 @@ fn build_tour_diff_preview_items(
         None,
         prepared_file,
         rows,
+        None,
         cx,
     );
     if full_items.len() <= TOUR_PREVIEW_MAX_ITEMS {

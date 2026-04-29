@@ -24,6 +24,7 @@ use crate::review_session::{
     ReviewSessionDocument, ReviewSessionState, ReviewSourceTarget, ReviewTaskRoute, ReviewWaymark,
 };
 use crate::semantic_diff::SemanticDiffFile;
+use crate::stacks::model::{ReviewStack, StackDiffMode, StackPullRequestRef};
 use crate::syntax::{self, SyntaxSpan};
 use crate::theme::{self, ThemePreference};
 use gpui::{point, px, ListAlignment, ListState, Pixels, Point, ScrollHandle, WindowAppearance};
@@ -111,6 +112,9 @@ pub struct DetailState {
     pub review_route_message: Option<String>,
     pub review_route_error: Option<String>,
     pub review_session: ReviewSessionState,
+    pub stack_open_pull_requests: Option<Vec<StackPullRequestRef>>,
+    pub stack_open_pull_requests_loading: bool,
+    pub stack_open_pull_requests_error: Option<String>,
 }
 
 impl Default for DetailState {
@@ -133,6 +137,9 @@ impl Default for DetailState {
             review_route_message: None,
             review_route_error: None,
             review_session: ReviewSessionState::default(),
+            stack_open_pull_requests: None,
+            stack_open_pull_requests_loading: false,
+            stack_open_pull_requests_error: None,
         }
     }
 }
@@ -389,6 +396,13 @@ pub struct CachedReviewFileTree {
     pub rows: Arc<Vec<ReviewFileTreeRow>>,
 }
 
+#[derive(Clone)]
+pub struct CachedReviewStack {
+    pub revision: String,
+    pub open_pr_revision: usize,
+    pub stack: Arc<ReviewStack>,
+}
+
 pub struct AppState {
     pub cache: Arc<CacheStore>,
     pub lsp_session_manager: Arc<LspSessionManager>,
@@ -428,6 +442,7 @@ pub struct AppState {
     pub review_queue_cache: RefCell<std::collections::HashMap<String, CachedReviewQueue>>,
     pub semantic_diff_cache: RefCell<std::collections::HashMap<String, CachedSemanticDiffFile>>,
     pub review_file_tree_cache: RefCell<std::collections::HashMap<String, CachedReviewFileTree>>,
+    pub review_stack_cache: RefCell<std::collections::HashMap<String, CachedReviewStack>>,
     pub review_file_tree_list_states: RefCell<std::collections::HashMap<String, ListState>>,
     pub review_nav_list_states: RefCell<std::collections::HashMap<String, ListState>>,
     pub source_browser_list_states: RefCell<std::collections::HashMap<String, ListState>>,
@@ -514,6 +529,7 @@ impl AppState {
             review_queue_cache: RefCell::new(std::collections::HashMap::new()),
             semantic_diff_cache: RefCell::new(std::collections::HashMap::new()),
             review_file_tree_cache: RefCell::new(std::collections::HashMap::new()),
+            review_stack_cache: RefCell::new(std::collections::HashMap::new()),
             review_file_tree_list_states: RefCell::new(std::collections::HashMap::new()),
             review_nav_list_states: RefCell::new(std::collections::HashMap::new()),
             source_browser_list_states: RefCell::new(std::collections::HashMap::new()),
@@ -1005,6 +1021,44 @@ impl AppState {
         if let Some(session) = self.active_review_session_mut() {
             session.center_mode = ReviewCenterMode::SourceBrowser;
             session.source_target = Some(target);
+        }
+    }
+
+    pub fn set_selected_stack_layer(&mut self, layer_id: Option<String>) {
+        if let Some(session) = self.active_review_session_mut() {
+            session.selected_stack_layer_id = layer_id;
+        }
+    }
+
+    pub fn set_stack_diff_mode(&mut self, mode: StackDiffMode) {
+        if let Some(session) = self.active_review_session_mut() {
+            session.stack_diff_mode = mode;
+        }
+    }
+
+    pub fn set_stack_layer_reviewed(
+        &mut self,
+        stack: &ReviewStack,
+        layer_id: &str,
+        reviewed: bool,
+    ) {
+        let Some(session) = self.active_review_session_mut() else {
+            return;
+        };
+        let Some(layer) = stack.layers.iter().find(|layer| layer.id == layer_id) else {
+            return;
+        };
+
+        if reviewed {
+            session.reviewed_stack_layer_ids.insert(layer.id.clone());
+            for atom_id in &layer.atom_ids {
+                session.reviewed_stack_atom_ids.insert(atom_id.clone());
+            }
+        } else {
+            session.reviewed_stack_layer_ids.remove(&layer.id);
+            for atom_id in &layer.atom_ids {
+                session.reviewed_stack_atom_ids.remove(atom_id);
+            }
         }
     }
 

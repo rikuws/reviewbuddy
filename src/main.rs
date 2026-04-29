@@ -47,6 +47,7 @@ mod selectable_text;
 mod semantic_diff;
 mod shader_surface;
 mod source_browser;
+mod stacks;
 mod state;
 mod syntax;
 mod theme;
