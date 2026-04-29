@@ -96,6 +96,7 @@ fn build_review_queue_item(detail: &PullRequestDetail, file: &PullRequestFile) -
         SemanticChangeKind::Rename => -10,
         SemanticChangeKind::Docs => -18,
         SemanticChangeKind::Formatting => -20,
+        SemanticChangeKind::Imports | SemanticChangeKind::Comments => -16,
         SemanticChangeKind::Tests => 8,
         SemanticChangeKind::Config => 18,
         SemanticChangeKind::Type => 24,

@@ -928,10 +928,15 @@ fn prepare_review_stack(app_state: &AppState, detail: &PullRequestDetail) -> Arc
 
     let repo_context = build_repo_context(app_state, detail);
     let mut options = StackDiscoveryOptions::default();
-    options.ai_provider = enabled_ai_stack_provider(app_state);
-    options.enable_ai_virtual = options.ai_provider.is_some();
+    options.enable_github_native = false;
+    options.enable_branch_topology = false;
+    options.enable_local_metadata = false;
+    options.enable_ai_virtual = true;
+    options.enable_virtual_commits = false;
+    options.enable_virtual_semantic = false;
+    options.ai_provider = Some(app_state.selected_tour_provider());
     let stack = discover_review_stack(detail, &repo_context, options)
-        .unwrap_or_else(|error| fallback_stack_for_error(detail, error.message));
+        .unwrap_or_else(|error| ai_stack_for_error(detail, error.message));
     let stack = Arc::new(stack);
     app_state.review_stack_cache.borrow_mut().insert(
         cache_key,
@@ -944,15 +949,22 @@ fn prepare_review_stack(app_state: &AppState, detail: &PullRequestDetail) -> Arc
     stack
 }
 
-fn enabled_ai_stack_provider(app_state: &AppState) -> Option<CodeTourProvider> {
-    let status = app_state.selected_tour_provider_status()?;
-    (status.available && status.authenticated).then(|| app_state.selected_tour_provider())
-}
-
 fn ai_stack_revision(app_state: &AppState) -> String {
-    enabled_ai_stack_provider(app_state)
-        .map(|provider| format!("ai:{}", provider.slug()))
-        .unwrap_or_else(|| format!("ai:off:{}", app_state.code_tour_provider_statuses_loaded))
+    let provider_status = app_state
+        .selected_tour_provider_status()
+        .map(|status| {
+            format!(
+                "{}:{}:{}",
+                status.available, status.authenticated, status.message
+            )
+        })
+        .unwrap_or_else(|| "status:unknown".to_string());
+    format!(
+        "ai-only:{}:{}:{}",
+        app_state.selected_tour_provider().slug(),
+        app_state.code_tour_provider_statuses_loaded,
+        provider_status
+    )
 }
 
 fn stack_open_pr_revision(app_state: &AppState) -> usize {
@@ -1004,19 +1016,17 @@ fn build_repo_context(app_state: &AppState, _detail: &PullRequestDetail) -> Repo
     }
 }
 
-fn fallback_stack_for_error(detail: &PullRequestDetail, message: String) -> ReviewStack {
-    let mut stack = crate::stacks::providers::virtual_semantic::discover(
+fn ai_stack_for_error(detail: &PullRequestDetail, message: String) -> ReviewStack {
+    crate::stacks::providers::ai_virtual::ai_unavailable_stack(
         detail,
-        &RepoContext::empty(),
-        &Default::default(),
+        &format!("AI stack planning failed. {message}"),
+        Some(serde_json::json!({ "error": message })),
     )
-    .ok()
-    .flatten()
-    .unwrap_or_else(|| ReviewStack {
+    .unwrap_or_else(|_| ReviewStack {
         id: format!("stack-error:{}#{}", detail.repository, detail.number),
         repository: detail.repository.clone(),
         selected_pr_number: detail.number,
-        source: crate::stacks::model::StackSource::VirtualSemantic,
+        source: crate::stacks::model::StackSource::VirtualAi,
         kind: crate::stacks::model::StackKind::Virtual,
         confidence: Confidence::Low,
         trunk_branch: Some(detail.base_ref_name.clone()),
@@ -1024,17 +1034,14 @@ fn fallback_stack_for_error(detail: &PullRequestDetail, message: String) -> Revi
         head_oid: detail.head_ref_oid.clone(),
         layers: Vec::new(),
         atoms: Vec::new(),
-        warnings: Vec::new(),
+        warnings: vec![crate::stacks::model::StackWarning::new(
+            "ai-virtual-stack-unavailable",
+            "AI stack planning failed and Remiss did not generate a non-AI stack.",
+        )],
         provider: None,
         generated_at_ms: crate::stacks::model::stack_now_ms(),
         generator_version: crate::stacks::model::STACK_GENERATOR_VERSION.to_string(),
-    });
-    stack.confidence = stack.confidence.min(Confidence::Low);
-    stack.warnings.push(crate::stacks::model::StackWarning::new(
-        "stack-discovery-error",
-        message,
-    ));
-    stack
+    })
 }
 
 fn prepare_review_queue(app_state: &AppState, detail: &PullRequestDetail) -> Arc<ReviewQueue> {
@@ -2085,8 +2092,16 @@ fn render_stack_rail(
         .selected_layer(session.selected_stack_layer_id.as_deref())
         .map(|layer| layer.id.clone());
     let reviewed_layer_ids = session.reviewed_stack_layer_ids.clone();
+    let ai_stack_unavailable = stack
+        .warnings
+        .iter()
+        .any(|warning| warning.code == "ai-virtual-stack-unavailable");
     let stack_label = match (&stack.kind, stack.source) {
         (crate::stacks::model::StackKind::Real, _) => "Real stack".to_string(),
+        (
+            crate::stacks::model::StackKind::Virtual,
+            crate::stacks::model::StackSource::VirtualAi,
+        ) if ai_stack_unavailable => "AI stack unavailable".to_string(),
         (
             crate::stacks::model::StackKind::Virtual,
             crate::stacks::model::StackSource::VirtualAi,
@@ -2098,6 +2113,10 @@ fn render_stack_rail(
     };
     let source_label = match (&stack.kind, stack.source) {
         (crate::stacks::model::StackKind::Real, _) => "Backed by GitHub PRs",
+        (
+            crate::stacks::model::StackKind::Virtual,
+            crate::stacks::model::StackSource::VirtualAi,
+        ) if ai_stack_unavailable => "No non-AI stack was generated",
         (
             crate::stacks::model::StackKind::Virtual,
             crate::stacks::model::StackSource::VirtualAi,

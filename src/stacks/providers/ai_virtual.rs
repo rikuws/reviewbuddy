@@ -11,6 +11,7 @@ use crate::{
 
 use super::super::{
     atoms::extract_change_atoms,
+    dependencies::{build_atom_dependencies, dependency_depths, AtomDependency},
     model::{
         stack_now_ms, ChangeAtom, ChangeAtomId, ChangeAtomSource, ChangeRole, Confidence,
         LayerMetrics, LayerReviewStatus, RepoContext, ReviewStack, ReviewStackLayer,
@@ -18,23 +19,21 @@ use super::super::{
         VirtualLayerRef, VirtualStackSizing, STACK_GENERATOR_VERSION,
     },
     validation::{
-        requires_manual_review, validate_ai_stack_plan, AiReviewPriority, AiStackPlan,
-        AiStackPlanLayer, AiStackPlanStrategy, ValidatedAiStackPlan,
+        atom_is_substantive, atom_noise_kind, requires_manual_review, validate_ai_stack_plan,
+        AiReviewPriority, AiStackPlan, AiStackPlanLayer, AiStackPlanStrategy, ValidatedAiStackPlan,
     },
 };
 
 use super::virtual_commits::{self, CommitContext, CommitSuitability, CommitSummary};
 
 const MAX_AI_STACK_ATOMS: usize = 180;
-const AI_MIN_CHANGED_LINES: usize = 800;
-const AI_MIN_ATOMS: usize = 10;
 
 pub struct AiVirtualStackProvider;
 
 pub fn discover(
     selected_pr: &PullRequestDetail,
     repo_context: &RepoContext,
-    sizing: &VirtualStackSizing,
+    _sizing: &VirtualStackSizing,
     provider: CodeTourProvider,
 ) -> Result<Option<ReviewStack>, StackDiscoveryError> {
     let atoms = extract_change_atoms(selected_pr);
@@ -55,11 +54,9 @@ pub fn discover(
     }
 
     if atoms.len() > MAX_AI_STACK_ATOMS {
-        return deterministic_fallback_stack(
+        return ai_unavailable_stack(
             selected_pr,
-            repo_context,
-            sizing,
-            "AI stack planning was unavailable because the atom list exceeded the prompt budget; Remiss used deterministic semantic grouping.",
+            "AI stack planning was unavailable because the atom list exceeded the prompt budget. Remiss did not generate a non-AI stack.",
             Some(json!({
                 "atomCount": atoms.len(),
                 "maxAiStackAtoms": MAX_AI_STACK_ATOMS,
@@ -70,11 +67,9 @@ pub fn discover(
     }
 
     let Some(working_directory) = repo_context.local_repo_path.as_ref() else {
-        return deterministic_fallback_stack(
+        return ai_unavailable_stack(
             selected_pr,
-            repo_context,
-            sizing,
-            "AI stack planning was unavailable because no local checkout was ready; Remiss used deterministic semantic grouping.",
+            "AI stack planning was unavailable because no local checkout was ready. Remiss did not generate a non-AI stack.",
             Some(json!({ "commitSuitability": commit_context.suitability })),
         )
         .map(Some);
@@ -84,11 +79,9 @@ pub fn discover(
     match backend.status() {
         Ok(status) if status.available && status.authenticated => {}
         Ok(status) => {
-            return deterministic_fallback_stack(
+            return ai_unavailable_stack(
                 selected_pr,
-                repo_context,
-                sizing,
-                "AI stack planning was unavailable; Remiss used deterministic semantic grouping.",
+                "AI stack planning was unavailable. Remiss did not generate a non-AI stack.",
                 Some(json!({
                     "provider": provider.slug(),
                     "status": status,
@@ -98,11 +91,9 @@ pub fn discover(
             .map(Some);
         }
         Err(error) => {
-            return deterministic_fallback_stack(
+            return ai_unavailable_stack(
                 selected_pr,
-                repo_context,
-                sizing,
-                "AI stack planning was unavailable; Remiss used deterministic semantic grouping.",
+                "AI stack planning was unavailable. Remiss did not generate a non-AI stack.",
                 Some(json!({
                     "provider": provider.slug(),
                     "error": error,
@@ -122,11 +113,9 @@ pub fn discover(
     ) {
         Ok(response) => response,
         Err(error) => {
-            return deterministic_fallback_stack(
+            return ai_unavailable_stack(
                 selected_pr,
-                repo_context,
-                sizing,
-                "AI stack planning was unavailable; Remiss used deterministic semantic grouping.",
+                "AI stack planning was unavailable. Remiss did not generate a non-AI stack.",
                 Some(json!({
                     "provider": provider.slug(),
                     "error": error,
@@ -140,11 +129,9 @@ pub fn discover(
     let plan = match parse_tolerant::<AiStackPlan>(&response.text) {
         Ok(plan) => plan,
         Err(error) => {
-            return deterministic_fallback_stack(
+            return ai_unavailable_stack(
                 selected_pr,
-                repo_context,
-                sizing,
-                "AI stack planning returned invalid output; Remiss used deterministic semantic grouping.",
+                "AI stack planning returned invalid output. Remiss did not generate a non-AI stack.",
                 Some(json!({
                     "provider": provider.slug(),
                     "modelOrAgent": response.model,
@@ -159,11 +146,9 @@ pub fn discover(
     let validated = match validate_ai_stack_plan(&plan, &atoms, total_changed_lines) {
         Ok(validated) => validated,
         Err(error) => {
-            return deterministic_fallback_stack(
+            return ai_unavailable_stack(
                 selected_pr,
-                repo_context,
-                sizing,
-                "AI stack planning returned invalid output; Remiss used deterministic semantic grouping.",
+                "AI stack planning returned invalid output. Remiss did not generate a non-AI stack.",
                 Some(json!({
                     "provider": provider.slug(),
                     "modelOrAgent": response.model,
@@ -187,18 +172,10 @@ pub fn discover(
 
 pub fn should_attempt_ai_planning(
     atoms: &[ChangeAtom],
-    total_changed_lines: usize,
-    commit_suitability: &CommitSuitability,
+    _total_changed_lines: usize,
+    _commit_suitability: &CommitSuitability,
 ) -> bool {
-    if atoms.is_empty() {
-        return false;
-    }
-
-    if commit_suitability.suitable_for_layers && total_changed_lines < 2_000 {
-        return false;
-    }
-
-    total_changed_lines >= AI_MIN_CHANGED_LINES || atoms.len() >= AI_MIN_ATOMS
+    !atoms.is_empty()
 }
 
 pub fn build_stack_from_validated_plan(
@@ -231,11 +208,15 @@ pub fn build_stack_from_validated_plan(
             id: layer_id,
             index,
             title: clean_layer_text(&plan_layer.title, "AI review layer", 90),
-            summary: clean_layer_text(&plan_layer.summary, "AI grouped review layer.", 220),
+            summary: clean_layer_text(
+                &layer_summary_with_review_question(plan_layer),
+                "AI grouped review layer.",
+                260,
+            ),
             rationale: clean_layer_text(
-                &plan_layer.rationale,
+                &layer_rationale_with_review_question(plan_layer),
                 "AI grouped these changes by semantic review order.",
-                500,
+                560,
             ),
             pr: None,
             virtual_layer: Some(VirtualLayerRef {
@@ -348,7 +329,7 @@ pub fn build_stack_from_validated_plan(
                 "rationale": plan.rationale,
                 "commitSuitability": commit_context.suitability,
                 "commits": commit_context.commits,
-                "deterministicFallback": "virtual_semantic",
+                "aiOnly": true,
             })),
         }),
         generated_at_ms: stack_now_ms(),
@@ -356,28 +337,62 @@ pub fn build_stack_from_validated_plan(
     }
 }
 
-fn deterministic_fallback_stack(
+pub fn ai_unavailable_stack(
     selected_pr: &PullRequestDetail,
-    repo_context: &RepoContext,
-    sizing: &VirtualStackSizing,
     warning: &str,
     raw_payload: Option<Value>,
 ) -> Result<ReviewStack, StackDiscoveryError> {
-    let mut stack = super::virtual_semantic::discover(selected_pr, repo_context, sizing)?
-        .ok_or_else(|| StackDiscoveryError::new("Deterministic semantic fallback failed."))?;
-    stack.confidence = stack.confidence.min(Confidence::Low);
-    stack.warnings.push(StackWarning::new(
-        "ai-virtual-stack-fallback",
-        warning.to_string(),
-    ));
-    stack.provider = Some(StackProviderMetadata {
-        provider: "virtual_semantic".to_string(),
-        raw_payload: Some(json!({
-            "aiVirtualStack": raw_payload.unwrap_or(Value::Null),
-            "deterministicFallback": "virtual_semantic",
-        })),
-    });
-    Ok(stack)
+    let atoms = extract_change_atoms(selected_pr);
+    let atoms_by_ref = atoms.iter().collect::<Vec<_>>();
+    let atom_ids = atoms.iter().map(|atom| atom.id.clone()).collect::<Vec<_>>();
+    let stack_id = virtual_stack_id(selected_pr);
+    let metrics = metrics_for_atoms(&atoms_by_ref);
+    let layer_id = virtual_layer_id(&stack_id, 0, ChangeRole::Unknown, &atom_ids);
+    let warning = StackWarning::new("ai-virtual-stack-unavailable", warning.to_string());
+
+    Ok(ReviewStack {
+        id: stack_id,
+        repository: selected_pr.repository.clone(),
+        selected_pr_number: selected_pr.number,
+        source: StackSource::VirtualAi,
+        kind: StackKind::Virtual,
+        confidence: Confidence::Low,
+        trunk_branch: Some(selected_pr.base_ref_name.clone()),
+        base_oid: selected_pr.base_ref_oid.clone(),
+        head_oid: selected_pr.head_ref_oid.clone(),
+        layers: vec![ReviewStackLayer {
+            id: layer_id,
+            index: 0,
+            title: "AI stack unavailable".to_string(),
+            summary: "Remiss did not generate a non-AI stack for this pull request.".to_string(),
+            rationale: "The stacked review view is configured to require AI-generated layers. Review the whole PR while the selected AI provider is unavailable or returns invalid output.".to_string(),
+            pr: None,
+            virtual_layer: Some(VirtualLayerRef {
+                source: StackSource::VirtualAi,
+                role: ChangeRole::Unknown,
+                source_label: "ai_unavailable".to_string(),
+            }),
+            base_oid: selected_pr.base_ref_oid.clone(),
+            head_oid: selected_pr.head_ref_oid.clone(),
+            atom_ids,
+            depends_on_layer_ids: Vec::new(),
+            metrics,
+            status: LayerReviewStatus::NotReviewed,
+            confidence: Confidence::Low,
+            warnings: vec![warning.clone()],
+        }],
+        atoms,
+        warnings: vec![warning],
+        provider: Some(StackProviderMetadata {
+            provider: "ai_virtual_stack".to_string(),
+            raw_payload: Some(json!({
+                "aiOnly": true,
+                "aiVirtualStack": raw_payload.unwrap_or(Value::Null),
+            })),
+        }),
+        generated_at_ms: stack_now_ms(),
+        generator_version: STACK_GENERATOR_VERSION.to_string(),
+    })
 }
 
 fn build_stack_planning_input(
@@ -386,6 +401,9 @@ fn build_stack_planning_input(
     commit_context: &CommitContext,
 ) -> Value {
     let commits_by_path = commits_by_path(&commit_context.commits);
+    let dependencies = build_atom_dependencies(atoms);
+    let atom_ids = atoms.iter().map(|atom| atom.id.clone()).collect::<Vec<_>>();
+    let depths = dependency_depths(&atom_ids, &dependencies);
     let total_changed_lines = atoms
         .iter()
         .map(|atom| atom.additions + atom.deletions)
@@ -404,11 +422,155 @@ fn build_stack_planning_input(
             .iter()
             .map(commit_summary_json)
             .collect::<Vec<_>>(),
+        "dependency_edges": dependencies
+            .iter()
+            .map(dependency_json)
+            .collect::<Vec<_>>(),
+        "candidate_layers": candidate_layers_json(atoms, &depths),
+        "hard_validation_rules": [
+            "Every layer needs at least one substantive atom unless it is a coherent mechanical formatting/comment layer.",
+            "Import-only and mostly import layers are invalid; attach import atoms to the substantive atom that requires them.",
+            "The final layer must not contain more than 40% of substantive atoms or more than two concerns.",
+            "Tests usually travel with the behavior they validate; generic tests-only layers are invalid.",
+            "Dependency edges must point from lower layers to same or higher layers.",
+            "Misc, remaining, update imports, cleanup, and everything else titles are invalid.",
+            "Prefer fewer coherent layers over artificial layers."
+        ],
         "atoms": atoms
             .iter()
-            .map(|atom| atom_summary_json(atom, &commits_by_path))
+            .map(|atom| atom_summary_json(atom, &commits_by_path, &depths))
             .collect::<Vec<_>>(),
     })
+}
+
+fn dependency_json(dependency: &AtomDependency) -> Value {
+    json!({
+        "from_atom_id": &dependency.from_atom_id,
+        "to_atom_id": &dependency.to_atom_id,
+        "kind": &dependency.kind,
+        "confidence": dependency.confidence,
+    })
+}
+
+fn candidate_layers_json(
+    atoms: &[ChangeAtom],
+    depths: &BTreeMap<ChangeAtomId, usize>,
+) -> Vec<Value> {
+    let mut groups = BTreeMap::<CandidateLayerKey, CandidateLayer>::new();
+    let mut substantive_key_by_path = BTreeMap::<String, CandidateLayerKey>::new();
+
+    for atom in atoms.iter().filter(|atom| atom_is_substantive(atom)) {
+        let key = CandidateLayerKey {
+            role_order: atom.role.order(),
+            role: atom.role,
+            depth: depths.get(&atom.id).copied().unwrap_or_default(),
+            directory: directory_label(atom.path.as_str()),
+        };
+        substantive_key_by_path
+            .entry(atom.path.clone())
+            .or_insert_with(|| key.clone());
+        let group = groups.entry(key.clone()).or_insert_with(|| CandidateLayer {
+            key,
+            substantive_atom_ids: Vec::new(),
+            attached_noise_atom_ids: Vec::new(),
+        });
+        group.substantive_atom_ids.push(atom.id.clone());
+    }
+
+    for atom in atoms.iter().filter(|atom| !atom_is_substantive(atom)) {
+        let key = substantive_key_by_path
+            .get(&atom.path)
+            .cloned()
+            .unwrap_or(CandidateLayerKey {
+                role_order: atom.role.order(),
+                role: atom.role,
+                depth: depths.get(&atom.id).copied().unwrap_or_default(),
+                directory: directory_label(atom.path.as_str()),
+            });
+        let group = groups.entry(key.clone()).or_insert_with(|| CandidateLayer {
+            key,
+            substantive_atom_ids: Vec::new(),
+            attached_noise_atom_ids: Vec::new(),
+        });
+        group.attached_noise_atom_ids.push(atom.id.clone());
+    }
+
+    groups
+        .into_values()
+        .enumerate()
+        .map(|(index, group)| {
+            json!({
+                "index": index,
+                "title": candidate_layer_title(group.key.role, group.key.depth, group.key.directory.as_str()),
+                "review_question": candidate_layer_question(group.key.role),
+                "role": group.key.role.label(),
+                "dependency_depth": group.key.depth,
+                "directory": group.key.directory,
+                "substantive_atom_ids": group.substantive_atom_ids,
+                "attached_noise_atom_ids": group.attached_noise_atom_ids,
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CandidateLayerKey {
+    role_order: usize,
+    role: ChangeRole,
+    depth: usize,
+    directory: String,
+}
+
+struct CandidateLayer {
+    key: CandidateLayerKey,
+    substantive_atom_ids: Vec<ChangeAtomId>,
+    attached_noise_atom_ids: Vec<ChangeAtomId>,
+}
+
+fn candidate_layer_title(role: ChangeRole, depth: usize, directory: &str) -> String {
+    let verb = match role {
+        ChangeRole::Foundation | ChangeRole::Config => "Introduce",
+        ChangeRole::CoreLogic => "Build",
+        ChangeRole::Integration => "Wire",
+        ChangeRole::Presentation => "Render",
+        ChangeRole::Tests => "Validate",
+        ChangeRole::Docs => "Document",
+        ChangeRole::Generated => "Regenerate",
+        ChangeRole::Unknown => "Review",
+    };
+
+    format!(
+        "{verb} {} changes in {directory} at dependency depth {depth}.",
+        role.label().to_ascii_lowercase()
+    )
+}
+
+fn candidate_layer_question(role: ChangeRole) -> &'static str {
+    match role {
+        ChangeRole::Foundation | ChangeRole::Config => {
+            "Do these foundation changes establish the contract later layers depend on?"
+        }
+        ChangeRole::CoreLogic => {
+            "Does this layer implement one coherent behavior change correctly?"
+        }
+        ChangeRole::Integration => "Does this layer wire the behavior through the right boundary?",
+        ChangeRole::Presentation => {
+            "Does this layer expose the behavior correctly in the reviewable UI surface?"
+        }
+        ChangeRole::Tests => {
+            "Does this layer provide broad coverage that cannot travel with one behavior layer?"
+        }
+        ChangeRole::Docs => "Does this layer document the reviewed behavior accurately?",
+        ChangeRole::Generated => "Was this mechanical generated change produced coherently?",
+        ChangeRole::Unknown => "Why does this atom need manual review instead of a normal layer?",
+    }
+}
+
+fn directory_label(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .filter(|dir| !dir.is_empty())
+        .unwrap_or_else(|| "root".to_string())
 }
 
 fn commit_summary_json(commit: &CommitSummary) -> Value {
@@ -423,6 +585,7 @@ fn commit_summary_json(commit: &CommitSummary) -> Value {
 fn atom_summary_json(
     atom: &ChangeAtom,
     commits_by_path: &BTreeMap<String, Vec<&CommitSummary>>,
+    depths: &BTreeMap<ChangeAtomId, usize>,
 ) -> Value {
     let commits = commits_by_path.get(&atom.path).cloned().unwrap_or_default();
     let commit_oids = commits
@@ -441,6 +604,9 @@ fn atom_summary_json(
         "source_kind": atom.source.stable_kind(),
         "role": atom.role.label(),
         "semantic_kind": &atom.semantic_kind,
+        "substantive": atom_is_substantive(atom),
+        "noise_kind": atom_noise_kind(atom),
+        "dependency_depth": depths.get(&atom.id).copied().unwrap_or_default(),
         "title": atom_title(atom),
         "summary": atom_summary(atom),
         "symbol_name": &atom.symbol_name,
@@ -565,6 +731,26 @@ fn review_priority_label(priority: &AiReviewPriority) -> &'static str {
         AiReviewPriority::Normal => "normal",
         AiReviewPriority::QuickPass => "quick_pass",
         AiReviewPriority::ManualReview => "manual_review",
+    }
+}
+
+fn layer_summary_with_review_question(layer: &AiStackPlanLayer) -> String {
+    if layer.review_question.trim().is_empty() {
+        layer.summary.clone()
+    } else {
+        format!("{} {}", layer.review_question.trim(), layer.summary.trim())
+    }
+}
+
+fn layer_rationale_with_review_question(layer: &AiStackPlanLayer) -> String {
+    if layer.review_question.trim().is_empty() {
+        layer.rationale.clone()
+    } else {
+        format!(
+            "Review question: {}\n\n{}",
+            layer.review_question.trim(),
+            layer.rationale.trim()
+        )
     }
 }
 
@@ -716,19 +902,18 @@ mod tests {
     }
 
     #[test]
-    fn invalid_ai_output_fallback_records_warning() {
-        let stack = deterministic_fallback_stack(
+    fn invalid_ai_output_records_ai_unavailable_warning() {
+        let stack = ai_unavailable_stack(
             &detail(),
-            &RepoContext::empty(),
-            &VirtualStackSizing::default(),
-            "AI stack planning returned invalid output; Remiss used deterministic semantic grouping.",
+            "AI stack planning returned invalid output. Remiss did not generate a non-AI stack.",
             Some(json!({ "validationError": "omitted atom" })),
         )
-        .expect("fallback stack");
+        .expect("unavailable stack");
 
-        assert_eq!(stack.source, StackSource::VirtualSemantic);
+        assert_eq!(stack.source, StackSource::VirtualAi);
+        assert_eq!(stack.layers[0].title, "AI stack unavailable");
         assert!(stack.warnings.iter().any(|warning| {
-            warning.code == "ai-virtual-stack-fallback"
+            warning.code == "ai-virtual-stack-unavailable"
                 && warning.message.contains("invalid output")
         }));
     }
@@ -736,8 +921,11 @@ mod tests {
     fn plan_layer(title: &str, atom_ids: Vec<&str>, deps: Vec<usize>) -> AiStackPlanLayer {
         AiStackPlanLayer {
             title: title.to_string(),
+            review_question: format!("Does this change correctly cover {title}?"),
             summary: format!("{title} summary"),
             rationale: format!("{title} rationale"),
+            substantive_atom_ids: Vec::new(),
+            attached_noise_atom_ids: Vec::new(),
             atom_ids: atom_ids.into_iter().map(str::to_string).collect(),
             depends_on_layer_indexes: deps,
             confidence: Confidence::Medium,

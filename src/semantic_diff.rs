@@ -15,6 +15,8 @@ pub enum SemanticChangeKind {
     Inline,
     Rename,
     Formatting,
+    Imports,
+    Comments,
     Tests,
     Docs,
     Config,
@@ -32,6 +34,8 @@ impl SemanticChangeKind {
             Self::Inline => "inline",
             Self::Rename => "rename",
             Self::Formatting => "formatting",
+            Self::Imports => "imports",
+            Self::Comments => "comments",
             Self::Tests => "tests",
             Self::Docs => "docs",
             Self::Config => "config",
@@ -270,6 +274,14 @@ fn classify_hunk_kind(
         return SemanticChangeKind::Formatting;
     }
 
+    if is_import_only_hunk(hunk) {
+        return SemanticChangeKind::Imports;
+    }
+
+    if is_comment_only_hunk(hunk) {
+        return SemanticChangeKind::Comments;
+    }
+
     let additions = changed_lines(hunk, DiffLineKind::Addition);
     let deletions = changed_lines(hunk, DiffLineKind::Deletion);
     let adds_symbol = additions
@@ -455,6 +467,103 @@ fn is_whitespace_only_hunk(hunk: &ParsedDiffHunk) -> bool {
     !additions.is_empty() && additions == deletions
 }
 
+fn is_import_only_hunk(hunk: &ParsedDiffHunk) -> bool {
+    let changed = changed_lines(hunk, DiffLineKind::Addition)
+        .into_iter()
+        .chain(changed_lines(hunk, DiffLineKind::Deletion))
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if changed.is_empty() {
+        return false;
+    }
+
+    let hunk_has_import_context = hunk.lines.iter().any(|line| {
+        let content = line.content.trim();
+        is_import_statement_line(content)
+            || is_reexport_statement_line(content)
+            || content == "import ("
+            || content.starts_with("import {")
+            || content.starts_with("use {")
+    });
+
+    changed.iter().all(|line| {
+        is_import_statement_line(line)
+            || is_reexport_statement_line(line)
+            || is_import_block_delimiter(line)
+            || (hunk_has_import_context && is_import_block_member_line(line))
+    })
+}
+
+fn is_comment_only_hunk(hunk: &ParsedDiffHunk) -> bool {
+    let changed = changed_lines(hunk, DiffLineKind::Addition)
+        .into_iter()
+        .chain(changed_lines(hunk, DiffLineKind::Deletion))
+        .map(|line| line.trim().to_string())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+
+    !changed.is_empty() && changed.iter().all(|line| is_comment_only_line(line))
+}
+
+fn is_import_statement_line(content: &str) -> bool {
+    content.starts_with("import ")
+        || content.starts_with("import(")
+        || content.starts_with("from ")
+        || content.starts_with("use ")
+        || content.starts_with("pub use ")
+        || content.starts_with("using ")
+        || content.starts_with("mod ")
+        || content.starts_with("package ")
+        || content.starts_with("@import ")
+        || content.starts_with("#include ")
+        || content.starts_with("require(")
+        || content.starts_with("require ")
+}
+
+fn is_reexport_statement_line(content: &str) -> bool {
+    content.starts_with("export {")
+        || content.starts_with("export *")
+        || content.starts_with("export type {")
+}
+
+fn is_import_block_delimiter(content: &str) -> bool {
+    matches!(
+        content,
+        "{" | "}" | "};" | "}," | ")" | ");" | "]" | "];" | "],"
+    ) || content == "import ("
+        || content.starts_with("import {")
+        || content.starts_with("use {")
+}
+
+fn is_import_block_member_line(content: &str) -> bool {
+    let normalized = content
+        .trim()
+        .trim_matches('{')
+        .trim_matches('}')
+        .trim_end_matches(',')
+        .trim_end_matches(';')
+        .trim();
+
+    !normalized.is_empty()
+        && normalized.len() <= 100
+        && normalized.chars().all(|ch| {
+            ch.is_ascii_alphanumeric()
+                || matches!(ch, '_' | '$' | ':' | '.' | '/' | '-' | '"' | '\'' | ' ')
+        })
+        && !normalized.contains('(')
+        && !normalized.contains('=')
+        && !looks_like_symbol_definition(normalized)
+}
+
+fn is_comment_only_line(content: &str) -> bool {
+    content.starts_with("//")
+        || content.starts_with("/*")
+        || content.starts_with('*')
+        || content.starts_with("--")
+        || (content.starts_with('#') && !content.starts_with("#["))
+}
+
 fn similarity_score(additions: &[String], deletions: &[String]) -> f32 {
     let add_tokens = additions
         .iter()
@@ -632,5 +741,49 @@ mod tests {
 
         let semantic = build_semantic_diff_file(&file, Some(&parsed), &[]);
         assert_eq!(semantic.sections[0].kind, SemanticChangeKind::Formatting);
+    }
+
+    #[test]
+    fn marks_import_only_hunks_as_imports() {
+        let file = PullRequestFile {
+            path: "src/main.rs".to_string(),
+            additions: 1,
+            deletions: 0,
+            change_type: "MODIFIED".to_string(),
+        };
+        let parsed = crate::diff::ParsedDiffFile {
+            path: file.path.clone(),
+            previous_path: None,
+            is_binary: false,
+            hunks: vec![ParsedDiffHunk {
+                header: "@@ -1,2 +1,3 @@".to_string(),
+                lines: vec![
+                    ParsedDiffLine {
+                        kind: DiffLineKind::Context,
+                        prefix: " ".to_string(),
+                        left_line_number: Some(1),
+                        right_line_number: Some(1),
+                        content: "use crate::{".to_string(),
+                    },
+                    ParsedDiffLine {
+                        kind: DiffLineKind::Addition,
+                        prefix: "+".to_string(),
+                        left_line_number: None,
+                        right_line_number: Some(2),
+                        content: "    stacks::ReviewStack,".to_string(),
+                    },
+                    ParsedDiffLine {
+                        kind: DiffLineKind::Context,
+                        prefix: " ".to_string(),
+                        left_line_number: Some(2),
+                        right_line_number: Some(3),
+                        content: "};".to_string(),
+                    },
+                ],
+            }],
+        };
+
+        let semantic = build_semantic_diff_file(&file, Some(&parsed), &[]);
+        assert_eq!(semantic.sections[0].kind, SemanticChangeKind::Imports);
     }
 }
