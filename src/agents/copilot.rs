@@ -28,7 +28,7 @@ const RUNNING_TICKER_MS: u64 = 10_000;
 const POLL_INTERVAL: Duration = Duration::from_millis(120);
 const MAX_PROMPT_BYTES: usize = 120_000;
 const MAX_STACK_PLAN_PROMPT_BYTES: usize = 140_000;
-const AVAILABLE_TOOLS: &str = "view,rg,glob";
+const COPILOT_TOOL_ALLOWLISTS: &[&str] = &["view,grep,glob", "view,rg,glob", "view,glob"];
 
 pub struct CopilotBackend;
 
@@ -55,6 +55,11 @@ struct CopilotOutcome {
     stderr_text: String,
     current_turn_stream: String,
     exit_code: Option<i32>,
+}
+
+struct CopilotRun {
+    outcome: CopilotOutcome,
+    exit_status: Option<ExitStatus>,
 }
 
 enum StreamLine {
@@ -132,130 +137,20 @@ impl CodingAgentBackend for CopilotBackend {
             truncate_to_byte_limit(&mut prompt, MAX_PROMPT_BYTES);
         }
 
-        let mut child = Command::new(&binary)
-            .arg("-p")
-            .arg(&prompt)
-            .arg("--output-format")
-            .arg("json")
-            .arg("--stream")
-            .arg("on")
-            .arg("--allow-all-tools")
-            .arg("--available-tools")
-            .arg(AVAILABLE_TOOLS)
-            .arg("--no-ask-user")
-            .arg("--no-color")
-            .arg("--log-level")
-            .arg("error")
-            .current_dir(&input.working_directory)
-            .env("NO_COLOR", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|error| format!("Failed to launch the Copilot CLI: {error}"))?;
+        let CopilotRun {
+            outcome,
+            exit_status,
+        } = run_copilot_with_tool_allowlist_retries(
+            &binary,
+            &input.working_directory,
+            &prompt,
+            OVERALL_TIMEOUT_MS,
+            INACTIVITY_TIMEOUT_MS,
+            true,
+            on_progress,
+        )?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "Failed to capture the Copilot CLI stdout.".to_string())?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "Failed to capture the Copilot CLI stderr.".to_string())?;
-
-        let (line_tx, line_rx) = mpsc::channel::<StreamLine>();
-        let stdout_handle = spawn_line_reader(stdout, StreamKind::Stdout, line_tx.clone());
-        let stderr_handle = spawn_line_reader(stderr, StreamKind::Stderr, line_tx);
-
-        on_progress(make_progress(
-            "running",
-            "GitHub Copilot is inspecting the checkout",
-            Some("Waiting for streamed Copilot events from the linked repository.".to_string()),
-            Some("Waiting for Copilot event stream".to_string()),
-        ));
-
-        let start = Instant::now();
-        let mut last_activity = Instant::now();
-        let mut last_ticker = Instant::now();
-        let mut exit_status: Option<ExitStatus> = None;
-        let mut outcome = CopilotOutcome::default();
-
-        loop {
-            while let Ok(line) = line_rx.try_recv() {
-                handle_stream_line(line, &mut outcome, on_progress);
-                last_activity = Instant::now();
-            }
-
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    outcome.exit_code = status.code();
-                    exit_status = Some(status);
-                    break;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    let _ = child.kill();
-                    return Err(format!("Failed to poll the Copilot CLI: {error}"));
-                }
-            }
-
-            let now = Instant::now();
-
-            if now.duration_since(start) > Duration::from_millis(OVERALL_TIMEOUT_MS) {
-                outcome.abort = Some(AbortReason {
-                    kind: AbortKind::Overall,
-                    timeout_ms: OVERALL_TIMEOUT_MS,
-                    last_visible_activity: outcome.last_visible_activity.clone(),
-                });
-                break;
-            }
-
-            if !outcome.saw_meaningful_progress
-                && now.duration_since(last_activity) > Duration::from_millis(INACTIVITY_TIMEOUT_MS)
-            {
-                outcome.abort = Some(AbortReason {
-                    kind: AbortKind::Inactivity,
-                    timeout_ms: INACTIVITY_TIMEOUT_MS,
-                    last_visible_activity: outcome.last_visible_activity.clone(),
-                });
-                break;
-            }
-
-            if now.duration_since(last_ticker) >= Duration::from_millis(RUNNING_TICKER_MS) {
-                last_ticker = now;
-                let elapsed_s = now.duration_since(start).as_secs();
-                on_progress(make_progress(
-                    "running",
-                    "GitHub Copilot is still working",
-                    Some(format!("Elapsed: {elapsed_s}s.")),
-                    outcome.last_visible_activity.clone(),
-                ));
-            }
-
-            match line_rx.recv_timeout(POLL_INTERVAL) {
-                Ok(line) => {
-                    handle_stream_line(line, &mut outcome, on_progress);
-                    last_activity = Instant::now();
-                }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {}
-            }
-        }
-
-        let timed_out = outcome.abort.clone();
-        if timed_out.is_some() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-
-        let _ = stdout_handle.join();
-        let _ = stderr_handle.join();
-        while let Ok(line) = line_rx.try_recv() {
-            handle_stream_line(line, &mut outcome, on_progress);
-        }
-        promote_stream_to_final(&mut outcome);
-
-        if let Some(abort) = timed_out {
+        if let Some(abort) = &outcome.abort {
             if !has_usable_final_text(&outcome) {
                 let summary = generation_abort_message("GitHub Copilot", &abort);
                 on_progress(make_progress(
@@ -334,16 +229,121 @@ pub fn run_json_prompt(
         truncate_to_byte_limit(&mut prompt, MAX_STACK_PLAN_PROMPT_BYTES);
     }
 
-    let mut child = Command::new(&binary)
+    let mut ignore_progress = |_progress: CodeTourProgressUpdate| {};
+
+    let CopilotRun {
+        outcome,
+        exit_status,
+    } = run_copilot_with_tool_allowlist_retries(
+        &binary,
+        working_directory,
+        &prompt,
+        STACK_PLAN_OVERALL_TIMEOUT_MS,
+        STACK_PLAN_INACTIVITY_TIMEOUT_MS,
+        false,
+        &mut ignore_progress,
+    )?;
+
+    if let Some(abort) = &outcome.abort {
+        if !has_usable_final_text(&outcome) {
+            return Err(generation_abort_message("GitHub Copilot", &abort));
+        }
+    }
+
+    if let Some(error) = &outcome.error {
+        return Err(error.clone());
+    }
+
+    let Some(final_text) = outcome.final_text.as_deref() else {
+        return Err(fallback_reason(&outcome, exit_status.as_ref()));
+    };
+
+    let trimmed = final_text.trim();
+    if trimmed.is_empty() {
+        return Err(fallback_reason(&outcome, exit_status.as_ref()));
+    }
+
+    Ok(AgentTextResponse {
+        text: trimmed.to_string(),
+        model: outcome.model,
+    })
+}
+
+fn run_copilot_with_tool_allowlist_retries(
+    binary: &str,
+    working_directory: &str,
+    prompt: &str,
+    overall_timeout_ms: u64,
+    inactivity_timeout_ms: u64,
+    emit_progress: bool,
+    on_progress: &mut dyn FnMut(CodeTourProgressUpdate),
+) -> Result<CopilotRun, String> {
+    let mut last_tool_error: Option<String> = None;
+
+    for (attempt_ix, available_tools) in COPILOT_TOOL_ALLOWLISTS.iter().enumerate() {
+        if attempt_ix > 0 && emit_progress {
+            on_progress(make_progress(
+                "startup",
+                "Retrying GitHub Copilot with compatible tools",
+                Some(
+                    "The installed Copilot CLI rejected the previous read-only tool allowlist."
+                        .to_string(),
+                ),
+                Some(format!("Retrying Copilot with tools: {available_tools}")),
+            ));
+        }
+
+        let run = run_copilot_cli(
+            binary,
+            working_directory,
+            prompt,
+            available_tools,
+            overall_timeout_ms,
+            inactivity_timeout_ms,
+            emit_progress,
+            on_progress,
+        )?;
+
+        if run
+            .outcome
+            .error
+            .as_deref()
+            .map(is_unknown_tool_allowlist_error)
+            .unwrap_or(false)
+            && !has_usable_final_text(&run.outcome)
+        {
+            last_tool_error = run.outcome.error.clone();
+            continue;
+        }
+
+        return Ok(run);
+    }
+
+    Err(last_tool_error.unwrap_or_else(|| {
+        "GitHub Copilot CLI rejected every configured read-only tool allowlist.".to_string()
+    }))
+}
+
+fn run_copilot_cli(
+    binary: &str,
+    working_directory: &str,
+    prompt: &str,
+    available_tools: &str,
+    overall_timeout_ms: u64,
+    inactivity_timeout_ms: u64,
+    emit_progress: bool,
+    on_progress: &mut dyn FnMut(CodeTourProgressUpdate),
+) -> Result<CopilotRun, String> {
+    let mut child = Command::new(binary)
         .arg("-p")
-        .arg(&prompt)
+        .arg(prompt)
         .arg("--output-format")
         .arg("json")
         .arg("--stream")
         .arg("on")
         .arg("--allow-all-tools")
         .arg("--available-tools")
-        .arg(AVAILABLE_TOOLS)
+        .arg(available_tools)
         .arg("--no-ask-user")
         .arg("--no-color")
         .arg("--log-level")
@@ -369,16 +369,31 @@ pub fn run_json_prompt(
     let stdout_handle = spawn_line_reader(stdout, StreamKind::Stdout, line_tx.clone());
     let stderr_handle = spawn_line_reader(stderr, StreamKind::Stderr, line_tx);
 
+    if emit_progress {
+        on_progress(make_progress(
+            "running",
+            "GitHub Copilot is inspecting the checkout",
+            Some("Waiting for streamed Copilot events from the linked repository.".to_string()),
+            Some(format!(
+                "Waiting for Copilot event stream ({available_tools})"
+            )),
+        ));
+    }
+
     let start = Instant::now();
     let mut last_activity = Instant::now();
+    let mut last_ticker = Instant::now();
     let mut exit_status: Option<ExitStatus> = None;
     let mut outcome = CopilotOutcome::default();
-    let mut ignore_progress = |_progress: CodeTourProgressUpdate| {};
 
     loop {
         while let Ok(line) = line_rx.try_recv() {
-            handle_stream_line(line, &mut outcome, &mut ignore_progress);
+            handle_stream_line(line, &mut outcome, on_progress);
             last_activity = Instant::now();
+        }
+
+        if outcome_has_unknown_tool_allowlist_error(&outcome) && !has_usable_final_text(&outcome) {
+            break;
         }
 
         match child.try_wait() {
@@ -395,39 +410,57 @@ pub fn run_json_prompt(
         }
 
         let now = Instant::now();
-        if now.duration_since(start) > Duration::from_millis(STACK_PLAN_OVERALL_TIMEOUT_MS) {
+
+        if now.duration_since(start) > Duration::from_millis(overall_timeout_ms) {
             outcome.abort = Some(AbortReason {
                 kind: AbortKind::Overall,
-                timeout_ms: STACK_PLAN_OVERALL_TIMEOUT_MS,
+                timeout_ms: overall_timeout_ms,
                 last_visible_activity: outcome.last_visible_activity.clone(),
             });
             break;
         }
 
         if !outcome.saw_meaningful_progress
-            && now.duration_since(last_activity)
-                > Duration::from_millis(STACK_PLAN_INACTIVITY_TIMEOUT_MS)
+            && now.duration_since(last_activity) > Duration::from_millis(inactivity_timeout_ms)
         {
             outcome.abort = Some(AbortReason {
                 kind: AbortKind::Inactivity,
-                timeout_ms: STACK_PLAN_INACTIVITY_TIMEOUT_MS,
+                timeout_ms: inactivity_timeout_ms,
                 last_visible_activity: outcome.last_visible_activity.clone(),
             });
             break;
         }
 
+        if emit_progress
+            && now.duration_since(last_ticker) >= Duration::from_millis(RUNNING_TICKER_MS)
+        {
+            last_ticker = now;
+            let elapsed_s = now.duration_since(start).as_secs();
+            on_progress(make_progress(
+                "running",
+                "GitHub Copilot is still working",
+                Some(format!("Elapsed: {elapsed_s}s.")),
+                outcome.last_visible_activity.clone(),
+            ));
+        }
+
         match line_rx.recv_timeout(POLL_INTERVAL) {
             Ok(line) => {
-                handle_stream_line(line, &mut outcome, &mut ignore_progress);
+                handle_stream_line(line, &mut outcome, on_progress);
                 last_activity = Instant::now();
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {}
         }
+
+        if outcome_has_unknown_tool_allowlist_error(&outcome) && !has_usable_final_text(&outcome) {
+            break;
+        }
     }
 
-    let timed_out = outcome.abort.clone();
-    if timed_out.is_some() {
+    let should_stop_child =
+        outcome.abort.is_some() || outcome_has_unknown_tool_allowlist_error(&outcome);
+    if should_stop_child {
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -435,32 +468,13 @@ pub fn run_json_prompt(
     let _ = stdout_handle.join();
     let _ = stderr_handle.join();
     while let Ok(line) = line_rx.try_recv() {
-        handle_stream_line(line, &mut outcome, &mut ignore_progress);
+        handle_stream_line(line, &mut outcome, on_progress);
     }
     promote_stream_to_final(&mut outcome);
 
-    if let Some(abort) = timed_out {
-        if !has_usable_final_text(&outcome) {
-            return Err(generation_abort_message("GitHub Copilot", &abort));
-        }
-    }
-
-    if let Some(error) = &outcome.error {
-        return Err(error.clone());
-    }
-
-    let Some(final_text) = outcome.final_text.as_deref() else {
-        return Err(fallback_reason(&outcome, exit_status.as_ref()));
-    };
-
-    let trimmed = final_text.trim();
-    if trimmed.is_empty() {
-        return Err(fallback_reason(&outcome, exit_status.as_ref()));
-    }
-
-    Ok(AgentTextResponse {
-        text: trimmed.to_string(),
-        model: outcome.model,
+    Ok(CopilotRun {
+        outcome,
+        exit_status,
     })
 }
 
@@ -475,6 +489,10 @@ fn handle_stream_line(
             append_line(&mut outcome.stderr_text, &line);
             let trimmed = line.trim();
             if !trimmed.is_empty() {
+                if is_unknown_tool_allowlist_error(trimmed) {
+                    outcome.error =
+                        Some(format!("GitHub Copilot CLI configuration error: {trimmed}"));
+                }
                 outcome.last_visible_activity = Some(limit_text(trimmed, 180));
             }
         }
@@ -757,6 +775,19 @@ fn has_usable_final_text(outcome: &CopilotOutcome) -> bool {
         .is_some()
 }
 
+fn outcome_has_unknown_tool_allowlist_error(outcome: &CopilotOutcome) -> bool {
+    outcome
+        .error
+        .as_deref()
+        .map(is_unknown_tool_allowlist_error)
+        .unwrap_or(false)
+}
+
+fn is_unknown_tool_allowlist_error(error: &str) -> bool {
+    let normalized = error.to_ascii_lowercase();
+    normalized.contains("unknown tool name") && normalized.contains("tool allowlist")
+}
+
 fn append_line(target: &mut String, line: &str) {
     let trimmed = line.trim();
     if trimmed.is_empty() {
@@ -937,6 +968,34 @@ mod tests {
 
         assert_eq!(prompt, "aaaa");
         assert!(prompt.len() <= 5);
+    }
+
+    #[test]
+    fn unknown_tool_allowlist_errors_are_retriable() {
+        assert!(is_unknown_tool_allowlist_error(
+            "GitHub Copilot CLI configuration error: Unknown tool name in the tool allowlist: \"rg\""
+        ));
+        assert!(is_unknown_tool_allowlist_error(
+            "GitHub Copilot CLI configuration error: Unknown tool name in the tool allowlist: \"grep\""
+        ));
+        assert!(!is_unknown_tool_allowlist_error(
+            "GitHub Copilot reported an authentication error"
+        ));
+    }
+
+    #[test]
+    fn stderr_unknown_tool_allowlist_sets_retryable_error() {
+        let mut outcome = CopilotOutcome::default();
+        let mut progress = Vec::new();
+
+        handle_stream_line(
+            StreamLine::Stderr("Unknown tool name in the tool allowlist: \"rg\"".to_string()),
+            &mut outcome,
+            &mut |update| progress.push(update),
+        );
+
+        assert!(outcome_has_unknown_tool_allowlist_error(&outcome));
+        assert!(progress.is_empty());
     }
 
     #[test]
