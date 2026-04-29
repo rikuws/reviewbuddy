@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use crate::code_tour::{
     CodeTourCandidateGroup, CodeTourFileContext, CodeTourReviewCommentContext,
     CodeTourReviewContext, CodeTourReviewThreadContext, DiffAnchor, GenerateCodeTourInput,
-    TourStep,
+    TourSectionCategory, TourSectionPriority, TourStep,
 };
 
 use super::schema::TOUR_OUTPUT_SCHEMA_JSON;
@@ -40,6 +40,9 @@ pub const BASE_INSTRUCTIONS: &[&str] = &[
     "Always use the provided candidate step ids. Never invent ids.",
     "Explain the whole pull request first, then organize the changed files into related sections.",
     "Use the section stepIds to cover the whole changeset. Reuse each candidate file step at most once across sections.",
+    "Each section is an AI-authored semantic change group: title it as a reviewer-facing story, not as a path bucket or generic diff kind.",
+    "Each section must choose exactly one category from sectionCategoryCatalog and one priority from sectionPriorityCatalog.",
+    "Set priority to high only when a reviewer should inspect that group early, medium for normal review attention, and low for supporting or low-risk changes.",
     "Each step summary should be one sentence. Each detail should be 1 to 3 sentences focused on what changed, why it matters, and what to verify in review.",
     "Each section should explain why those files belong together and how the change moves across them.",
     "Adapt the Explain Code style for a native GPUI review view.",
@@ -153,6 +156,20 @@ fn build_prompt_context(input: &GenerateCodeTourInput) -> Value {
             }))
             .collect::<Vec<_>>(),
         "overviewStep": overview_step.map(summarize_step),
+        "sectionCategoryCatalog": TourSectionCategory::all()
+            .iter()
+            .map(|category| json!({
+                "value": category.slug(),
+                "label": category.label(),
+            }))
+            .collect::<Vec<_>>(),
+        "sectionPriorityCatalog": TourSectionPriority::all()
+            .iter()
+            .map(|priority| json!({
+                "value": priority.slug(),
+                "label": priority.label(),
+            }))
+            .collect::<Vec<_>>(),
         "candidateGroups": input
             .candidate_groups
             .iter()
@@ -276,6 +293,10 @@ mod tests {
         assert!(prompt.contains("Pull-request context:"));
         assert!(prompt.contains("\"repository\": \"owner/name\""));
         assert!(prompt.contains("You are generating a guided code tour"));
+        assert!(prompt.contains("sectionCategoryCatalog"));
+        assert!(prompt.contains("\"value\": \"auth-security\""));
+        assert!(prompt.contains("sectionPriorityCatalog"));
+        assert!(prompt.contains("\"value\": \"high\""));
     }
 
     #[test]

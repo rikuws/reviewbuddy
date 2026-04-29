@@ -11,7 +11,7 @@ use crate::{
     github::{PullRequestDetail, PullRequestFile, PullRequestReviewThread},
 };
 
-const CODE_TOUR_CACHE_KEY_PREFIX: &str = "code-tour-v4";
+const CODE_TOUR_CACHE_KEY_PREFIX: &str = "code-tour-v5";
 const CODE_TOUR_SETTINGS_CACHE_KEY: &str = "code-tour-settings-v1";
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
@@ -114,6 +114,139 @@ pub struct TourCallsite {
     pub snippet: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TourSectionCategory {
+    AuthSecurity,
+    DataState,
+    ApiIo,
+    UiUx,
+    Tests,
+    Docs,
+    Config,
+    Infra,
+    Refactor,
+    Performance,
+    Reliability,
+    #[default]
+    Other,
+}
+
+impl TourSectionCategory {
+    pub fn all() -> &'static [TourSectionCategory] {
+        &[
+            TourSectionCategory::AuthSecurity,
+            TourSectionCategory::DataState,
+            TourSectionCategory::ApiIo,
+            TourSectionCategory::UiUx,
+            TourSectionCategory::Tests,
+            TourSectionCategory::Docs,
+            TourSectionCategory::Config,
+            TourSectionCategory::Infra,
+            TourSectionCategory::Refactor,
+            TourSectionCategory::Performance,
+            TourSectionCategory::Reliability,
+            TourSectionCategory::Other,
+        ]
+    }
+
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::AuthSecurity => "auth-security",
+            Self::DataState => "data-state",
+            Self::ApiIo => "api-io",
+            Self::UiUx => "ui-ux",
+            Self::Tests => "tests",
+            Self::Docs => "docs",
+            Self::Config => "config",
+            Self::Infra => "infra",
+            Self::Refactor => "refactor",
+            Self::Performance => "performance",
+            Self::Reliability => "reliability",
+            Self::Other => "other",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::AuthSecurity => "Auth / Security",
+            Self::DataState => "Data / State",
+            Self::ApiIo => "API / I/O",
+            Self::UiUx => "UI / UX",
+            Self::Tests => "Tests",
+            Self::Docs => "Docs",
+            Self::Config => "Config",
+            Self::Infra => "Infra",
+            Self::Refactor => "Refactor",
+            Self::Performance => "Performance",
+            Self::Reliability => "Reliability",
+            Self::Other => "Other",
+        }
+    }
+
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value.trim() {
+            "auth-security" => Some(Self::AuthSecurity),
+            "data-state" => Some(Self::DataState),
+            "api-io" => Some(Self::ApiIo),
+            "ui-ux" => Some(Self::UiUx),
+            "tests" => Some(Self::Tests),
+            "docs" => Some(Self::Docs),
+            "config" => Some(Self::Config),
+            "infra" => Some(Self::Infra),
+            "refactor" => Some(Self::Refactor),
+            "performance" => Some(Self::Performance),
+            "reliability" => Some(Self::Reliability),
+            "other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TourSectionPriority {
+    Low,
+    #[default]
+    Medium,
+    High,
+}
+
+impl TourSectionPriority {
+    pub fn all() -> &'static [TourSectionPriority] {
+        &[
+            TourSectionPriority::Low,
+            TourSectionPriority::Medium,
+            TourSectionPriority::High,
+        ]
+    }
+
+    pub fn slug(&self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+        }
+    }
+
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value.trim() {
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TourSection {
@@ -122,6 +255,8 @@ pub struct TourSection {
     pub summary: String,
     pub detail: String,
     pub badge: String,
+    pub category: TourSectionCategory,
+    pub priority: TourSectionPriority,
     pub step_ids: Vec<String>,
     pub review_points: Vec<String>,
     pub callsites: Vec<TourCallsite>,

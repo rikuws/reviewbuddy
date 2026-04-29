@@ -39,3 +39,7 @@ Remiss can install managed language servers for supported languages. These insta
 ## Roadmap
 
 See `PLAN.md` for the product direction and review-IDE constraints.
+
+## Design
+
+See `DESIGN_LANGUAGE.md` and `UI_IMPLEMENTATION_GUIDE.md` for the current UI direction and GPUI implementation rules.

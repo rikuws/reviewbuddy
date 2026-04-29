@@ -442,9 +442,9 @@ fn render_inline_div(
         };
 
         let mut font = if span.code {
-            font("Fira Code")
+            font(mono_font_family())
         } else {
-            font(".AppleSystemUIFont")
+            font(ui_font_family())
         };
         font.weight = weight;
         font.style = if span.emphasis {

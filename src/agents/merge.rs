@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::code_tour::{
     CodeTourCandidateGroup, GenerateCodeTourInput, GeneratedCodeTour, TourCallsite, TourSection,
-    TourStep,
+    TourSectionCategory, TourSectionPriority, TourStep,
 };
 
 use super::prompt::trim_text;
@@ -71,6 +71,10 @@ pub struct TourResponseSection {
     pub detail: Option<String>,
     #[serde(default)]
     pub badge: Option<String>,
+    #[serde(default)]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub priority: Option<String>,
     #[serde(default)]
     pub step_ids: Vec<String>,
     #[serde(default)]
@@ -168,6 +172,8 @@ pub fn merge_tour(
             .iter()
             .filter_map(|step_id| merged_steps_by_id.get(step_id))
             .collect();
+        let category = response_section_category(item.category.as_deref(), &section_steps);
+        let priority = response_section_priority(item.priority.as_deref(), &section_steps);
 
         let next_id = format!("section:{}", merged_sections.len() + 1);
         merged_sections.push(TourSection {
@@ -188,6 +194,8 @@ pub fn merge_tour(
                 item.badge.as_deref(),
                 &fallback_section_badge(&section_steps),
             ),
+            category,
+            priority,
             step_ids: step_ids.clone(),
             review_points: sanitize_string_array(&item.review_points, MAX_REVIEW_POINTS),
             callsites: sanitize_callsites(&item.callsites, MAX_CALLSITES_PER_SECTION),
@@ -318,6 +326,22 @@ fn unique_step_ids(values: &[String]) -> Vec<String> {
     ordered
 }
 
+fn response_section_category(value: Option<&str>, steps: &[&TourStep]) -> TourSectionCategory {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(raw) => TourSectionCategory::from_slug(raw).unwrap_or(TourSectionCategory::Other),
+        None => fallback_section_category(steps),
+    }
+}
+
+fn response_section_priority(value: Option<&str>, steps: &[&TourStep]) -> TourSectionPriority {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(raw) => {
+            TourSectionPriority::from_slug(raw).unwrap_or_else(|| fallback_section_priority(steps))
+        }
+        None => fallback_section_priority(steps),
+    }
+}
+
 fn sanitize_string_array(values: &[String], limit: usize) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut items: Vec<String> = Vec::new();
@@ -444,6 +468,8 @@ fn build_fallback_sections(
             ),
             detail: fallback_section_detail(&section_steps),
             badge: fallback_section_badge(&section_steps),
+            category: fallback_section_category(&section_steps),
+            priority: fallback_section_priority(&section_steps),
             step_ids: step_ids.clone(),
             review_points: fallback_section_review_points(&section_steps),
             callsites: Vec::new(),
@@ -473,6 +499,8 @@ fn build_fallback_sections(
             summary: fallback_section_summary(&section_steps),
             detail: fallback_section_detail(&section_steps),
             badge: fallback_section_badge(&section_steps),
+            category: fallback_section_category(&section_steps),
+            priority: fallback_section_priority(&section_steps),
             step_ids: remaining_step_ids.clone(),
             review_points: fallback_section_review_points(&section_steps),
             callsites: Vec::new(),
@@ -537,6 +565,172 @@ fn fallback_section_badge(steps: &[&TourStep]) -> String {
         .first()
         .map(|step| step.badge.clone())
         .unwrap_or_else(|| "focus".to_string())
+}
+
+fn fallback_section_category(steps: &[&TourStep]) -> TourSectionCategory {
+    let haystack = steps
+        .iter()
+        .map(|step| {
+            format!(
+                "{} {} {} {}",
+                step.title,
+                step.summary,
+                step.detail,
+                step.file_path.as_deref().unwrap_or_default()
+            )
+            .to_ascii_lowercase()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if contains_any(
+        &haystack,
+        &[
+            "auth",
+            "oauth",
+            "login",
+            "session",
+            "token",
+            "secret",
+            "permission",
+            "passkey",
+            "password",
+            "security",
+        ],
+    ) {
+        return TourSectionCategory::AuthSecurity;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "test", "tests/", "spec", "fixture", "mock", "snapshot", "assert",
+        ],
+    ) {
+        return TourSectionCategory::Tests;
+    }
+    if contains_any(
+        &haystack,
+        &["docs/", ".md", "readme", "guide", "documentation"],
+    ) {
+        return TourSectionCategory::Docs;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            ".toml", ".json", ".yaml", ".yml", ".lock", "config", "settings",
+        ],
+    ) {
+        return TourSectionCategory::Config;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            ".github",
+            "workflow",
+            "ci",
+            "deploy",
+            "docker",
+            "infra",
+            "terraform",
+            "kubernetes",
+        ],
+    ) {
+        return TourSectionCategory::Infra;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "view",
+            "ui",
+            "ux",
+            "component",
+            "screen",
+            "render",
+            "button",
+            "layout",
+            "style",
+        ],
+    ) {
+        return TourSectionCategory::UiUx;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "api", "route", "endpoint", "request", "response", "handler", "http", "graphql",
+            "webhook",
+        ],
+    ) {
+        return TourSectionCategory::ApiIo;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "state",
+            "store",
+            "cache",
+            "database",
+            "db",
+            "migration",
+            "schema",
+            "model",
+            "serde",
+        ],
+    ) {
+        return TourSectionCategory::DataState;
+    }
+    if contains_any(
+        &haystack,
+        &["performance", "perf", "latency", "throughput", "allocation"],
+    ) {
+        return TourSectionCategory::Performance;
+    }
+    if contains_any(
+        &haystack,
+        &[
+            "error",
+            "retry",
+            "fallback",
+            "recover",
+            "validation",
+            "timeout",
+        ],
+    ) {
+        return TourSectionCategory::Reliability;
+    }
+    if contains_any(
+        &haystack,
+        &["refactor", "rename", "extract", "inline", "move", "cleanup"],
+    ) {
+        return TourSectionCategory::Refactor;
+    }
+
+    TourSectionCategory::Other
+}
+
+fn fallback_section_priority(steps: &[&TourStep]) -> TourSectionPriority {
+    let file_count = steps.len();
+    let total_delta: i64 = steps
+        .iter()
+        .map(|step| step.additions + step.deletions)
+        .sum();
+    let unresolved_thread_count: i64 = steps.iter().map(|step| step.unresolved_thread_count).sum();
+
+    if unresolved_thread_count > 0 || total_delta >= 220 || file_count >= 8 {
+        TourSectionPriority::High
+    } else if total_delta >= 60
+        || file_count >= 3
+        || steps
+            .iter()
+            .any(|step| matches!(step.badge.as_str(), "added" | "deleted" | "renamed"))
+    {
+        TourSectionPriority::Medium
+    } else {
+        TourSectionPriority::Low
+    }
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
 }
 
 fn fallback_section_review_points(steps: &[&TourStep]) -> Vec<String> {
@@ -652,7 +846,8 @@ pub(crate) const _: () = ();
 mod tests {
     use super::*;
     use crate::code_tour::{
-        CodeTourCandidateGroup, CodeTourProvider, DiffAnchor, GenerateCodeTourInput, TourStep,
+        CodeTourCandidateGroup, CodeTourProvider, DiffAnchor, GenerateCodeTourInput,
+        TourSectionCategory, TourSectionPriority, TourStep,
     };
 
     fn sample_input() -> GenerateCodeTourInput {
@@ -773,6 +968,8 @@ mod tests {
                 summary: Some("Section summary".into()),
                 detail: Some("Section detail".into()),
                 badge: Some("badge".into()),
+                category: Some("auth-security".into()),
+                priority: Some("high".into()),
                 step_ids: vec!["file:a".into(), "file:a".into(), "file:b".into()],
                 review_points: vec!["point".into()],
                 callsites: vec![TourResponseCallsite {
@@ -792,6 +989,8 @@ mod tests {
         assert_eq!(tour.sections.len(), 1);
         assert_eq!(tour.sections[0].step_ids, vec!["file:a", "file:b"]);
         assert_eq!(tour.sections[0].title, "Section 1");
+        assert_eq!(tour.sections[0].category, TourSectionCategory::AuthSecurity);
+        assert_eq!(tour.sections[0].priority, TourSectionPriority::High);
         assert_eq!(tour.sections[0].review_points, vec!["point"]);
         assert_eq!(tour.sections[0].callsites.len(), 1);
         assert_eq!(tour.sections[0].callsites[0].title, "Callsite in a:10");
@@ -811,6 +1010,70 @@ mod tests {
         );
         assert_eq!(tour.warnings.len(), 1);
         assert!(tour.warnings[0].contains("Copilot failed"));
+    }
+
+    #[test]
+    fn merge_tour_validates_group_metadata_and_preserves_file_coverage() {
+        let mut input = sample_input();
+        input.candidate_steps.push(TourStep {
+            id: "file:c".into(),
+            kind: "file".into(),
+            title: "c".into(),
+            summary: "+1 / -1".into(),
+            detail: "Modified file.".into(),
+            file_path: Some("c".into()),
+            anchor: None,
+            additions: 1,
+            deletions: 1,
+            unresolved_thread_count: 0,
+            snippet: None,
+            badge: "modified".into(),
+        });
+
+        let response = TourResponse {
+            sections: vec![
+                TourResponseSection {
+                    title: Some("Security path".into()),
+                    summary: Some("Security summary".into()),
+                    detail: Some("Security detail".into()),
+                    badge: Some("focus".into()),
+                    category: Some("auth-security".into()),
+                    priority: Some("high".into()),
+                    step_ids: vec!["file:a".into(), "file:a".into()],
+                    review_points: Vec::new(),
+                    callsites: Vec::new(),
+                },
+                TourResponseSection {
+                    title: Some("Invalid metadata".into()),
+                    summary: Some("Invalid summary".into()),
+                    detail: Some("Invalid detail".into()),
+                    badge: Some("focus".into()),
+                    category: Some("not-a-category".into()),
+                    priority: Some("not-a-priority".into()),
+                    step_ids: vec!["file:a".into(), "file:b".into()],
+                    review_points: Vec::new(),
+                    callsites: Vec::new(),
+                },
+            ],
+            ..Default::default()
+        };
+
+        let tour = merge_tour(response, &input, None);
+        assert_eq!(tour.sections.len(), 3);
+        assert_eq!(tour.sections[0].step_ids, vec!["file:a"]);
+        assert_eq!(tour.sections[0].category, TourSectionCategory::AuthSecurity);
+        assert_eq!(tour.sections[0].priority, TourSectionPriority::High);
+        assert_eq!(tour.sections[1].step_ids, vec!["file:b"]);
+        assert_eq!(tour.sections[1].category, TourSectionCategory::Other);
+        assert_eq!(tour.sections[1].priority, TourSectionPriority::Low);
+        assert_eq!(tour.sections[2].step_ids, vec!["file:c"]);
+
+        let covered_step_ids = tour
+            .sections
+            .iter()
+            .flat_map(|section| section.step_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(covered_step_ids, vec!["file:a", "file:b", "file:c"]);
     }
 
     #[test]

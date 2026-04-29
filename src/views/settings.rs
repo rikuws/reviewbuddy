@@ -450,7 +450,7 @@ pub fn render_settings_view(state: &Entity<AppState>, cx: &App) -> impl IntoElem
                                 .child(
                                     div()
                                         .text_size(px(12.0))
-                                        .font_family("Fira Code")
+                                        .font_family(mono_font_family())
                                         .text_color(fg_subtle())
                                         .child(SelectableText::new(
                                             "settings-storage-root",
@@ -775,7 +775,7 @@ fn render_managed_lsp_card(
                     .child(
                         div()
                             .text_size(px(12.0))
-                            .font_family("Fira Code")
+                            .font_family(mono_font_family())
                             .text_color(fg_subtle())
                             .child(managed_lsp::managed_server_display_name(kind)),
                     )

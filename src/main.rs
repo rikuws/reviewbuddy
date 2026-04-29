@@ -45,6 +45,7 @@ mod review_routes;
 mod review_session;
 mod selectable_text;
 mod semantic_diff;
+mod shader_surface;
 mod source_browser;
 mod state;
 mod syntax;

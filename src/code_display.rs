@@ -85,7 +85,7 @@ pub fn code_text_runs(spans: &[SyntaxSpan]) -> Option<Vec<TextRun>> {
 
         runs.push(TextRun {
             len: span.text.len(),
-            font: font("Fira Code"),
+            font: font(mono_font_family()),
             color: span.color,
             background_color: None,
             underline: None,
@@ -291,7 +291,7 @@ fn render_highlighted_code_lines(lines: Vec<HighlightedCodeLine>) -> impl IntoEl
                 .w_full()
                 .min_w_0()
                 .whitespace_nowrap()
-                .font_family("Fira Code")
+                .font_family(mono_font_family())
                 .text_size(px(12.0))
                 .text_color(fg_default())
                 .flex()
@@ -381,7 +381,7 @@ fn render_prepared_code_lines(
                 .w_full()
                 .min_w_0()
                 .whitespace_nowrap()
-                .font_family("Fira Code")
+                .font_family(mono_font_family())
                 .text_size(px(12.0))
                 .text_color(fg_default())
                 .flex()
@@ -426,7 +426,7 @@ fn render_virtualized_prepared_code_lines(
             format!("prepared-code-block-{block_id}").into(),
         ))
         .whitespace_nowrap()
-        .font_family("Fira Code")
+        .font_family(mono_font_family())
         .text_size(px(12.0))
         .text_color(fg_default())
         .overflow_x_scroll()
@@ -472,7 +472,7 @@ fn render_code_line(
     let line_div = div()
         .w_full()
         .min_w_0()
-        .font_family("Fira Code")
+        .font_family(mono_font_family())
         .flex()
         .items_start();
     let line_number = line.line_number;
@@ -505,7 +505,7 @@ fn render_code_line_content(
     line: String,
     spans: Vec<SyntaxSpan>,
 ) -> Div {
-    let code_div = div().w_full().min_w_0().font_family("Fira Code");
+    let code_div = div().w_full().min_w_0().font_family(mono_font_family());
 
     if let Some(runs) = code_text_runs(&spans) {
         code_div.child(
@@ -550,7 +550,7 @@ fn render_prepared_code_line_with_diff(
         .w_full()
         .min_w_0()
         .min_h(px(22.0))
-        .font_family("Fira Code")
+        .font_family(mono_font_family())
         .flex()
         .items_start()
         .bg(row_bg)
@@ -588,7 +588,7 @@ fn render_prepared_code_line_content(
     line: PreparedFileLine,
     lsp_context: Option<PreparedFileLineLspContext>,
 ) -> Div {
-    let code_div = div().w_full().min_w_0().font_family("Fira Code");
+    let code_div = div().w_full().min_w_0().font_family(mono_font_family());
 
     if line.text.is_empty() {
         return code_div.child("\u{00a0}".to_string());
@@ -957,7 +957,7 @@ impl Render for SharedLspHoverTooltipView {
                         div()
                             .flex_grow()
                             .min_w_0()
-                            .font_family("Fira Code")
+                            .font_family(mono_font_family())
                             .text_size(px(12.0))
                             .text_color(fg_emphasis())
                             .text_ellipsis()
@@ -972,7 +972,7 @@ impl Render for SharedLspHoverTooltipView {
                             .rounded(radius_sm())
                             .bg(bg_emphasis())
                             .text_size(px(10.0))
-                            .font_family("Fira Code")
+                            .font_family(mono_font_family())
                             .text_color(accent())
                             .child("LSP"),
                     ),
@@ -1087,7 +1087,7 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails, id_prefix: &str) -
                         div()
                             .w_full()
                             .min_w_0()
-                            .font_family("Fira Code")
+                            .font_family(mono_font_family())
                             .text_size(px(12.0))
                             .text_color(fg_default())
                             .whitespace_normal()
@@ -1114,7 +1114,7 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails, id_prefix: &str) -
                         div()
                             .w_full()
                             .min_w_0()
-                            .font_family("Fira Code")
+                            .font_family(mono_font_family())
                             .text_size(px(12.0))
                             .text_color(fg_default())
                             .whitespace_normal()
@@ -1136,7 +1136,7 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails, id_prefix: &str) -
                         div()
                             .w_full()
                             .min_w_0()
-                            .font_family("Fira Code")
+                            .font_family(mono_font_family())
                             .text_size(px(12.0))
                             .text_color(fg_default())
                             .whitespace_normal()
@@ -1158,7 +1158,7 @@ fn render_lsp_symbol_details(details: &lsp::LspSymbolDetails, id_prefix: &str) -
 fn render_lsp_section_label(label: &str) -> impl IntoElement {
     div()
         .text_size(px(11.0))
-        .font_family("Fira Code")
+        .font_family(mono_font_family())
         .text_color(accent())
         .child(label.to_string())
 }

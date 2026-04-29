@@ -2,12 +2,15 @@ use gpui::prelude::*;
 use gpui::*;
 
 use crate::app_assets::{
-    BRAND_HERO_LANDSCAPE_ASSET, OVERVIEW_MY_PULL_REQUESTS_ASSET, OVERVIEW_OPEN_PULL_REQUESTS_ASSET,
+    OVERVIEW_MY_PULL_REQUESTS_ASSET, OVERVIEW_OPEN_PULL_REQUESTS_ASSET,
     OVERVIEW_REVIEW_REQUESTS_ASSET,
 };
-use crate::branding::APP_TAGLINE_LABEL;
 use crate::review_queue::default_review_file;
 use crate::review_session::{load_review_session, location_label};
+use crate::shader_surface::{
+    opengl_shader_surface_variant_with_corner_mask, opengl_shader_surface_with_corner_mask,
+    OverviewShaderVariant, ShaderCornerMask,
+};
 use crate::state::*;
 use crate::theme::*;
 use crate::{github, notifications};
@@ -17,7 +20,6 @@ use super::workspace_sync::trigger_sync_workspace;
 use std::collections::BTreeMap;
 
 const DETAIL_AUTO_REFRESH_TTL_MS: i64 = 5 * 60 * 1000;
-const OVERVIEW_HERO_RADIUS: f32 = 8.0;
 
 pub fn render_section_workspace(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let s = state.read(cx);
@@ -44,7 +46,6 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let workspace_error = s.workspace_error.clone();
     let first_open_tab = s.open_tabs.first().cloned();
     let overview_greeting_index = s.overview_greeting_index;
-    let workspace_syncing = s.workspace_syncing;
     let review_comment_items = overview_review_comment_items(&s, &review_items);
 
     let welcome_greeting =
@@ -62,9 +63,6 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
     let state_for_authored = state.clone();
     let state_for_review_requests = state.clone();
     let state_for_items = state.clone();
-    let state_for_strip_review_board = state.clone();
-    let state_for_strip_sync = state.clone();
-    let state_for_empty_sync = state.clone();
     let state_for_comment_items = state.clone();
     let show_empty_state = is_auth
         && !workspace_loading
@@ -82,20 +80,7 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .min_h_0()
         .h_full()
         .overflow_hidden()
-        .child(overview_ambient_strip(
-            welcome_greeting,
-            workspace_syncing,
-            is_auth,
-            move |_, _, cx| {
-                activate_queue(
-                    &state_for_strip_review_board,
-                    SectionId::Reviews,
-                    "reviewRequested",
-                    cx,
-                );
-            },
-            move |_, window, cx| trigger_sync_workspace(&state_for_strip_sync, window, cx),
-        ))
+        .child(overview_ambient_strip(welcome_greeting))
         .child(
             div()
                 .id("overview-scroll")
@@ -115,6 +100,7 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                             OVERVIEW_OPEN_PULL_REQUESTS_ASSET,
                             "Open Pull Requests",
                             open_tab_count,
+                            OverviewShaderVariant::Bands,
                             first_open_tab.is_some(),
                             {
                                 let state = state_for_open_pull_requests.clone();
@@ -130,6 +116,7 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                             OVERVIEW_MY_PULL_REQUESTS_ASSET,
                             "My Pull Requests",
                             authored_count,
+                            OverviewShaderVariant::Flow,
                             is_auth,
                             {
                                 let state = state_for_authored.clone();
@@ -142,6 +129,7 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                             OVERVIEW_REVIEW_REQUESTS_ASSET,
                             "Review Requests",
                             review_count,
+                            OverviewShaderVariant::Bands,
                             is_auth,
                             {
                                 let state = state_for_review_requests.clone();
@@ -157,9 +145,7 @@ fn render_overview(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                         )),
                 )
                 .when(show_empty_state, |el| {
-                    el.child(overview_empty_state_panel(move |_, window, cx| {
-                        trigger_sync_workspace(&state_for_empty_sync, window, cx);
-                    }))
+                    el.child(overview_empty_state_panel())
                 })
                 .when(!show_empty_state, |el| {
                     el.child(
@@ -207,163 +193,128 @@ struct OverviewReviewCommentItem {
     is_outdated: bool,
 }
 
-fn overview_ambient_strip(
-    welcome_greeting: String,
-    workspace_syncing: bool,
-    is_auth: bool,
-    on_review_board: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    on_sync: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+fn overview_ambient_strip(welcome_greeting: String) -> impl IntoElement {
     div()
         .relative()
         .w_full()
-        .h(px(112.0))
+        .min_h(px(128.0))
+        .flex()
         .flex_shrink_0()
-        .rounded(px(OVERVIEW_HERO_RADIUS))
+        .rounded(radius())
+        .border_1()
+        .border_color(border_muted())
         .overflow_hidden()
         .child(
-            img(BRAND_HERO_LANDSCAPE_ASSET)
-                .w_full()
-                .h_full()
-                .object_fit(ObjectFit::Cover),
+            opengl_shader_surface_with_corner_mask(
+                "overview-attention",
+                radius(),
+                bg_canvas(),
+                ShaderCornerMask::LEFT,
+            )
+            .w(px(188.0))
+            .h_full()
+            .flex_shrink_0(),
         )
-        .child(div().absolute().inset_0().bg(Rgba {
-            r: 0.02,
-            g: 0.03,
-            b: 0.04,
-            a: 0.34,
-        }))
         .child(
             div()
-                .absolute()
-                .top(px(0.0))
-                .right(px(0.0))
-                .bottom(px(0.0))
-                .left(px(0.0))
-                .p(px(20.0))
-                .px(px(24.0))
+                .relative()
+                .min_h(px(128.0))
+                .h_full()
+                .flex_grow()
+                .bg(bg_overlay())
+                .rounded_r(radius())
+                .p(px(24.0))
                 .flex()
                 .items_center()
                 .justify_between()
-                .gap(px(18.0))
+                .gap(px(24.0))
                 .child(
-                    div()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap(px(8.0))
-                        .child(
-                            div()
-                                .text_size(px(10.0))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .font_family("Fira Code")
-                                .text_color(hero_text_primary())
-                                .child(APP_TAGLINE_LABEL),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(30.0))
-                                .line_height(px(32.0))
-                                .font_family(display_serif_font_family())
-                                .font_weight(FontWeight::NORMAL)
-                                .text_color(hero_text_primary())
-                                .line_clamp(1)
-                                .child(welcome_greeting),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap(px(8.0))
-                        .flex_shrink_0()
-                        .when(is_auth, |el| {
-                            el.child(ambient_button("Review board", on_review_board))
-                        })
-                        .child(ambient_button(
-                            if workspace_syncing {
-                                "Syncing..."
-                            } else {
-                                "Refresh"
-                            },
-                            on_sync,
-                        )),
+                    div().min_w_0().flex().flex_col().gap(px(0.0)).child(
+                        div()
+                            .text_size(px(28.0))
+                            .line_height(px(32.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg_emphasis())
+                            .line_clamp(2)
+                            .child(welcome_greeting),
+                    ),
                 ),
         )
-}
-
-fn ambient_button(
-    label: &str,
-    on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .px(px(13.0))
-        .py(px(7.0))
-        .rounded(radius_sm())
-        .bg(Rgba {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 0.14,
-        })
-        .border_1()
-        .border_color(Rgba {
-            r: 1.0,
-            g: 1.0,
-            b: 1.0,
-            a: 0.16,
-        })
-        .text_color(hero_text_primary())
-        .text_size(px(13.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .cursor_pointer()
-        .hover(|style| {
-            style.bg(Rgba {
-                r: 1.0,
-                g: 1.0,
-                b: 1.0,
-                a: 0.22,
-            })
-        })
-        .on_mouse_down(MouseButton::Left, on_click)
-        .child(label.to_string())
 }
 
 fn overview_metric_card(
     icon_asset: &str,
     label: &str,
     count: i64,
+    shader_variant: OverviewShaderVariant,
     interactive: bool,
     on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let material_key = format!("metric-{label}");
+
     div()
         .flex_1()
         .min_w(px(190.0))
+        .min_h(px(84.0))
         .flex()
         .items_center()
         .justify_between()
-        .gap(px(14.0))
-        .p(px(14.0))
-        .px(px(16.0))
+        .gap(px(0.0))
         .rounded(radius())
-        .bg(bg_surface())
+        .overflow_hidden()
         .border_1()
         .border_color(border_muted())
         .when(interactive, |el| {
             el.cursor_pointer()
-                .hover(|style| style.bg(hover_bg()))
+                .hover(|style| style.border_color(border_muted()))
                 .on_mouse_down(MouseButton::Left, on_click)
         })
+        .child(
+            opengl_shader_surface_variant_with_corner_mask(
+                material_key.clone(),
+                shader_variant,
+                radius(),
+                bg_canvas(),
+                ShaderCornerMask::LEFT,
+            )
+            .w(px(72.0))
+            .h_full()
+            .flex_shrink_0()
+            .child(
+                div()
+                    .absolute()
+                    .left(px(20.0))
+                    .top(px(25.0))
+                    .w(px(32.0))
+                    .h(px(32.0))
+                    .rounded(px(999.0))
+                    .bg(white().opacity(0.72))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        svg()
+                            .path(icon_asset.to_string())
+                            .size(px(17.0))
+                            .text_color(fg_emphasis()),
+                    ),
+            ),
+        )
         .child(
             div()
                 .min_w_0()
                 .flex()
                 .flex_col()
                 .gap(px(7.0))
+                .p(px(14.0))
+                .px(px(16.0))
+                .flex_grow()
+                .bg(bg_surface())
+                .rounded_r(radius())
                 .child(
                     div()
                         .text_size(px(10.0))
-                        .font_family("Fira Code")
+                        .font_family(mono_font_family())
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(fg_subtle())
                         .child(label.to_uppercase()),
@@ -372,36 +323,14 @@ fn overview_metric_card(
                     div()
                         .text_size(px(27.0))
                         .line_height(px(29.0))
-                        .font_family(display_serif_font_family())
-                        .font_weight(FontWeight::NORMAL)
+                        .font_weight(FontWeight::SEMIBOLD)
                         .text_color(fg_emphasis())
                         .child(count.to_string()),
                 ),
         )
-        .child(
-            div()
-                .w(px(34.0))
-                .h(px(34.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .flex_shrink_0()
-                .rounded(radius())
-                .bg(bg_overlay())
-                .border_1()
-                .border_color(border_muted())
-                .child(
-                    svg()
-                        .path(icon_asset.to_string())
-                        .size(px(17.0))
-                        .text_color(fg_muted()),
-                ),
-        )
 }
 
-fn overview_empty_state_panel(
-    on_sync: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
+fn overview_empty_state_panel() -> impl IntoElement {
     panel().child(
         div()
             .p(px(28.0))
@@ -433,11 +362,6 @@ fn overview_empty_state_panel(
                             ),
                     ),
             )
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .child(review_button("Refresh workspace", on_sync)),
-            ),
     )
 }
 
@@ -605,13 +529,18 @@ fn overview_review_comment_row(
 
     div()
         .w_full()
-        .p(px(14.0))
-        .rounded(radius_sm())
+        .p(px(16.0))
+        .rounded(radius())
         .bg(bg_overlay())
         .border_1()
         .border_color(border_muted())
         .cursor_pointer()
-        .hover(|style| style.bg(hover_bg()).text_color(fg_emphasis()))
+        .hover(|style| {
+            style
+                .bg(hover_bg())
+                .border_color(focus_border())
+                .text_color(fg_emphasis())
+        })
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             open_pull_request(&state, summary.clone(), window, cx);
         })
@@ -635,7 +564,7 @@ fn overview_review_comment_row(
                                 .child(
                                     div()
                                         .text_size(px(10.0))
-                                        .font_family("Fira Code")
+                                        .font_family(mono_font_family())
                                         .text_color(fg_subtle())
                                         .child(repo_ref),
                                 )
@@ -693,7 +622,7 @@ fn overview_review_comment_row(
                 .child(
                     div()
                         .min_w_0()
-                        .font_family("Fira Code")
+                        .font_family(mono_font_family())
                         .text_size(px(10.0))
                         .text_color(fg_subtle())
                         .text_ellipsis()
@@ -910,6 +839,13 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .as_ref()
         .map(|q| q.id == "authored")
         .unwrap_or(false);
+    let board_shader_offset = if is_authored_queue {
+        2
+    } else if is_reviews {
+        1
+    } else {
+        0
+    };
 
     // Group items into kanban lanes by repository
     let mut my_items: Vec<github::PullRequestSummary> = Vec::new();
@@ -941,9 +877,11 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .child(
             div()
                 .w(sidebar_width())
-                .bg(bg_surface())
-                .p(px(28.0))
-                .px(px(32.0))
+                .bg(bg_overlay())
+                .border_r(px(1.0))
+                .border_color(border_muted())
+                .p(px(24.0))
+                .px(px(28.0))
                 .flex()
                 .flex_col()
                 .flex_shrink_0()
@@ -963,7 +901,7 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                 )
                 .child(
                     div()
-                        .text_size(px(12.0))
+                        .text_size(px(13.0))
                         .text_color(fg_muted())
                         .mt(px(6.0))
                         .max_w(px(200.0))
@@ -973,7 +911,7 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                             "Pull requests grouped into repo lanes."
                         }),
                 )
-                .child(div().flex().flex_col().gap(px(4.0)).mt(px(20.0)).children(
+                .child(div().flex().flex_col().gap(px(6.0)).mt(px(22.0)).children(
                     available_queues.iter().map(|queue| {
                         let is_active = current_queue
                             .as_ref()
@@ -1096,12 +1034,12 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                         .id("kanban-board-hscroll")
                         .overflow_x_scroll()
                         .overflow_y_hidden()
-                        .px(px(20.0))
-                        .pb(px(20.0))
+                        .px(px(24.0))
+                        .pb(px(24.0))
                         .child(
                             div()
                                 .flex()
-                                .gap(px(12.0))
+                                .gap(px(16.0))
                                 .h_full()
                                 .when(has_my_items, |el| {
                                     let state = state_for_lanes.clone();
@@ -1112,6 +1050,7 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                         my_items,
                                         accent(),
                                         true,
+                                        board_shader_offset + 2,
                                         state,
                                     ))
                                 })
@@ -1128,6 +1067,7 @@ fn render_pull_list(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                         items,
                                         accent_color,
                                         false,
+                                        board_shader_offset,
                                         state,
                                     )
                                 })),
@@ -1201,30 +1141,85 @@ fn render_issues(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
 
 // --- Shared components ---
 
+pub fn material_surface(seed: &str) -> Div {
+    shader_material_surface(
+        seed,
+        0,
+        ShaderCornerMask::default(),
+        transparent(),
+        radius(),
+    )
+}
+
+fn material_surface_with_corner_radius(
+    seed: &str,
+    variant_offset: usize,
+    corners: ShaderCornerMask,
+    mask_color: Rgba,
+    corner_radius: Pixels,
+) -> Div {
+    shader_material_surface(seed, variant_offset, corners, mask_color, corner_radius)
+}
+
+fn shader_material_surface(
+    seed: &str,
+    variant_offset: usize,
+    corners: ShaderCornerMask,
+    mask_color: Rgba,
+    corner_radius: Pixels,
+) -> Div {
+    let seed = seed.to_string();
+    let shader_seed = format!("review-material-{seed}");
+    let variant = material_shader_variant(&seed, variant_offset);
+
+    opengl_shader_surface_variant_with_corner_mask(
+        shader_seed,
+        variant,
+        corner_radius,
+        mask_color,
+        corners,
+    )
+}
+
+fn material_shader_variant(seed: &str, offset: usize) -> OverviewShaderVariant {
+    match (material_seed_index(seed) + offset) % 3 {
+        0 => OverviewShaderVariant::Ember,
+        1 => OverviewShaderVariant::Lagoon,
+        _ => OverviewShaderVariant::Aurora,
+    }
+}
+
+fn material_seed_index(seed: &str) -> usize {
+    let hash = seed.bytes().fold(2166136261u32, |acc, byte| {
+        acc.wrapping_mul(16777619) ^ byte as u32
+    });
+    (hash as usize) % 3
+}
+
 pub fn panel() -> Div {
     div()
         .rounded(radius())
-        .bg(bg_surface())
+        .bg(bg_overlay())
         .border_1()
         .border_color(border_muted())
+        .shadow_sm()
         .overflow_hidden()
 }
 
 pub fn nested_panel() -> Div {
     div()
-        .p(px(18.0))
+        .p(px(20.0))
         .rounded(radius())
-        .bg(bg_overlay())
+        .bg(bg_surface())
         .border_1()
         .border_color(border_muted())
 }
 
 pub fn eyebrow(text: &str) -> impl IntoElement {
     div()
-        .text_size(px(10.0))
+        .text_size(px(11.0))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(fg_subtle())
-        .font_family("Fira Code")
         .mb(px(8.0))
         .child(text.to_string().to_uppercase())
 }
@@ -1235,14 +1230,21 @@ pub fn ghost_button(
 ) -> impl IntoElement {
     div()
         .px(px(14.0))
-        .py(px(6.0))
+        .py(px(7.0))
         .rounded(radius_sm())
-        .bg(bg_subtle())
-        .text_color(fg_muted())
+        .bg(bg_overlay())
+        .border_1()
+        .border_color(border_muted())
+        .text_color(fg_default())
         .text_size(px(13.0))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
-        .hover(|style| style.bg(hover_bg()).text_color(fg_emphasis()))
+        .hover(|style| {
+            style
+                .bg(hover_bg())
+                .border_color(focus_border())
+                .text_color(fg_emphasis())
+        })
         .on_mouse_down(MouseButton::Left, on_click)
         .child(label.to_string())
 }
@@ -1255,12 +1257,12 @@ pub fn review_button(
         .px(px(16.0))
         .py(px(8.0))
         .rounded(radius_sm())
-        .bg(bg_selected())
-        .text_color(fg_emphasis())
+        .bg(primary_action_bg())
+        .text_color(fg_on_primary_action())
         .text_size(px(13.0))
         .font_weight(FontWeight::SEMIBOLD)
         .cursor_pointer()
-        .hover(|style| style.bg(hover_bg()))
+        .hover(|style| style.bg(primary_action_hover()))
         .on_mouse_down(MouseButton::Left, on_click)
         .child(label.to_string())
 }
@@ -1271,6 +1273,8 @@ pub fn badge(text: &str) -> impl IntoElement {
         .py(px(3.0))
         .rounded(px(999.0))
         .bg(bg_subtle())
+        .border_1()
+        .border_color(border_muted())
         .text_size(px(12.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(fg_muted())
@@ -1385,7 +1389,7 @@ fn avatar_placeholder(login: &str, size: f32, emphasized: bool) -> Div {
         .justify_center()
         .flex_shrink_0()
         .text_size(px((size * 0.38).max(9.0)))
-        .font_family("Fira Code")
+        .font_family(mono_font_family())
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(if emphasized { accent() } else { fg_emphasis() })
         .child(login_monogram(login))
@@ -1410,6 +1414,8 @@ pub fn badge_success(text: &str) -> impl IntoElement {
         .py(px(3.0))
         .rounded(px(999.0))
         .bg(success_muted())
+        .border_1()
+        .border_color(diff_add_border())
         .text_size(px(12.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(success())
@@ -1447,7 +1453,7 @@ pub fn meta_row(label: &str, value: &str) -> impl IntoElement {
                 .w(px(88.0))
                 .flex_shrink_0()
                 .text_color(fg_subtle())
-                .font_family("Fira Code")
+                .font_family(mono_font_family())
                 .text_size(px(10.0))
                 .child(label.to_uppercase()),
         )
@@ -1463,20 +1469,11 @@ pub fn meta_row(label: &str, value: &str) -> impl IntoElement {
                 .border_color(border_muted())
                 .text_color(fg_emphasis())
                 .font_weight(FontWeight::MEDIUM)
-                .font_family("Fira Code")
+                .font_family(mono_font_family())
                 .text_size(px(11.0))
                 .whitespace_normal()
                 .child(value.to_string()),
         )
-}
-
-fn hero_text_primary() -> Rgba {
-    Rgba {
-        r: 0.97,
-        g: 0.97,
-        b: 0.98,
-        a: 1.0,
-    }
 }
 
 fn welcome_greeting_count(is_authenticated: bool) -> usize {
@@ -1529,29 +1526,42 @@ fn filter_pill(
         .px(px(14.0))
         .py(px(6.0))
         .rounded(radius_sm())
+        .border_1()
+        .border_color(if active {
+            focus_border()
+        } else {
+            transparent()
+        })
         .text_size(px(13.0))
         .font_weight(FontWeight::MEDIUM)
         .cursor_pointer()
         .when(active, |el| el.bg(bg_selected()).text_color(fg_emphasis()))
         .when(!active, |el| el.text_color(fg_muted()))
-        .hover(|style| style.bg(hover_bg()).text_color(fg_emphasis()))
+        .hover(|style| {
+            style
+                .bg(hover_bg())
+                .border_color(focus_border())
+                .text_color(fg_emphasis())
+        })
         .on_mouse_down(MouseButton::Left, on_click)
         .child(label.to_string())
         .child(
             div()
                 .text_color(if active { fg_default() } else { fg_subtle() })
-                .font_family("Fira Code")
+                .font_family(mono_font_family())
                 .text_size(px(12.0))
                 .child(count.to_string()),
         )
 }
 
-fn pill_badge(label: &str, fg: Rgba, bg: Rgba, _border: Rgba) -> impl IntoElement {
+fn pill_badge(label: &str, fg: Rgba, bg: Rgba, border: Rgba) -> impl IntoElement {
     div()
         .px(px(8.0))
         .py(px(2.0))
         .rounded(px(999.0))
         .bg(bg)
+        .border_1()
+        .border_color(border)
         .text_size(px(10.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(fg)
@@ -1568,7 +1578,7 @@ fn pull_request_state_badge(item: &github::PullRequestSummary) -> AnyElement {
     }
 
     match item.state.as_str() {
-        "MERGED" => pill_badge("Merged", purple(), bg_emphasis(), purple()).into_any_element(),
+        "MERGED" => pill_badge("Merged", info(), info_muted(), info()).into_any_element(),
         "CLOSED" => {
             pill_badge("Closed", danger(), danger_muted(), diff_remove_border()).into_any_element()
         }
@@ -1622,7 +1632,7 @@ fn render_diff_summary(additions: i64, deletions: i64) -> impl IntoElement {
                 .flex()
                 .gap(px(4.0))
                 .text_size(px(11.0))
-                .font_family("Fira Code")
+                .font_family(mono_font_family())
                 .child(div().text_color(success()).child(format!("+{additions}")))
                 .child(div().text_color(danger()).child(format!("-{deletions}"))),
         )
@@ -1650,6 +1660,7 @@ fn pr_list_row(
 ) -> impl IntoElement {
     let title = item.title.clone();
     let repo_ref = format!("{} #{}", item.repository, item.number);
+    let material_key = format!("{}-{}", item.repository, item.number);
     let author_login = item.author_login.clone();
     let author_avatar_url = item.author_avatar_url.clone();
     let meta = format!("updated {}", format_relative_time(&item.updated_at));
@@ -1662,19 +1673,23 @@ fn pr_list_row(
 
     div()
         .w_full()
-        .p(px(14.0))
-        .rounded(radius_sm())
+        .rounded(radius())
         .bg(bg_overlay())
         .border_1()
-        .border_color(border_muted())
+        .border_color(transparent())
+        .shadow_sm()
+        .overflow_hidden()
+        .flex()
         .cursor_pointer()
-        .hover(|style| style.bg(hover_bg()).text_color(fg_emphasis()))
+        .hover(|style| style.bg(bg_surface()).text_color(fg_emphasis()))
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             on_click(summary.clone(), window, cx)
         })
+        .child(material_surface(&material_key).w(px(10.0)).flex_shrink_0())
         .child(
             div()
                 .flex_grow()
+                .p(px(14.0))
                 .flex()
                 .items_start()
                 .justify_between()
@@ -1689,7 +1704,7 @@ fn pr_list_row(
                         .child(
                             div()
                                 .text_size(px(10.0))
-                                .font_family("Fira Code")
+                                .font_family(mono_font_family())
                                 .text_color(fg_subtle())
                                 .child(repo_ref),
                         )
@@ -1746,8 +1761,9 @@ fn kanban_lane(
     label: &str,
     subtitle: &str,
     items: Vec<github::PullRequestSummary>,
-    accent: Rgba,
+    _accent: Rgba,
     is_mine: bool,
+    shader_offset: usize,
     state: Entity<AppState>,
 ) -> impl IntoElement {
     let label = label.to_string();
@@ -1757,7 +1773,7 @@ fn kanban_lane(
     let mute_repo = lane_id.to_string();
 
     div()
-        .w(px(286.0))
+        .w(px(320.0))
         .flex_shrink_0()
         .flex()
         .flex_col()
@@ -1768,88 +1784,103 @@ fn kanban_lane(
                 .flex_col()
                 .min_h_0()
                 .flex_grow()
-                .rounded(radius())
-                .bg(bg_surface())
-                .border_1()
-                .border_color(border_muted())
-                .overflow_hidden()
+                .rounded(radius_lg())
+                .bg(transparent())
+                .shadow_md()
+                .child(
+                    material_surface_with_corner_radius(
+                        lane_id,
+                        shader_offset + 1,
+                        ShaderCornerMask::TOP,
+                        bg_canvas(),
+                        radius_lg(),
+                    )
+                    .h(px(70.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .p(px(16.0))
+                    .text_color(fg_emphasis())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(10.0))
+                            .child(
+                                div()
+                                    .text_size(px(14.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(fg_emphasis())
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .px(px(8.0))
+                                    .py(px(2.0))
+                                    .rounded(px(999.0))
+                                    .bg(white().opacity(0.62))
+                                    .text_size(px(11.0))
+                                    .font_family(mono_font_family())
+                                    .text_color(fg_emphasis())
+                                    .child(count.to_string()),
+                            ),
+                    )
+                    .when(!is_mine, |el| {
+                        el.child(
+                            div()
+                                .px(px(8.0))
+                                .py(px(4.0))
+                                .rounded(radius_sm())
+                                .text_size(px(11.0))
+                                .text_color(fg_emphasis())
+                                .cursor_pointer()
+                                .bg(white().opacity(0.46))
+                                .hover(|s| s.bg(white().opacity(0.68)).text_color(danger()))
+                                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                    mute_state.update(cx, |s, cx| {
+                                        s.muted_repos.insert(mute_repo.clone());
+                                        cx.notify();
+                                    });
+                                })
+                                .child("Mute"),
+                        )
+                    }),
+                )
                 .child(
                     div()
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .p(px(14.0))
-                        .pb(px(8.0))
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap(px(10.0))
-                                .child(div().w(px(6.0)).h(px(24.0)).rounded(radius_sm()).bg(accent))
-                                .child(
-                                    div()
-                                        .text_size(px(14.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(fg_emphasis())
-                                        .child(label),
-                                )
-                                .child(
-                                    div()
-                                        .px(px(8.0))
-                                        .py(px(2.0))
-                                        .rounded(px(10.0))
-                                        .bg(bg_emphasis())
-                                        .text_size(px(11.0))
-                                        .font_family("Fira Code")
-                                        .text_color(fg_muted())
-                                        .child(count.to_string()),
-                                ),
-                        )
-                        .when(!is_mine, |el| {
-                            el.child(
-                                div()
-                                    .px(px(8.0))
-                                    .py(px(4.0))
-                                    .rounded(radius_sm())
-                                    .text_size(px(11.0))
-                                    .text_color(fg_subtle())
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(hover_bg()).text_color(danger()))
-                                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                                        mute_state.update(cx, |s, cx| {
-                                            s.muted_repos.insert(mute_repo.clone());
-                                            cx.notify();
-                                        });
-                                    })
-                                    .child("Mute"),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .px(px(14.0))
-                        .pb(px(10.0))
-                        .text_size(px(11.0))
-                        .text_color(fg_subtle())
-                        .font_family("Fira Code")
-                        .child(subtitle),
-                )
-                .child(
-                    div()
+                        .flex_col()
                         .flex_grow()
                         .min_h_0()
-                        .id(SharedString::from(format!("lane-scroll-{lane_id}")))
-                        .overflow_y_scroll()
-                        .px(px(8.0))
-                        .pb(px(8.0))
-                        .child(div().flex().flex_col().gap(px(4.0)).children(
-                            items.into_iter().map(|item| {
-                                let state = state.clone();
-                                kanban_card(item, move |summary, window, cx| {
-                                    open_pull_request(&state, summary, window, cx);
-                                })
-                            }),
-                        )),
+                        .bg(bg_overlay())
+                        .rounded_b(radius_lg())
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .px(px(14.0))
+                                .py(px(10.0))
+                                .text_size(px(11.0))
+                                .text_color(fg_subtle())
+                                .font_family(mono_font_family())
+                                .child(subtitle),
+                        )
+                        .child(
+                            div()
+                                .flex_grow()
+                                .min_h_0()
+                                .id(SharedString::from(format!("lane-scroll-{lane_id}")))
+                                .overflow_y_scroll()
+                                .px(px(10.0))
+                                .pb(px(10.0))
+                                .child(div().flex().flex_col().gap(px(8.0)).children(
+                                    items.into_iter().map(|item| {
+                                        let state = state.clone();
+                                        kanban_card(item, move |summary, window, cx| {
+                                            open_pull_request(&state, summary, window, cx);
+                                        })
+                                    }),
+                                )),
+                        ),
                 ),
         )
 }
@@ -1881,13 +1912,14 @@ fn kanban_card(
     let summary = item.clone();
 
     div()
-        .p(px(12.0))
-        .rounded(radius_sm())
-        .bg(bg_overlay())
+        .rounded(radius())
+        .bg(bg_surface())
         .border_1()
         .border_color(border_muted())
+        .shadow_sm()
+        .p(px(14.0))
         .cursor_pointer()
-        .hover(|s| s.bg(hover_bg()))
+        .hover(|s| s.bg(bg_overlay()).shadow_md())
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             on_click(summary.clone(), window, cx)
         })
@@ -1924,7 +1956,7 @@ fn kanban_card(
                                         .gap(px(6.0))
                                         .min_w_0()
                                         .text_size(px(10.0))
-                                        .font_family("Fira Code")
+                                        .font_family(mono_font_family())
                                         .text_color(fg_muted())
                                         .child(user_avatar(
                                             &author_login,
@@ -2052,8 +2084,6 @@ pub fn open_pull_request(
         s.review_message = None;
         s.review_success = false;
         s.pr_header_compact = false;
-        s.active_tour_outline_id = "overview".to_string();
-        s.collapsed_tour_panels.clear();
 
         s.detail_states.entry(key.clone()).or_default();
         s.apply_review_session_document(&key, cached_review_session.clone());

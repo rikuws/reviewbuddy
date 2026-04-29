@@ -49,6 +49,27 @@ pub const TOUR_OUTPUT_SCHEMA_JSON: &str = r#"{
           "summary": { "type": "string" },
           "detail": { "type": "string" },
           "badge": { "type": "string" },
+          "category": {
+            "type": "string",
+            "enum": [
+              "auth-security",
+              "data-state",
+              "api-io",
+              "ui-ux",
+              "tests",
+              "docs",
+              "config",
+              "infra",
+              "refactor",
+              "performance",
+              "reliability",
+              "other"
+            ]
+          },
+          "priority": {
+            "type": "string",
+            "enum": ["low", "medium", "high"]
+          },
           "stepIds": {
             "type": "array",
             "items": { "type": "string" }
@@ -78,6 +99,8 @@ pub const TOUR_OUTPUT_SCHEMA_JSON: &str = r#"{
           "summary",
           "detail",
           "badge",
+          "category",
+          "priority",
           "stepIds",
           "reviewPoints",
           "callsites"
@@ -113,5 +136,26 @@ mod tests {
         let value = &*TOUR_OUTPUT_SCHEMA_VALUE;
         assert_eq!(value["type"], "object");
         assert!(value["properties"]["overview"].is_object());
+        let section = &value["properties"]["sections"]["items"];
+        assert!(section["properties"]["category"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("auth-security")));
+        assert!(section["properties"]["priority"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("high")));
+        assert!(section["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("category")));
+        assert!(section["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("priority")));
     }
 }

@@ -1,21 +1,54 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use gpui::{px, Pixels, Rgba, WindowAppearance};
+use gpui::{linear_color_stop, linear_gradient, px, Background, Pixels, Rgba, WindowAppearance};
 use serde::{Deserialize, Serialize};
 
 use crate::cache::CacheStore;
 
 const THEME_SETTINGS_CACHE_KEY: &str = "theme-settings-v1";
 const UI_FONT_FAMILY: &str = ".AppleSystemUIFont";
+const MONO_FONT_FAMILY: &str = "Fira Code";
 const DISPLAY_SERIF_FONT_FAMILY: &str = "Instrument Serif";
 
-const INK: u32 = 0x0f1624;
-const SLATE: u32 = 0x3b4452;
-const MIST: u32 = 0xe6e8eb;
-const PAPER: u32 = 0xf7f6f3;
-const SAGE: u32 = 0x55756a;
-const OCHRE: u32 = 0xb6924d;
+const LIGHT_CANVAS: u32 = 0xf6f8fb;
+const LIGHT_SURFACE: u32 = 0xffffff;
+const LIGHT_ELEVATED: u32 = 0xffffff;
+const LIGHT_INSET: u32 = 0xedf2f7;
+const LIGHT_SUBTLE: u32 = 0xf1f5f9;
+const LIGHT_EMPHASIS: u32 = 0xe7edf5;
+const LIGHT_SELECTED: u32 = 0xf0f3f7;
+const LIGHT_TEXT_EMPHASIS: u32 = 0x101828;
+const LIGHT_TEXT: u32 = 0x344054;
+const LIGHT_TEXT_MUTED: u32 = 0x667085;
+const LIGHT_TEXT_SUBTLE: u32 = 0x98a2b3;
+const LIGHT_BORDER: u32 = 0xd6dee8;
+const LIGHT_BORDER_MUTED: u32 = 0xe5ebf2;
+
+const DARK_CANVAS: u32 = 0x0b1118;
+const DARK_SURFACE: u32 = 0x111821;
+const DARK_ELEVATED: u32 = 0x151f2b;
+const DARK_INSET: u32 = 0x080d14;
+const DARK_SUBTLE: u32 = 0x151d28;
+const DARK_EMPHASIS: u32 = 0x1d2939;
+const DARK_SELECTED: u32 = 0x1a2431;
+const DARK_TEXT_EMPHASIS: u32 = 0xf3f7fb;
+const DARK_TEXT: u32 = 0xd6dee8;
+const DARK_TEXT_MUTED: u32 = 0x9aa8ba;
+const DARK_TEXT_SUBTLE: u32 = 0x728196;
+const DARK_BORDER: u32 = 0x2b3848;
+const DARK_BORDER_MUTED: u32 = 0x202b38;
+
+const LIGHT_FOCUS: u32 = 0x2563eb;
+const DARK_FOCUS: u32 = 0x7db4ff;
+const LIGHT_SUCCESS: u32 = 0x16a34a;
+const DARK_SUCCESS: u32 = 0x6ee7a5;
+const LIGHT_WARNING: u32 = 0xd97706;
+const DARK_WARNING: u32 = 0xfbbf24;
+const LIGHT_DANGER: u32 = 0xdc2626;
+const DARK_DANGER: u32 = 0xfca5a5;
+const LIGHT_INFO: u32 = 0x0891b2;
+const DARK_INFO: u32 = 0x67e8f9;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -68,7 +101,7 @@ pub struct ThemeSettings {
     pub preference: ThemePreference,
 }
 
-static ACTIVE_THEME: AtomicU8 = AtomicU8::new(ActiveTheme::Dark as u8);
+static ACTIVE_THEME: AtomicU8 = AtomicU8::new(ActiveTheme::Light as u8);
 
 fn color(r: f32, g: f32, b: f32, a: f32) -> Rgba {
     Rgba { r, g, b, a }
@@ -174,184 +207,283 @@ pub fn ui_font_family() -> &'static str {
     UI_FONT_FAMILY
 }
 
+pub fn mono_font_family() -> &'static str {
+    MONO_FONT_FAMILY
+}
+
 pub fn display_serif_font_family() -> &'static str {
     DISPLAY_SERIF_FONT_FAMILY
 }
 
 pub fn bg_canvas() -> Rgba {
-    theme_hex(PAPER, INK)
+    theme_hex(LIGHT_CANVAS, DARK_CANVAS)
 }
 
 pub fn bg_surface() -> Rgba {
-    theme_hex(0xfcfbf8, 0x141c29)
+    theme_hex(LIGHT_SURFACE, DARK_SURFACE)
 }
 
 pub fn bg_overlay() -> Rgba {
-    theme_hex(0xffffff, 0x1a2330)
+    theme_hex(LIGHT_ELEVATED, DARK_ELEVATED)
 }
 
 pub fn bg_inset() -> Rgba {
-    theme_hex(MIST, 0x0b111b)
+    theme_hex(LIGHT_INSET, DARK_INSET)
 }
 
 pub fn bg_subtle() -> Rgba {
-    theme_hex(0xf2f1ed, 0x18212d)
+    theme_hex(LIGHT_SUBTLE, DARK_SUBTLE)
 }
 
 pub fn bg_emphasis() -> Rgba {
-    theme_hex(0xecebe6, 0x202a36)
+    theme_hex(LIGHT_EMPHASIS, DARK_EMPHASIS)
 }
 
 pub fn bg_selected() -> Rgba {
-    theme_hex(0xe8eee9, 0x1b2a2a)
+    theme_hex(LIGHT_SELECTED, DARK_SELECTED)
+}
+
+pub fn focus() -> Rgba {
+    theme_hex(LIGHT_FOCUS, DARK_FOCUS)
+}
+
+pub fn focus_muted() -> Rgba {
+    theme_hex_alpha((LIGHT_FOCUS, 0.12), (DARK_FOCUS, 0.18))
+}
+
+pub fn focus_border() -> Rgba {
+    theme_hex_alpha((LIGHT_FOCUS, 0.42), (DARK_FOCUS, 0.54))
+}
+
+pub fn fg_on_focus() -> Rgba {
+    theme_hex(0xffffff, 0x07111f)
+}
+
+pub fn primary_action_bg() -> Rgba {
+    theme_hex(0x05070c, 0xf3f7fb)
+}
+
+pub fn primary_action_hover() -> Rgba {
+    theme_hex(0x1f2937, 0xd6dee8)
+}
+
+pub fn fg_on_primary_action() -> Rgba {
+    theme_hex(0xffffff, 0x07111f)
 }
 
 pub fn accent() -> Rgba {
-    theme_hex(SAGE, 0x8ba99d)
+    focus()
 }
 
 pub fn accent_muted() -> Rgba {
-    theme_hex_alpha((SAGE, 0.14), (0x8ba99d, 0.18))
+    focus_muted()
 }
 
-pub fn ochre() -> Rgba {
-    theme_hex(OCHRE, 0xd3b36f)
+pub fn warning() -> Rgba {
+    theme_hex(LIGHT_WARNING, DARK_WARNING)
 }
 
-pub fn ochre_muted() -> Rgba {
-    theme_hex_alpha((OCHRE, 0.16), (0xd3b36f, 0.18))
+pub fn warning_muted() -> Rgba {
+    theme_hex_alpha((LIGHT_WARNING, 0.13), (DARK_WARNING, 0.18))
+}
+
+pub fn info() -> Rgba {
+    theme_hex(LIGHT_INFO, DARK_INFO)
+}
+
+pub fn info_muted() -> Rgba {
+    theme_hex_alpha((LIGHT_INFO, 0.12), (DARK_INFO, 0.18))
+}
+
+pub fn brand_accent() -> Rgba {
+    theme_hex(0x6d5dfc, 0xa7a2ff)
+}
+
+pub fn brand_accent_muted() -> Rgba {
+    theme_hex_alpha((0x6d5dfc, 0.10), (0xa7a2ff, 0.16))
 }
 
 pub fn border_default() -> Rgba {
-    theme_hex_alpha((SLATE, 0.18), (MIST, 0.20))
+    theme_hex_alpha((LIGHT_BORDER, 0.92), (DARK_BORDER, 0.92))
 }
 
 pub fn border_muted() -> Rgba {
-    theme_hex_alpha((SLATE, 0.10), (MIST, 0.12))
+    theme_hex_alpha((LIGHT_BORDER_MUTED, 0.90), (DARK_BORDER_MUTED, 0.92))
 }
 
 pub fn diff_hunk_bg() -> Rgba {
-    theme_hex(0xe8ecec, 0x111b26)
+    theme_hex(0xeaf2ff, 0x102033)
 }
 
 pub fn diff_hunk_fg() -> Rgba {
-    theme_hex(SAGE, 0xaac2b6)
+    focus()
 }
 
 pub fn diff_context_bg() -> Rgba {
-    theme_hex(PAPER, INK)
+    theme_hex(0xfbfdff, 0x0b1118)
 }
 
 pub fn diff_context_gutter_bg() -> Rgba {
-    theme_hex(0xf1f0ec, 0x111927)
+    theme_hex(0xf1f5f9, 0x101720)
 }
 
 pub fn diff_meta_bg() -> Rgba {
-    theme_hex(MIST, 0x18212d)
+    theme_hex(0xeaf2ff, 0x102033)
 }
 
 pub fn diff_add_bg() -> Rgba {
-    theme_hex(0xebf3ee, 0x122019)
+    theme_hex(0xecfdf3, 0x0c1f16)
 }
 
 pub fn diff_add_gutter_bg() -> Rgba {
-    theme_hex(0xdfebe4, 0x17271f)
+    theme_hex(0xdcfce7, 0x123320)
 }
 
 pub fn diff_add_emphasis_bg() -> Rgba {
-    theme_hex_alpha((SAGE, 0.18), (0x8fb2a2, 0.25))
+    theme_hex_alpha((LIGHT_SUCCESS, 0.16), (DARK_SUCCESS, 0.20))
 }
 
 pub fn diff_add_border() -> Rgba {
-    transparent()
+    theme_hex_alpha((LIGHT_SUCCESS, 0.28), (DARK_SUCCESS, 0.28))
 }
 
 pub fn diff_remove_bg() -> Rgba {
-    theme_hex(0xf8ece9, 0x241719)
+    theme_hex(0xfef2f2, 0x2a1216)
 }
 
 pub fn diff_remove_gutter_bg() -> Rgba {
-    theme_hex(0xf0dfdc, 0x2a1d1f)
+    theme_hex(0xfee2e2, 0x3a171c)
 }
 
 pub fn diff_remove_emphasis_bg() -> Rgba {
-    theme_hex_alpha((0xa1524f, 0.18), (0xd28a86, 0.26))
+    theme_hex_alpha((LIGHT_DANGER, 0.15), (DARK_DANGER, 0.20))
 }
 
 pub fn diff_remove_border() -> Rgba {
-    transparent()
+    theme_hex_alpha((LIGHT_DANGER, 0.26), (DARK_DANGER, 0.28))
 }
 
 pub fn fg_default() -> Rgba {
-    theme_hex(SLATE, MIST)
+    theme_hex(LIGHT_TEXT, DARK_TEXT)
 }
 
 pub fn fg_muted() -> Rgba {
-    theme_hex(0x66717f, 0xa7adb5)
+    theme_hex(LIGHT_TEXT_MUTED, DARK_TEXT_MUTED)
 }
 
 pub fn fg_subtle() -> Rgba {
-    theme_hex(0x8f969d, 0x737c88)
+    theme_hex(LIGHT_TEXT_SUBTLE, DARK_TEXT_SUBTLE)
 }
 
 pub fn fg_emphasis() -> Rgba {
-    theme_hex(INK, PAPER)
+    theme_hex(LIGHT_TEXT_EMPHASIS, DARK_TEXT_EMPHASIS)
 }
 
 pub fn success() -> Rgba {
-    theme_hex(0x3f7a56, 0x8fb98e)
+    theme_hex(LIGHT_SUCCESS, DARK_SUCCESS)
 }
 
 pub fn success_muted() -> Rgba {
-    theme_hex_alpha((0x3f7a56, 0.12), (0x8fb98e, 0.14))
+    theme_hex_alpha((LIGHT_SUCCESS, 0.12), (DARK_SUCCESS, 0.16))
 }
 
 pub fn danger() -> Rgba {
-    theme_hex(0xa1524f, 0xd28a86)
+    theme_hex(LIGHT_DANGER, DARK_DANGER)
 }
 
 pub fn danger_muted() -> Rgba {
-    theme_hex_alpha((0xa1524f, 0.12), (0xd28a86, 0.14))
-}
-
-pub fn purple() -> Rgba {
-    ochre()
+    theme_hex_alpha((LIGHT_DANGER, 0.12), (DARK_DANGER, 0.16))
 }
 
 pub fn waypoint_bg() -> Rgba {
-    ochre_muted()
+    warning_muted()
 }
 
 pub fn waypoint_active_bg() -> Rgba {
-    theme_hex_alpha((OCHRE, 0.22), (0xd3b36f, 0.26))
+    theme_hex_alpha((LIGHT_WARNING, 0.18), (DARK_WARNING, 0.24))
 }
 
 pub fn waypoint_border() -> Rgba {
-    theme_hex_alpha((OCHRE, 0.32), (0xd3b36f, 0.34))
+    theme_hex_alpha((LIGHT_WARNING, 0.34), (DARK_WARNING, 0.38))
 }
 
 pub fn waypoint_fg() -> Rgba {
-    theme_hex(0x866736, 0xf0d58a)
+    warning()
 }
 
 pub fn waypoint_icon_bg() -> Rgba {
-    theme_hex(0xf2eadb, 0x2b2418)
+    warning_muted()
 }
 
 pub fn waypoint_icon_border() -> Rgba {
-    theme_hex_alpha((OCHRE, 0.42), (0xd3b36f, 0.40))
+    waypoint_border()
 }
 
 pub fn waypoint_icon_core() -> Rgba {
-    ochre()
+    warning()
 }
 
 pub fn hover_bg() -> Rgba {
-    theme_hex(0xedece8, 0x202a36)
+    theme_hex(0xf2f5f8, 0x1b2531)
+}
+
+pub fn material_gradient(seed: &str) -> Background {
+    match material_index(seed) {
+        0 => linear_gradient(
+            126.0,
+            linear_color_stop(theme_hex(0xd8d1ff, 0x352c72), 0.0),
+            linear_color_stop(theme_hex(0x28f3e3, 0x04c4d7), 1.0),
+        ),
+        1 => linear_gradient(
+            132.0,
+            linear_color_stop(theme_hex(0xf6b6ff, 0x642c84), 0.0),
+            linear_color_stop(theme_hex(0xff4f59, 0xe94b58), 1.0),
+        ),
+        _ => linear_gradient(
+            102.0,
+            linear_color_stop(theme_hex(0x37c9ff, 0x0b6fb6), 0.0),
+            linear_color_stop(theme_hex(0xffb15c, 0xe57731), 1.0),
+        ),
+    }
+}
+
+pub fn material_glow(seed: &str) -> Background {
+    match material_index(seed) {
+        0 => linear_gradient(
+            58.0,
+            linear_color_stop(theme_hex_alpha((0x7cffd5, 0.84), (0x7cffd5, 0.46)), 0.0),
+            linear_color_stop(theme_hex_alpha((0xf2ff7a, 0.72), (0xf2ff7a, 0.36)), 1.0),
+        ),
+        1 => linear_gradient(
+            58.0,
+            linear_color_stop(theme_hex_alpha((0xffd4f5, 0.76), (0xff8fd8, 0.36)), 0.0),
+            linear_color_stop(theme_hex_alpha((0xff7b8a, 0.72), (0xff7b8a, 0.38)), 1.0),
+        ),
+        _ => linear_gradient(
+            58.0,
+            linear_color_stop(theme_hex_alpha((0x00f0ff, 0.70), (0x00c2ff, 0.42)), 0.0),
+            linear_color_stop(theme_hex_alpha((0xffe173, 0.76), (0xffbd4a, 0.42)), 1.0),
+        ),
+    }
+}
+
+pub fn material_mark(seed: &str) -> Rgba {
+    match material_index(seed) {
+        0 => theme_hex(0x33f2d8, 0x6ee7f9),
+        1 => theme_hex(0xff5d7c, 0xff8fb3),
+        _ => theme_hex(0xffa43b, 0xffbd63),
+    }
+}
+
+fn material_index(seed: &str) -> usize {
+    let hash = seed.bytes().fold(2166136261u32, |acc, byte| {
+        acc.wrapping_mul(16777619) ^ byte as u32
+    });
+    (hash as usize) % 3
 }
 
 pub fn palette_backdrop() -> Rgba {
-    theme_rgba((0.06, 0.09, 0.14, 0.16), (0.02, 0.03, 0.05, 0.66))
+    theme_rgba((0.05, 0.09, 0.16, 0.18), (0.01, 0.02, 0.04, 0.72))
 }
 
 pub fn topbar_height() -> Pixels {
@@ -359,23 +491,27 @@ pub fn topbar_height() -> Pixels {
 }
 
 pub fn sidebar_width() -> Pixels {
-    px(260.0)
+    px(248.0)
 }
 
 pub fn file_tree_width() -> Pixels {
-    px(252.0)
+    px(268.0)
 }
 
 pub fn detail_side_width() -> Pixels {
-    px(280.0)
+    px(312.0)
 }
 
 pub fn radius() -> Pixels {
-    px(8.0)
+    px(12.0)
 }
 
 pub fn radius_sm() -> Pixels {
-    px(4.0)
+    px(8.0)
+}
+
+pub fn radius_lg() -> Pixels {
+    px(18.0)
 }
 
 pub fn lane_accent_color(repo: &str) -> Rgba {
@@ -384,24 +520,24 @@ pub fn lane_accent_color(repo: &str) -> Rgba {
     });
     let palette = match active_theme() {
         ActiveTheme::Light => [
-            hex(SAGE),
-            hex(OCHRE),
-            hex(0x557f87),
-            hex(0x6e6f53),
-            hex(0x9a675d),
-            hex(0x586a8a),
-            hex(0x7b6d55),
-            hex(SLATE),
+            hex(LIGHT_FOCUS),
+            hex(LIGHT_INFO),
+            hex(LIGHT_SUCCESS),
+            hex(LIGHT_WARNING),
+            hex(0x7c3aed),
+            hex(0xdb2777),
+            hex(0x4f46e5),
+            hex(0x0f766e),
         ],
         ActiveTheme::Dark => [
-            hex(0x8ba99d),
-            hex(0xd3b36f),
-            hex(0x80aab0),
-            hex(0x9b9c72),
-            hex(0xc28a7f),
-            hex(0x8fa0c1),
-            hex(0xb2a07e),
-            hex(0xa7adb5),
+            hex(DARK_FOCUS),
+            hex(DARK_INFO),
+            hex(DARK_SUCCESS),
+            hex(DARK_WARNING),
+            hex(0xc4b5fd),
+            hex(0xf9a8d4),
+            hex(0xaaa6ff),
+            hex(0x5eead4),
         ],
     };
     palette[(hash as usize) % palette.len()]

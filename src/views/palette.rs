@@ -41,22 +41,23 @@ pub fn render_palette(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         )
         .child(
             div()
-                .w(px(560.0))
-                .max_h(px(520.0))
-                .bg(bg_surface())
-                .rounded(radius())
+                .w(px(720.0))
+                .max_h(px(640.0))
+                .bg(bg_overlay())
+                .rounded(radius_lg())
                 .border_1()
                 .border_color(border_default())
+                .shadow_sm()
                 .overflow_hidden()
                 .flex()
                 .flex_col()
                 .child(
                     div()
-                        .px(px(20.0))
-                        .py(px(16.0))
+                        .px(px(24.0))
+                        .py(px(20.0))
                         .flex()
                         .flex_col()
-                        .gap(px(12.0))
+                        .gap(px(16.0))
                         .child(
                             div()
                                 .flex()
@@ -75,7 +76,7 @@ pub fn render_palette(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(13.0))
+                                                .text_size(px(14.0))
                                                 .font_weight(FontWeight::SEMIBOLD)
                                                 .text_color(fg_emphasis())
                                                 .child(format!("{APP_NAME} command")),
@@ -92,13 +93,13 @@ pub fn render_palette(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                         )
                         .child(
                             div()
-                                .px(px(14.0))
-                                .py(px(12.0))
-                                .rounded(radius_sm())
+                                .px(px(16.0))
+                                .py(px(14.0))
+                                .rounded(radius())
                                 .border_1()
-                                .border_color(border_default())
-                                .bg(bg_overlay())
-                                .text_size(px(13.0))
+                                .border_color(focus_border())
+                                .bg(bg_surface())
+                                .text_size(px(15.0))
                                 .text_color(if query.is_empty() {
                                     fg_subtle()
                                 } else {
@@ -123,7 +124,7 @@ pub fn render_palette(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                 .child(
                                     div()
                                         .text_size(px(11.0))
-                                        .font_family("Fira Code")
+                                        .font_family(mono_font_family())
                                         .text_color(fg_subtle())
                                         .child(format!("{} matches", filtered.len())),
                                 )
@@ -133,7 +134,7 @@ pub fn render_palette(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                         .gap(px(6.0))
                                         .items_center()
                                         .text_size(px(11.0))
-                                        .font_family("Fira Code")
+                                        .font_family(mono_font_family())
                                         .text_color(fg_subtle())
                                         .child("↑↓ move")
                                         .child("•")
@@ -147,10 +148,10 @@ pub fn render_palette(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                         .flex_col()
                         .id("palette-scroll")
                         .overflow_y_scroll()
-                        .max_h(px(360.0))
+                        .max_h(px(452.0))
                         .child(
                             div()
-                                .px(px(20.0))
+                                .px(px(24.0))
                                 .py(px(10.0))
                                 .text_size(px(11.0))
                                 .text_color(fg_subtle())
@@ -245,21 +246,21 @@ fn palette_item(item: CommandItem, selected: bool, state: Entity<AppState>) -> i
     let label = item.label.clone();
     div()
         .mx(px(8.0))
-        .mb(px(6.0))
-        .px(px(14.0))
-        .py(px(10.0))
+        .mb(px(7.0))
+        .px(px(16.0))
+        .py(px(12.0))
         .rounded(radius_sm())
         .text_size(px(13.0))
         .border_1()
         .border_color(if selected {
-            border_default()
+            focus_border()
         } else {
-            border_muted()
+            transparent()
         })
         .bg(if selected {
             bg_selected()
         } else {
-            bg_surface()
+            bg_overlay()
         })
         .text_color(if selected {
             fg_emphasis()
@@ -267,7 +268,12 @@ fn palette_item(item: CommandItem, selected: bool, state: Entity<AppState>) -> i
             fg_default()
         })
         .cursor_pointer()
-        .hover(|style| style.bg(hover_bg()).text_color(fg_emphasis()))
+        .hover(|style| {
+            style
+                .bg(hover_bg())
+                .border_color(focus_border())
+                .text_color(fg_emphasis())
+        })
         .on_mouse_down(MouseButton::Left, move |_, window, cx| {
             apply_command_action(item.action.clone(), &state, window, cx);
         })
@@ -289,7 +295,7 @@ fn palette_item(item: CommandItem, selected: bool, state: Entity<AppState>) -> i
                     el.child(
                         div()
                             .text_size(px(11.0))
-                            .font_family("Fira Code")
+                            .font_family(mono_font_family())
                             .text_color(fg_subtle())
                             .child("enter"),
                     )

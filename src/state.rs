@@ -73,7 +73,6 @@ fn random_overview_greeting_index() -> usize {
 pub enum PullRequestSurface {
     Overview,
     Files,
-    Tour,
 }
 
 impl PullRequestSurface {
@@ -81,7 +80,6 @@ impl PullRequestSurface {
         match self {
             Self::Overview => "Briefing",
             Self::Files => "Review",
-            Self::Tour => "Tour",
         }
     }
 
@@ -469,11 +467,7 @@ pub struct AppState {
     pub code_tour_provider_loading: bool,
     pub code_tour_provider_error: Option<String>,
     pub automatic_tour_request_keys: std::collections::HashSet<String>,
-    pub active_tour_outline_id: String,
-    pub collapsed_tour_panels: std::collections::HashSet<String>,
     pub settings_scroll_handle: ScrollHandle,
-    pub tour_content_scroll_handle: ScrollHandle,
-    pub tour_content_list_state: ListState,
     pub ai_tour_section_list_state: ListState,
     pub code_tour_settings: CodeTourSettingsState,
     pub managed_lsp_settings: ManagedLspSettingsState,
@@ -554,11 +548,7 @@ impl AppState {
             code_tour_provider_loading: false,
             code_tour_provider_error: None,
             automatic_tour_request_keys: std::collections::HashSet::new(),
-            active_tour_outline_id: "overview".to_string(),
-            collapsed_tour_panels: std::collections::HashSet::new(),
             settings_scroll_handle: ScrollHandle::new(),
-            tour_content_scroll_handle: ScrollHandle::new(),
-            tour_content_list_state: ListState::new(0, ListAlignment::Top, px(600.0)),
             ai_tour_section_list_state: ListState::new(0, ListAlignment::Top, px(720.0)),
             code_tour_settings: CodeTourSettingsState::default(),
             managed_lsp_settings: ManagedLspSettingsState::default(),

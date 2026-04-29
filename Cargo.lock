@@ -3566,6 +3566,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5d563b38d2b97209f8e861173de434bd0214cf020e3423a52624cd1d989f006"
 dependencies = [
  "objc2",
+ "objc2-core-foundation",
+ "objc2-core-video",
  "objc2-foundation",
 ]
 
@@ -4541,6 +4543,8 @@ name = "remiss"
 version = "0.1.0"
 dependencies = [
  "codex-codes",
+ "core-foundation 0.10.0",
+ "core-video",
  "dirs 6.0.0",
  "flate2",
  "giallo",
@@ -4548,6 +4552,9 @@ dependencies = [
  "json5",
  "objc2",
  "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-core-image",
+ "objc2-core-video",
  "objc2-foundation",
  "once_cell",
  "pulldown-cmark",

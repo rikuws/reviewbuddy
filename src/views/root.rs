@@ -298,9 +298,9 @@ fn render_app_sidebar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
         .w(px(sidebar_width))
         .flex_shrink_0()
         .min_h_0()
-        .bg(bg_surface())
+        .bg(bg_overlay())
         .border_r(px(1.0))
-        .border_color(border_default())
+        .border_color(border_muted())
         .child(
             div()
                 .h_full()
@@ -372,8 +372,8 @@ fn render_app_sidebar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                                 .child(
                                                     div()
                                                         .text_size(px(10.0))
-                                                        .font_family("Fira Code")
-                                                        .text_color(ochre())
+                                                        .font_family(mono_font_family())
+                                                        .text_color(focus())
                                                         .text_ellipsis()
                                                         .whitespace_nowrap()
                                                         .overflow_x_hidden()
@@ -442,9 +442,11 @@ fn render_app_sidebar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                     .px(px(8.0))
                                     .py(px(7.0))
                                     .rounded(radius_sm())
-                                    .bg(bg_overlay())
+                                    .bg(bg_surface())
+                                    .border_1()
+                                    .border_color(border_muted())
                                     .text_size(px(11.0))
-                                    .font_family("Fira Code")
+                                    .font_family(mono_font_family())
                                     .text_color(sync_color)
                                     .child(status_label),
                             )
@@ -459,7 +461,7 @@ fn render_app_sidebar(state: &Entity<AppState>, cx: &App) -> impl IntoElement {
                                         div()
                                             .px(px(6.0))
                                             .text_size(px(10.0))
-                                            .font_family("Fira Code")
+                                            .font_family(mono_font_family())
                                             .text_color(fg_subtle())
                                             .child("THEME"),
                                     )
@@ -523,15 +525,15 @@ fn render_workspace_tabs_strip(state: &Entity<AppState>, cx: &App) -> impl IntoE
     div()
         .bg(bg_surface())
         .border_b(px(1.0))
-        .border_color(border_default())
+        .border_color(border_muted())
         .flex_shrink_0()
         .child(
             div()
-                .px(px(8.0))
-                .pt(px(6.0))
+                .px(px(12.0))
+                .py(px(8.0))
                 .flex()
-                .items_end()
-                .gap(px(4.0))
+                .items_center()
+                .gap(px(6.0))
                 .id("workspace-tabs-scroll")
                 .overflow_x_scroll()
                 .min_w_0()
@@ -611,7 +613,7 @@ fn sidebar_nav_button(
         .rounded(radius_sm())
         .border_1()
         .border_color(if active {
-            border_default()
+            focus_border()
         } else {
             transparent()
         })
@@ -621,7 +623,12 @@ fn sidebar_nav_button(
         .justify_between()
         .gap(px(10.0))
         .cursor_pointer()
-        .hover(|style| style.bg(hover_bg()).text_color(fg_emphasis()))
+        .hover(|style| {
+            style
+                .bg(hover_bg())
+                .border_color(focus_border())
+                .text_color(fg_emphasis())
+        })
         .on_mouse_down(MouseButton::Left, on_click)
         .child(
             div()
@@ -653,7 +660,7 @@ fn sidebar_nav_button(
             el.child(
                 div()
                     .text_size(px(11.0))
-                    .font_family("Fira Code")
+                    .font_family(mono_font_family())
                     .text_color(if active { fg_default() } else { fg_subtle() })
                     .child(count.to_string()),
             )
@@ -674,7 +681,7 @@ fn sidebar_theme_button(
         .rounded(radius_sm())
         .border_1()
         .border_color(if active {
-            border_default()
+            focus_border()
         } else {
             border_muted()
         })
@@ -709,7 +716,7 @@ fn sidebar_utility_button(
         } else {
             transparent()
         })
-        .bg(if active { bg_selected() } else { transparent() })
+        .bg(if active { bg_selected() } else { bg_surface() })
         .flex()
         .items_center()
         .justify_center()
@@ -736,7 +743,7 @@ fn sidebar_action_button(
         .rounded(radius_sm())
         .border_1()
         .border_color(border_muted())
-        .bg(bg_overlay())
+        .bg(bg_surface())
         .flex()
         .items_center()
         .justify_center()
@@ -789,22 +796,22 @@ fn pr_tab(
         .gap(px(8.0))
         .px(px(10.0))
         .py(px(5.0))
-        .rounded_t(radius_sm())
+        .rounded(radius_sm())
         .border_1()
         .border_color(if active {
-            border_default()
+            focus_border()
         } else {
             border_muted()
         })
-        .bg(if active { bg_canvas() } else { bg_surface() })
+        .bg(if active { bg_selected() } else { bg_overlay() })
         .text_size(px(11.0))
         .max_w(px(280.0))
         .min_w_0()
         .cursor_pointer()
         .hover(move |style| {
             style
-                .bg(if active { bg_canvas() } else { hover_bg() })
-                .border_color(border_default())
+                .bg(if active { bg_selected() } else { hover_bg() })
+                .border_color(focus_border())
                 .text_color(fg_emphasis())
         })
         .on_mouse_down(MouseButton::Left, on_click)
@@ -828,9 +835,9 @@ fn pr_tab(
                         .px(px(6.0))
                         .py(px(1.0))
                         .rounded(px(999.0))
-                        .bg(if active { bg_surface() } else { bg_emphasis() })
+                        .bg(if active { bg_overlay() } else { bg_emphasis() })
                         .text_size(px(10.0))
-                        .font_family("Fira Code")
+                        .font_family(mono_font_family())
                         .text_color(if active { fg_default() } else { fg_subtle() })
                         .flex_shrink_0()
                         .child(repo_short),
@@ -855,7 +862,7 @@ fn pr_tab_state_dot(pr_state: &str, is_draft: bool) -> Rgba {
     }
 
     match pr_state {
-        "MERGED" => purple(),
+        "MERGED" => info(),
         "CLOSED" => danger(),
         _ => success(),
     }
@@ -869,9 +876,7 @@ fn pr_tab_state_badge(pr_state: &str, is_draft: bool) -> Option<AnyElement> {
     }
 
     match pr_state {
-        "MERGED" => {
-            Some(pr_tab_badge("Merged", purple(), bg_emphasis(), purple()).into_any_element())
-        }
+        "MERGED" => Some(pr_tab_badge("Merged", info(), info_muted(), info()).into_any_element()),
         "CLOSED" => Some(
             pr_tab_badge("Closed", danger(), danger_muted(), diff_remove_border())
                 .into_any_element(),
@@ -880,12 +885,14 @@ fn pr_tab_state_badge(pr_state: &str, is_draft: bool) -> Option<AnyElement> {
     }
 }
 
-fn pr_tab_badge(label: &str, fg: Rgba, bg: Rgba, _border: Rgba) -> impl IntoElement {
+fn pr_tab_badge(label: &str, fg: Rgba, bg: Rgba, border: Rgba) -> impl IntoElement {
     div()
         .px(px(8.0))
         .py(px(2.0))
         .rounded(px(999.0))
         .bg(bg)
+        .border_1()
+        .border_color(border)
         .text_size(px(10.0))
         .font_weight(FontWeight::MEDIUM)
         .text_color(fg)
