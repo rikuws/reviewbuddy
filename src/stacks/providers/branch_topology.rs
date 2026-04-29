@@ -161,9 +161,11 @@ pub fn discover(
             base_oid: pr.base_ref_oid.clone(),
             head_oid: pr.head_ref_oid.clone(),
             atom_ids: Vec::new(),
-            depends_on_layer_ids: (index > 0)
-                .then(|| vec![format!("layer-pr-{}", prs[index - 1].number)])
-                .unwrap_or_default(),
+            depends_on_layer_ids: if index > 0 {
+                vec![format!("layer-pr-{}", prs[index - 1].number)]
+            } else {
+                Vec::new()
+            },
             metrics: LayerMetrics::default(),
             status: LayerReviewStatus::NotReviewed,
             confidence,

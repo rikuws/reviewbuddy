@@ -432,14 +432,27 @@ fn validate_dependency_order(
         };
 
         if from_index > to_index {
-            return Err(AiStackPlanValidationError::new(format!(
-                "AI stack plan orders atom '{}' after dependent atom '{}'.",
-                dependency.from_atom_id, dependency.to_atom_id
-            )));
+            if dependency_is_hard_ordering_constraint(&dependency) {
+                return Err(AiStackPlanValidationError::new(format!(
+                    "AI stack plan orders atom '{}' after dependent atom '{}'.",
+                    dependency.from_atom_id, dependency.to_atom_id
+                )));
+            }
         }
     }
 
     Ok(())
+}
+
+fn dependency_is_hard_ordering_constraint(
+    dependency: &super::dependencies::AtomDependency,
+) -> bool {
+    match dependency.kind {
+        DependencyKind::PathLocality => false,
+        DependencyKind::TestTarget => true,
+        DependencyKind::RoleOrdering => dependency.confidence != Confidence::Low,
+        DependencyKind::SymbolReference => false,
+    }
 }
 
 fn validate_no_tail_dump(
@@ -864,8 +877,10 @@ mod tests {
     #[test]
     fn rejects_dependency_inversions() {
         let mut foundation = atom("atom_model", ChangeRole::Foundation);
+        foundation.path = "src/user.rs".to_string();
         foundation.defined_symbols = vec!["User".to_string()];
         let mut core = atom("atom_service", ChangeRole::CoreLogic);
+        core.path = "src/user.rs".to_string();
         core.referenced_symbols = vec!["User".to_string()];
         let atoms = vec![foundation, core];
         let mut plan = plan_with_layers(vec![vec!["atom_service"], vec!["atom_model"]], vec![]);

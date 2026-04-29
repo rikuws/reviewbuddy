@@ -4,7 +4,7 @@ use crate::{
     cache::CacheStore,
     code_tour::{self, CodeTourSettings},
     github::{self, PullRequestDetail, PullRequestSummary, WorkspaceSnapshot},
-    local_repo,
+    local_repo, review_intelligence,
     state::pr_key,
 };
 
@@ -111,7 +111,9 @@ pub fn sync_workspace_code_tours(
     }
 
     for summary in pull_requests {
-        match ensure_pull_request_code_tour(cache, &summary, settings.provider) {
+        match review_intelligence::run_background_blocking(|| {
+            ensure_pull_request_code_tour(cache, &summary, settings.provider)
+        }) {
             Ok(PullRequestTourState::Generated) => outcome.generated_tours += 1,
             Ok(PullRequestTourState::Cached) => outcome.reused_cached_tours += 1,
             Err(error) => {

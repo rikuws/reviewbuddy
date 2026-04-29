@@ -63,14 +63,42 @@ pub fn load_or_prepare_local_repository_for_pull_request(
     head_ref_oid: Option<&str>,
 ) -> Result<LocalRepositoryStatus, String> {
     let status = resolve_local_repository_status(cache, repository, head_ref_oid)?;
+    if status.source == "linked" && status.ready_for_local_features {
+        return Ok(status);
+    }
+
+    if status.source == "linked" {
+        return load_or_prepare_managed_repository_for_pull_request(
+            cache,
+            repository,
+            pull_request_number,
+            head_ref_oid,
+        );
+    }
+
+    if normalized_expected_head_oid(head_ref_oid).is_some() {
+        return load_or_prepare_managed_repository_for_pull_request(
+            cache,
+            repository,
+            pull_request_number,
+            head_ref_oid,
+        );
+    }
+
     if status.source == "managed" && !status.ready_for_local_features {
-        prepare_local_repository_for_pull_request(
+        let root = prepare_local_repository_for_pull_request(
             cache,
             repository,
             pull_request_number,
             head_ref_oid,
         )?;
-        return resolve_local_repository_status(cache, repository, head_ref_oid);
+        return inspect_repository_candidate(
+            repository,
+            root,
+            "managed".to_string(),
+            Some("Using the app-managed checkout.".to_string()),
+            head_ref_oid,
+        );
     }
 
     Ok(status)
@@ -288,18 +316,24 @@ fn load_or_prepare_managed_repository_for_pull_request(
     pull_request_number: i64,
     head_ref_oid: Option<&str>,
 ) -> Result<LocalRepositoryStatus, String> {
-    let status = inspect_managed_repository_candidate(repository, head_ref_oid)?;
+    let status = inspect_managed_worktree_candidate(repository, pull_request_number, head_ref_oid)?;
     if status.ready_for_local_features {
         return Ok(status);
     }
 
-    prepare_local_repository_for_pull_request(
+    let root = prepare_local_repository_for_pull_request(
         cache,
         repository,
         pull_request_number,
         head_ref_oid,
     )?;
-    inspect_managed_repository_candidate(repository, head_ref_oid)
+    inspect_repository_candidate(
+        repository,
+        root,
+        "managed".to_string(),
+        Some("Using the app-managed checkout.".to_string()),
+        head_ref_oid,
+    )
 }
 
 fn inspect_managed_repository_candidate(
@@ -307,6 +341,23 @@ fn inspect_managed_repository_candidate(
     expected_head_oid: Option<&str>,
 ) -> Result<LocalRepositoryStatus, String> {
     let managed_path = managed_repository_path(repository)?;
+
+    inspect_repository_candidate(
+        repository,
+        managed_path,
+        "managed".to_string(),
+        Some("Using the app-managed checkout.".to_string()),
+        expected_head_oid,
+    )
+}
+
+fn inspect_managed_worktree_candidate(
+    repository: &str,
+    pull_request_number: i64,
+    expected_head_oid: Option<&str>,
+) -> Result<LocalRepositoryStatus, String> {
+    let managed_path =
+        managed_repository_worktree_path(repository, pull_request_number, expected_head_oid)?;
 
     inspect_repository_candidate(
         repository,
@@ -379,8 +430,126 @@ fn ensure_managed_repository_for_pull_request(
     head_ref_oid: Option<&str>,
 ) -> Result<PathBuf, String> {
     let root = ensure_managed_repository(repository)?;
+    if normalized_expected_head_oid(head_ref_oid).is_some() {
+        let status =
+            inspect_managed_worktree_candidate(repository, pull_request_number, head_ref_oid)?;
+        if status.ready_for_local_features {
+            if let Some(path) = status.path {
+                return Ok(PathBuf::from(path));
+            }
+        }
+    }
+
     sync_managed_repository_to_pull_request(&root, repository, pull_request_number, head_ref_oid)?;
-    Ok(root)
+    ensure_managed_worktree_for_pull_request(&root, repository, pull_request_number, head_ref_oid)
+}
+
+fn ensure_managed_worktree_for_pull_request(
+    base_root: &Path,
+    repository: &str,
+    pull_request_number: i64,
+    head_ref_oid: Option<&str>,
+) -> Result<PathBuf, String> {
+    let expected_head = normalized_expected_head_oid(head_ref_oid);
+    let worktree_path = managed_repository_worktree_path(
+        repository,
+        pull_request_number,
+        expected_head.as_deref(),
+    )?;
+
+    if worktree_path.exists() {
+        let status = inspect_repository_candidate(
+            repository,
+            worktree_path.clone(),
+            "managed".to_string(),
+            Some("Using the app-managed checkout.".to_string()),
+            expected_head.as_deref(),
+        )?;
+        if expected_head.is_some() && status.ready_for_local_features {
+            return Ok(PathBuf::from(
+                status
+                    .path
+                    .unwrap_or_else(|| worktree_path.display().to_string()),
+            ));
+        }
+
+        remove_managed_worktree(base_root, &worktree_path)?;
+    }
+
+    if let Some(parent) = worktree_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!("Failed to create the app-managed worktree folder in app storage: {error}")
+        })?;
+    }
+
+    let target_ref = expected_head
+        .clone()
+        .or_else(|| current_head_oid(base_root).ok().flatten())
+        .ok_or_else(|| {
+            "The app-managed checkout could not resolve the pull request head commit.".to_string()
+        })?;
+
+    let output = run_git(
+        base_root,
+        vec![
+            "worktree".to_string(),
+            "add".to_string(),
+            "--force".to_string(),
+            "--detach".to_string(),
+            worktree_path.display().to_string(),
+            target_ref.clone(),
+        ],
+    )?;
+
+    if output.exit_code != Some(0) {
+        return Err(combine_process_error(
+            output,
+            &format!(
+                "Failed to create the app-managed worktree for pull request #{pull_request_number} in {repository}"
+            ),
+        ));
+    }
+
+    let status = inspect_repository_candidate(
+        repository,
+        worktree_path.clone(),
+        "managed".to_string(),
+        Some("Using the app-managed checkout.".to_string()),
+        expected_head.as_deref(),
+    )?;
+    if status.ready_for_local_features {
+        Ok(PathBuf::from(
+            status
+                .path
+                .unwrap_or_else(|| worktree_path.display().to_string()),
+        ))
+    } else {
+        Err(status.message)
+    }
+}
+
+fn remove_managed_worktree(base_root: &Path, worktree_path: &Path) -> Result<(), String> {
+    let _ = run_git(
+        base_root,
+        vec![
+            "worktree".to_string(),
+            "remove".to_string(),
+            "--force".to_string(),
+            worktree_path.display().to_string(),
+        ],
+    );
+
+    if worktree_path.exists() {
+        fs::remove_dir_all(worktree_path).map_err(|error| {
+            format!(
+                "Failed to remove stale app-managed worktree '{}': {error}",
+                worktree_path.display()
+            )
+        })?;
+    }
+
+    let _ = run_git(base_root, ["worktree", "prune"]);
+    Ok(())
 }
 
 fn sync_managed_repository_to_pull_request(
@@ -520,6 +689,18 @@ fn managed_repository_path(repository: &str) -> Result<PathBuf, String> {
     )
 }
 
+fn managed_repository_worktree_path(
+    repository: &str,
+    pull_request_number: i64,
+    head_ref_oid: Option<&str>,
+) -> Result<PathBuf, String> {
+    let repository_dir = managed_repository_directory_name(repository);
+    let head = managed_worktree_head_component(head_ref_oid);
+    Ok(app_storage::managed_repositories_root()
+        .join(format!("{repository_dir}__worktrees"))
+        .join(format!("pr-{pull_request_number}-{head}")))
+}
+
 fn managed_repository_directory_name(repository: &str) -> String {
     let mut result = String::new();
 
@@ -534,6 +715,29 @@ fn managed_repository_directory_name(repository: &str) -> String {
 
     if result.is_empty() {
         "repository".to_string()
+    } else {
+        result
+    }
+}
+
+fn managed_worktree_head_component(head_ref_oid: Option<&str>) -> String {
+    let mut result = String::new();
+    for character in head_ref_oid
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .chars()
+        .take(16)
+    {
+        match character {
+            'a'..='z' | '0'..='9' => result.push(character),
+            'A'..='Z' => result.push(character.to_ascii_lowercase()),
+            _ => result.push('-'),
+        }
+    }
+
+    if result.is_empty() {
+        "unknown".to_string()
     } else {
         result
     }
@@ -602,7 +806,7 @@ mod tests {
     use super::{
         ensure_local_repository_for_pull_request, load_local_repository_status_for_pull_request,
         local_repo_link_key, managed_repository_directory_name, managed_repository_path,
-        normalized_remote_repository, LocalRepositoryLink,
+        managed_repository_worktree_path, normalized_remote_repository, LocalRepositoryLink,
     };
 
     static NEXT_TEST_ID: AtomicUsize = AtomicUsize::new(0);
@@ -854,6 +1058,56 @@ mod tests {
     }
 
     #[test]
+    fn ensure_local_repository_uses_clean_linked_checkout_at_expected_head() {
+        let repository = GitTestRepository::new("openai/example");
+        repository.write_file("src/lib.rs", "pub fn value() -> i32 { 1 }\n");
+        let head = repository.commit_all("initial");
+
+        let cache =
+            CacheStore::new(unique_test_directory("local-repo-cache").join("cache.sqlite3"))
+                .expect("failed to create cache");
+        cache
+            .put(
+                &local_repo_link_key("openai/example"),
+                &LocalRepositoryLink {
+                    path: repository.root.display().to_string(),
+                },
+                0,
+            )
+            .expect("failed to write link");
+
+        let status =
+            ensure_local_repository_for_pull_request(&cache, "openai/example", 42, Some(&head))
+                .expect("failed to ensure repository");
+
+        assert_eq!(status.source, "linked");
+        assert!(status.ready_for_local_features);
+        assert_eq!(
+            PathBuf::from(status.path.expect("status path"))
+                .canonicalize()
+                .expect("canonical status path"),
+            repository
+                .root
+                .canonicalize()
+                .expect("canonical repository path")
+        );
+    }
+
+    #[test]
+    fn managed_worktree_paths_vary_by_pull_request_head() {
+        let first =
+            managed_repository_worktree_path("openai/example", 42, Some("aaaaaaaaaaaaaaaaaaaa"))
+                .expect("first path");
+        let second =
+            managed_repository_worktree_path("openai/example", 42, Some("bbbbbbbbbbbbbbbbbbbb"))
+                .expect("second path");
+
+        assert_ne!(first, second);
+        assert!(first.to_string_lossy().contains("pr-42-aaaaaaaaaaaaaaaa"));
+        assert!(second.to_string_lossy().contains("pr-42-bbbbbbbbbbbbbbbb"));
+    }
+
+    #[test]
     fn ensure_local_repository_falls_back_to_managed_checkout_when_linked_repo_is_dirty() {
         let repository_name = format!(
             "openai/example-fallback-{}",
@@ -888,9 +1142,18 @@ mod tests {
         assert_eq!(status.current_head_oid.as_deref(), Some(head.as_str()));
         assert_eq!(
             status.path.as_deref(),
-            Some(managed_path.to_string_lossy().as_ref())
+            Some(
+                managed_repository_worktree_path(&repository_name, 42, Some(&head))
+                    .expect("worktree path")
+                    .to_string_lossy()
+                    .as_ref()
+            )
         );
 
+        let _ = fs::remove_dir_all(
+            managed_repository_worktree_path(&repository_name, 42, Some(&head))
+                .expect("worktree path"),
+        );
         let _ = fs::remove_dir_all(managed_path);
     }
 }

@@ -111,9 +111,11 @@ pub fn discover(
             base_oid: Some(base_oid.to_string()),
             head_oid: Some(commit.oid.clone()),
             atom_ids: layer_atoms.iter().map(|atom| atom.id.clone()).collect(),
-            depends_on_layer_ids: (index > 0)
-                .then(|| vec![layers[index - 1].id.clone()])
-                .unwrap_or_default(),
+            depends_on_layer_ids: if index > 0 {
+                vec![layers[index - 1].id.clone()]
+            } else {
+                Vec::new()
+            },
             metrics,
             status: LayerReviewStatus::NotReviewed,
             confidence: Confidence::Medium,
@@ -362,7 +364,7 @@ pub fn score_commit_suitability(
         .iter()
         .filter(|commit| {
             let ratio = commit.changed_lines as f32 / total_changed_lines as f32;
-            ratio >= 0.05 && ratio <= 0.45
+            (0.05..=0.45).contains(&ratio)
         })
         .count();
     if balanced_commit_count * 3 >= commit_count.saturating_mul(2).max(1) {

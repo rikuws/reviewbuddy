@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sha1::{Digest, Sha1};
 
 use crate::{
     agents::{self, jsonrepair::parse_tolerant, prompt::build_stack_planning_prompt},
+    app_storage,
     code_tour::CodeTourProvider,
     github::PullRequestDetail,
 };
@@ -20,7 +21,7 @@ use super::super::{
     },
     validation::{
         atom_is_substantive, atom_noise_kind, requires_manual_review, validate_ai_stack_plan,
-        AiReviewPriority, AiStackPlan, AiStackPlanLayer, AiStackPlanStrategy, ValidatedAiStackPlan,
+        AiReviewPriority, AiStackPlan, AiStackPlanLayer, ValidatedAiStackPlan,
     },
 };
 
@@ -109,16 +110,36 @@ pub fn discover(
     let response = match agents::run_json_prompt(
         provider,
         working_directory.to_string_lossy().as_ref(),
-        prompt,
+        prompt.clone(),
     ) {
         Ok(response) => response,
         Err(error) => {
+            let diagnostic_log_path = write_ai_stack_diagnostic_log(AiStackDiagnosticLogInput {
+                selected_pr,
+                provider,
+                stage: "provider_error",
+                working_directory: working_directory.to_string_lossy().as_ref(),
+                input_json: &input_json,
+                prompt: &prompt,
+                response_text: None,
+                model: None,
+                parse_error: None,
+                validation_error: None,
+                parsed_plan: None,
+                extracted_plan_value: None,
+                normalized_plan_value: None,
+                provider_error: Some(&error),
+            });
             return ai_unavailable_stack(
                 selected_pr,
-                "AI stack planning was unavailable. Remiss did not generate a non-AI stack.",
+                &format!(
+                    "AI stack planning was unavailable.{} Remiss did not generate a non-AI stack.",
+                    diagnostic_log_suffix(diagnostic_log_path.as_deref())
+                ),
                 Some(json!({
                     "provider": provider.slug(),
                     "error": error,
+                    "diagnosticLogPath": diagnostic_log_path,
                     "commitSuitability": commit_context.suitability,
                 })),
             )
@@ -126,33 +147,76 @@ pub fn discover(
         }
     };
 
-    let plan = match parse_tolerant::<AiStackPlan>(&response.text) {
-        Ok(plan) => plan,
+    let parse_result = match parse_ai_stack_plan_response(&response.text) {
+        Ok(result) => result,
         Err(error) => {
+            let diagnostic_log_path = write_ai_stack_diagnostic_log(AiStackDiagnosticLogInput {
+                selected_pr,
+                provider,
+                stage: "parse_error",
+                working_directory: working_directory.to_string_lossy().as_ref(),
+                input_json: &input_json,
+                prompt: &prompt,
+                response_text: Some(&response.text),
+                model: response.model.as_deref(),
+                parse_error: Some(&error),
+                validation_error: None,
+                parsed_plan: None,
+                extracted_plan_value: error.extracted_plan_value.as_ref(),
+                normalized_plan_value: error.normalized_plan_value.as_ref(),
+                provider_error: None,
+            });
             return ai_unavailable_stack(
                 selected_pr,
-                "AI stack planning returned invalid output. Remiss did not generate a non-AI stack.",
+                &format!(
+                    "AI stack planning returned invalid output: {}.{} Remiss did not generate a non-AI stack.",
+                    error.message,
+                    diagnostic_log_suffix(diagnostic_log_path.as_deref())
+                ),
                 Some(json!({
                     "provider": provider.slug(),
                     "modelOrAgent": response.model,
                     "error": error.message,
+                    "diagnosticLogPath": diagnostic_log_path,
                     "commitSuitability": commit_context.suitability,
                 })),
             )
             .map(Some);
         }
     };
+    let plan = parse_result.plan.clone();
 
     let validated = match validate_ai_stack_plan(&plan, &atoms, total_changed_lines) {
         Ok(validated) => validated,
         Err(error) => {
+            let diagnostic_log_path = write_ai_stack_diagnostic_log(AiStackDiagnosticLogInput {
+                selected_pr,
+                provider,
+                stage: "validation_error",
+                working_directory: working_directory.to_string_lossy().as_ref(),
+                input_json: &input_json,
+                prompt: &prompt,
+                response_text: Some(&response.text),
+                model: response.model.as_deref(),
+                parse_error: None,
+                validation_error: Some(&error.message),
+                parsed_plan: Some(&plan),
+                extracted_plan_value: Some(&parse_result.extracted_plan_value),
+                normalized_plan_value: Some(&parse_result.normalized_plan_value),
+                provider_error: None,
+            });
             return ai_unavailable_stack(
                 selected_pr,
-                "AI stack planning returned invalid output. Remiss did not generate a non-AI stack.",
+                &format!(
+                    "AI stack planning returned invalid output: {}.{} Remiss did not generate a non-AI stack.",
+                    error.message,
+                    diagnostic_log_suffix(diagnostic_log_path.as_deref())
+                ),
                 Some(json!({
                     "provider": provider.slug(),
                     "modelOrAgent": response.model,
                     "validationError": error.message,
+                    "diagnosticLogPath": diagnostic_log_path,
                     "commitSuitability": commit_context.suitability,
                 })),
             )
@@ -176,6 +240,396 @@ pub fn should_attempt_ai_planning(
     _commit_suitability: &CommitSuitability,
 ) -> bool {
     !atoms.is_empty()
+}
+
+#[derive(Debug)]
+struct AiStackPlanParseResult {
+    plan: AiStackPlan,
+    extracted_plan_value: Value,
+    normalized_plan_value: Value,
+}
+
+#[derive(Debug)]
+struct AiStackPlanParseError {
+    message: String,
+    extracted_plan_value: Option<Value>,
+    normalized_plan_value: Option<Value>,
+}
+
+fn parse_ai_stack_plan_response(
+    raw: &str,
+) -> Result<AiStackPlanParseResult, AiStackPlanParseError> {
+    let value = parse_tolerant::<Value>(raw).map_err(|error| AiStackPlanParseError {
+        message: error.message,
+        extracted_plan_value: None,
+        normalized_plan_value: None,
+    })?;
+    let mut plan_value =
+        extract_ai_stack_plan_value(value).ok_or_else(|| AiStackPlanParseError {
+            message: "The response did not contain a stack plan object with layers.".to_string(),
+            extracted_plan_value: None,
+            normalized_plan_value: None,
+        })?;
+
+    let extracted_plan_value = plan_value.clone();
+    normalize_ai_stack_plan_value(&mut plan_value);
+    let normalized_plan_value = plan_value.clone();
+    match serde_json::from_value::<AiStackPlan>(plan_value) {
+        Ok(plan) => Ok(AiStackPlanParseResult {
+            plan,
+            extracted_plan_value,
+            normalized_plan_value,
+        }),
+        Err(error) => Err(AiStackPlanParseError {
+            message: format!("The stack plan did not match the expected schema: {error}"),
+            extracted_plan_value: Some(extracted_plan_value),
+            normalized_plan_value: Some(normalized_plan_value),
+        }),
+    }
+}
+
+fn extract_ai_stack_plan_value(value: Value) -> Option<Value> {
+    if value_has_layers(&value) {
+        return Some(value);
+    }
+
+    let object = value.as_object()?;
+    for key in [
+        "plan",
+        "stack_plan",
+        "stackPlan",
+        "review_stack_plan",
+        "reviewStackPlan",
+        "review_stack",
+        "reviewStack",
+        "result",
+        "response",
+        "output",
+        "data",
+    ] {
+        let Some(candidate) = object.get(key) else {
+            continue;
+        };
+        if value_has_layers(candidate) {
+            return Some(candidate.clone());
+        }
+        if let Some(text) = candidate.as_str() {
+            if let Ok(parsed) = parse_tolerant::<Value>(text) {
+                if value_has_layers(&parsed) {
+                    return Some(parsed);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn value_has_layers(value: &Value) -> bool {
+    value
+        .as_object()
+        .map(|object| {
+            object.contains_key("layers")
+                || object.contains_key("Layers")
+                || object.contains_key("reviewLayers")
+                || object.contains_key("review_layers")
+                || object.contains_key("stackLayers")
+                || object.contains_key("stack_layers")
+        })
+        .unwrap_or(false)
+}
+
+fn normalize_ai_stack_plan_value(value: &mut Value) {
+    normalize_object_keys_to_snake_case(value);
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    alias_field(object, "review_layers", "layers");
+    alias_field(object, "stack_layers", "layers");
+    object
+        .entry("strategy")
+        .or_insert_with(|| Value::String("semantic_virtual_stack".to_string()));
+    object
+        .entry("confidence")
+        .or_insert_with(|| Value::String("medium".to_string()));
+    object.entry("rationale").or_insert_with(|| {
+        Value::String("AI grouped pull request atoms into review layers.".to_string())
+    });
+    object
+        .entry("manual_review_atom_ids")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    object
+        .entry("warnings")
+        .or_insert_with(|| Value::Array(Vec::new()));
+
+    normalize_enum_field(object, "strategy");
+    normalize_enum_field(object, "confidence");
+    normalize_atom_id_array_field(object, "manual_review_atom_ids");
+
+    if let Some(layers) = object.get_mut("layers").and_then(Value::as_array_mut) {
+        for (index, layer) in layers.iter_mut().enumerate() {
+            normalize_ai_stack_layer_value(layer, index);
+        }
+    }
+}
+
+fn normalize_ai_stack_layer_value(value: &mut Value, index: usize) {
+    normalize_object_keys_to_snake_case(value);
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+
+    alias_field(object, "depends_on", "depends_on_layer_indexes");
+    alias_field(object, "dependencies", "depends_on_layer_indexes");
+    alias_field(object, "atoms", "atom_ids");
+    object
+        .entry("title")
+        .or_insert_with(|| Value::String(format!("Review layer {}", index + 1)));
+    object.entry("review_question").or_insert_with(|| {
+        Value::String("Does this layer answer one coherent review question?".to_string())
+    });
+    object
+        .entry("summary")
+        .or_insert_with(|| Value::String("Review this coherent layer of changes.".to_string()));
+    object
+        .entry("rationale")
+        .or_insert_with(|| Value::String("Grouped together by the AI stack planner.".to_string()));
+    object
+        .entry("substantive_atom_ids")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    object
+        .entry("attached_noise_atom_ids")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    object
+        .entry("atom_ids")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    object
+        .entry("depends_on_layer_indexes")
+        .or_insert_with(|| Value::Array(Vec::new()));
+    object
+        .entry("confidence")
+        .or_insert_with(|| Value::String("medium".to_string()));
+    object
+        .entry("review_priority")
+        .or_insert_with(|| Value::String("normal".to_string()));
+
+    normalize_enum_field(object, "confidence");
+    normalize_enum_field(object, "review_priority");
+    normalize_atom_id_array_field(object, "substantive_atom_ids");
+    normalize_atom_id_array_field(object, "attached_noise_atom_ids");
+    normalize_atom_id_array_field(object, "atom_ids");
+}
+
+fn normalize_object_keys_to_snake_case(value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            let previous = std::mem::take(object);
+            for (key, mut nested) in previous {
+                normalize_object_keys_to_snake_case(&mut nested);
+                object.insert(to_snake_case_key(&key), nested);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_object_keys_to_snake_case(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn alias_field(object: &mut Map<String, Value>, from: &str, to: &str) {
+    if object.contains_key(to) {
+        return;
+    }
+    if let Some(value) = object.remove(from) {
+        object.insert(to.to_string(), value);
+    }
+}
+
+fn normalize_enum_field(object: &mut Map<String, Value>, key: &str) {
+    let Some(value) = object.get_mut(key) else {
+        return;
+    };
+    if let Some(text) = value.as_str() {
+        *value = Value::String(normalize_enum_token(text));
+    }
+}
+
+fn normalize_atom_id_array_field(object: &mut Map<String, Value>, key: &str) {
+    let Some(value) = object.get_mut(key) else {
+        return;
+    };
+    let Some(items) = value.as_array_mut() else {
+        return;
+    };
+
+    for item in items {
+        if item.is_string() {
+            continue;
+        }
+        if let Some(id) = item
+            .as_object()
+            .and_then(|object| object.get("id").or_else(|| object.get("atom_id")))
+            .and_then(Value::as_str)
+        {
+            *item = Value::String(id.to_string());
+        }
+    }
+}
+
+fn to_snake_case_key(value: &str) -> String {
+    let mut output = String::new();
+    let mut previous_was_separator = false;
+    for (index, character) in value.chars().enumerate() {
+        if matches!(character, '-' | ' ' | '.') {
+            if !output.is_empty() && !previous_was_separator {
+                output.push('_');
+                previous_was_separator = true;
+            }
+            continue;
+        }
+
+        if character.is_ascii_uppercase() {
+            if index > 0 && !previous_was_separator {
+                output.push('_');
+            }
+            output.push(character.to_ascii_lowercase());
+            previous_was_separator = false;
+        } else {
+            output.push(character);
+            previous_was_separator = character == '_';
+        }
+    }
+    output.trim_matches('_').to_string()
+}
+
+fn normalize_enum_token(value: &str) -> String {
+    to_snake_case_key(value.trim().trim_matches('"').trim())
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+struct AiStackDiagnosticLogInput<'a> {
+    selected_pr: &'a PullRequestDetail,
+    provider: CodeTourProvider,
+    stage: &'a str,
+    working_directory: &'a str,
+    input_json: &'a Value,
+    prompt: &'a str,
+    response_text: Option<&'a str>,
+    model: Option<&'a str>,
+    parse_error: Option<&'a AiStackPlanParseError>,
+    validation_error: Option<&'a str>,
+    parsed_plan: Option<&'a AiStackPlan>,
+    extracted_plan_value: Option<&'a Value>,
+    normalized_plan_value: Option<&'a Value>,
+    provider_error: Option<&'a str>,
+}
+
+fn write_ai_stack_diagnostic_log(input: AiStackDiagnosticLogInput<'_>) -> Option<String> {
+    let timestamp_ms = stack_now_ms();
+    let log_dir = app_storage::data_dir_root().join("ai-stack-logs");
+    if let Err(error) = std::fs::create_dir_all(&log_dir) {
+        eprintln!(
+            "Failed to create AI stack diagnostic log directory '{}': {error}",
+            log_dir.display()
+        );
+        return None;
+    }
+
+    let file_name = format!(
+        "{}-{}-pr-{}-{}.json",
+        timestamp_ms,
+        sanitize_log_path_component(&input.selected_pr.repository),
+        input.selected_pr.number,
+        input.provider.slug()
+    );
+    let path = log_dir.join(file_name);
+    let parse_error = input.parse_error.map(|error| {
+        json!({
+            "message": error.message,
+            "extractedPlanAvailable": error.extracted_plan_value.is_some(),
+            "normalizedPlanAvailable": error.normalized_plan_value.is_some(),
+        })
+    });
+    let log = json!({
+        "timestampMs": timestamp_ms,
+        "stage": input.stage,
+        "repository": input.selected_pr.repository,
+        "prNumber": input.selected_pr.number,
+        "headRefOid": input.selected_pr.head_ref_oid,
+        "provider": input.provider.slug(),
+        "workingDirectory": input.working_directory,
+        "modelOrAgent": input.model,
+        "providerError": input.provider_error,
+        "parseError": parse_error,
+        "validationError": input.validation_error,
+        "promptBytes": input.prompt.len(),
+        "rawResponseBytes": input.response_text.map(str::len),
+        "input": input.input_json,
+        "prompt": input.prompt,
+        "rawResponse": input.response_text,
+        "extractedPlan": input.extracted_plan_value,
+        "normalizedPlan": input.normalized_plan_value,
+        "parsedPlan": input.parsed_plan,
+    });
+
+    let serialized = match serde_json::to_string_pretty(&log) {
+        Ok(serialized) => serialized,
+        Err(error) => {
+            eprintln!("Failed to serialize AI stack diagnostic log: {error}");
+            return None;
+        }
+    };
+
+    if let Err(error) = std::fs::write(&path, serialized) {
+        eprintln!(
+            "Failed to write AI stack diagnostic log '{}': {error}",
+            path.display()
+        );
+        return None;
+    }
+
+    let path = path.display().to_string();
+    eprintln!("AI stack diagnostic log written: {path}");
+    Some(path)
+}
+
+fn diagnostic_log_suffix(path: Option<&str>) -> String {
+    path.map(|path| format!(" Diagnostic log: {path}."))
+        .unwrap_or_default()
+}
+
+fn sanitize_log_path_component(value: &str) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        "unknown".to_string()
+    } else {
+        sanitized.chars().take(80).collect()
+    }
 }
 
 pub fn build_stack_from_validated_plan(
@@ -808,7 +1262,7 @@ mod tests {
         github::{PullRequestDataCompleteness, PullRequestFile},
         stacks::{
             model::{LineRange, StackWarning},
-            validation::AiStackPlan,
+            validation::{AiStackPlan, AiStackPlanStrategy},
         },
     };
 
@@ -899,6 +1353,63 @@ mod tests {
                 .len(),
             stack.atoms.len()
         );
+    }
+
+    #[test]
+    fn parses_wrapped_camel_case_stack_plan() {
+        let raw = r#"{
+            "plan": {
+                "strategy": "Dependency Chain",
+                "confidence": "Medium",
+                "rationale": "Group by review dependencies.",
+                "reviewLayers": [
+                    {
+                        "title": "Introduce the contract",
+                        "reviewQuestion": "Does the contract support the later behavior?",
+                        "summary": "Foundation changes.",
+                        "rationale": "Later layers use this contract.",
+                        "atomIds": [{"id": "atom_1"}],
+                        "dependsOnLayerIndexes": [],
+                        "reviewPriority": "Start Here"
+                    }
+                ],
+                "manualReviewAtomIds": [],
+                "warnings": []
+            }
+        }"#;
+
+        let plan = parse_ai_stack_plan_response(raw)
+            .expect("plan should parse")
+            .plan;
+
+        assert_eq!(plan.strategy, AiStackPlanStrategy::DependencyChain);
+        assert_eq!(plan.confidence, Confidence::Medium);
+        assert_eq!(plan.layers.len(), 1);
+        assert_eq!(plan.layers[0].review_priority, AiReviewPriority::StartHere);
+        assert_eq!(plan.layers[0].atom_ids, vec!["atom_1".to_string()]);
+    }
+
+    #[test]
+    fn defaults_nonessential_stack_plan_metadata() {
+        let raw = r#"{
+            "layers": [
+                {
+                    "title": "Build core behavior",
+                    "summary": "Core behavior changes.",
+                    "rationale": "This is the central review layer.",
+                    "atom_ids": ["atom_1"]
+                }
+            ]
+        }"#;
+
+        let plan = parse_ai_stack_plan_response(raw)
+            .expect("plan should parse")
+            .plan;
+
+        assert_eq!(plan.strategy, AiStackPlanStrategy::SemanticVirtualStack);
+        assert_eq!(plan.confidence, Confidence::Medium);
+        assert_eq!(plan.layers[0].confidence, Confidence::Medium);
+        assert_eq!(plan.layers[0].review_priority, AiReviewPriority::Normal);
     }
 
     #[test]

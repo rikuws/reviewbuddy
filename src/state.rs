@@ -102,6 +102,9 @@ pub struct DetailState {
     pub local_repository_status: Option<LocalRepositoryStatus>,
     pub local_repository_loading: bool,
     pub local_repository_error: Option<String>,
+    pub review_intelligence_request_key: Option<String>,
+    pub review_intelligence_loading: bool,
+    pub ai_stack_state: AiStackState,
     pub tour_states: std::collections::HashMap<CodeTourProvider, CodeTourState>,
     pub file_content_states: std::collections::HashMap<String, FileContentState>,
     pub lsp_statuses: std::collections::HashMap<String, LspServerStatus>,
@@ -127,6 +130,9 @@ impl Default for DetailState {
             local_repository_status: None,
             local_repository_loading: false,
             local_repository_error: None,
+            review_intelligence_request_key: None,
+            review_intelligence_loading: false,
+            ai_stack_state: AiStackState::default(),
             tour_states: std::collections::HashMap::new(),
             file_content_states: std::collections::HashMap::new(),
             lsp_statuses: std::collections::HashMap::new(),
@@ -140,6 +146,31 @@ impl Default for DetailState {
             stack_open_pull_requests: None,
             stack_open_pull_requests_loading: false,
             stack_open_pull_requests_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct AiStackState {
+    pub request_key: Option<String>,
+    pub stack: Option<Arc<ReviewStack>>,
+    pub loading: bool,
+    pub generating: bool,
+    pub error: Option<String>,
+    pub message: Option<String>,
+    pub success: bool,
+}
+
+impl Default for AiStackState {
+    fn default() -> Self {
+        Self {
+            request_key: None,
+            stack: None,
+            loading: false,
+            generating: false,
+            error: None,
+            message: None,
+            success: false,
         }
     }
 }

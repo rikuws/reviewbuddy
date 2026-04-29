@@ -1,4 +1,4 @@
-mod ai_tour;
+pub(crate) mod ai_tour;
 pub(crate) mod diff_view;
 mod palette;
 mod pr_detail;

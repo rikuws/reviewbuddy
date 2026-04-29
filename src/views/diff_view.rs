@@ -45,17 +45,15 @@ use crate::review_session::{
 use crate::selectable_text::{AppTextFieldKind, AppTextInput, SelectableText};
 use crate::semantic_diff::{build_semantic_diff_file, SemanticDiffFile, SemanticDiffSection};
 use crate::source_browser::render_source_browser;
-use crate::stacks::{
-    discover_review_stack,
-    model::{
-        ChangeAtomId, Confidence, LayerDiffFilter, RepoContext, ReviewStack, ReviewStackLayer,
-        StackDiffMode, StackDiscoveryOptions,
-    },
+use crate::stacks::model::{
+    ChangeAtomId, Confidence, LayerDiffFilter, LayerMetrics, LayerReviewStatus, ReviewStack,
+    ReviewStackLayer, StackDiffMode, StackKind, StackSource, StackWarning, VirtualLayerRef,
+    STACK_GENERATOR_VERSION,
 };
 use crate::state::*;
 use crate::syntax::{self, SyntaxSpan};
 use crate::theme::*;
-use crate::{github, notifications};
+use crate::{github, notifications, review_intelligence};
 
 use super::ai_tour::{refresh_active_tour, trigger_generate_tour};
 use super::sections::{
@@ -80,6 +78,13 @@ pub fn enter_files_surface(state: &Entity<AppState>, window: &mut Window, cx: &m
 
     ensure_active_review_focus_loaded(state, window, cx);
     ensure_active_stack_refs_loaded(state, window, cx);
+    review_intelligence::trigger_review_intelligence(
+        state,
+        window,
+        cx,
+        review_intelligence::ReviewIntelligenceScope::All,
+        false,
+    );
 }
 
 pub fn open_review_diff_location(
@@ -905,143 +910,109 @@ fn review_cache_key(active_pr_key: Option<&str>, scope: &str) -> String {
 }
 
 fn prepare_review_stack(app_state: &AppState, detail: &PullRequestDetail) -> Arc<ReviewStack> {
-    let cache_key = review_cache_key(app_state.active_pr_key.as_deref(), "review-stack");
-    let revision = format!(
-        "{}:{}:{}:{}:{}",
-        detail.updated_at,
-        detail.base_ref_oid.as_deref().unwrap_or_default(),
-        detail.head_ref_oid.as_deref().unwrap_or_default(),
-        local_stack_revision(app_state),
-        ai_stack_revision(app_state)
-    );
-    let open_pr_revision = stack_open_pr_revision(app_state);
-
-    if let Some(cached) = app_state
-        .review_stack_cache
-        .borrow()
-        .get(&cache_key)
-        .filter(|cached| cached.revision == revision && cached.open_pr_revision == open_pr_revision)
-        .cloned()
+    if let Some(stack) = app_state
+        .active_detail_state()
+        .and_then(|detail_state| detail_state.ai_stack_state.stack.clone())
     {
-        return cached.stack;
+        return stack;
     }
 
-    let repo_context = build_repo_context(app_state, detail);
-    let mut options = StackDiscoveryOptions::default();
-    options.enable_github_native = false;
-    options.enable_branch_topology = false;
-    options.enable_local_metadata = false;
-    options.enable_ai_virtual = true;
-    options.enable_virtual_commits = false;
-    options.enable_virtual_semantic = false;
-    options.ai_provider = Some(app_state.selected_tour_provider());
-    let stack = discover_review_stack(detail, &repo_context, options)
-        .unwrap_or_else(|error| ai_stack_for_error(detail, error.message));
-    let stack = Arc::new(stack);
-    app_state.review_stack_cache.borrow_mut().insert(
-        cache_key,
-        CachedReviewStack {
-            revision,
-            open_pr_revision,
-            stack: stack.clone(),
-        },
-    );
-    stack
-}
-
-fn ai_stack_revision(app_state: &AppState) -> String {
-    let provider_status = app_state
-        .selected_tour_provider_status()
-        .map(|status| {
-            format!(
-                "{}:{}:{}",
-                status.available, status.authenticated, status.message
-            )
-        })
-        .unwrap_or_else(|| "status:unknown".to_string());
-    format!(
-        "ai-only:{}:{}:{}",
-        app_state.selected_tour_provider().slug(),
-        app_state.code_tour_provider_statuses_loaded,
-        provider_status
-    )
-}
-
-fn stack_open_pr_revision(app_state: &AppState) -> usize {
-    app_state
+    let ai_stack_state = app_state
         .active_detail_state()
-        .and_then(|detail_state| detail_state.stack_open_pull_requests.as_ref())
-        .map(|open_prs| {
-            open_prs.iter().fold(open_prs.len(), |acc, pr| {
-                acc.wrapping_mul(31)
-                    .wrapping_add(pr.number as usize)
-                    .wrapping_add(pr.base_ref_name.len())
-                    .wrapping_add(pr.head_ref_name.len())
-            })
-        })
-        .unwrap_or(0)
-}
+        .map(|detail_state| detail_state.ai_stack_state.clone())
+        .unwrap_or_default();
 
-fn local_stack_revision(app_state: &AppState) -> String {
-    app_state
-        .active_detail_state()
-        .and_then(|detail_state| detail_state.local_repository_status.as_ref())
-        .map(|status| {
-            format!(
-                "{}:{}:{}",
-                status.ready_for_snapshot_features(),
-                status.path.as_deref().unwrap_or_default(),
-                status.current_head_oid.as_deref().unwrap_or_default()
-            )
-        })
-        .unwrap_or_default()
-}
-
-fn build_repo_context(app_state: &AppState, _detail: &PullRequestDetail) -> RepoContext {
-    let detail_state = app_state.active_detail_state();
-    RepoContext {
-        open_pull_requests: detail_state
-            .and_then(|state| state.stack_open_pull_requests.clone())
-            .unwrap_or_default(),
-        local_repo_path: detail_state
-            .and_then(|state| state.local_repository_status.as_ref())
-            .and_then(|status| {
-                status
-                    .ready_for_snapshot_features()
-                    .then(|| status.path.clone())
-            })
-            .flatten()
-            .map(PathBuf::from),
-        trunk_branch: None,
+    if ai_stack_state.generating {
+        return Arc::new(ai_stack_placeholder(
+            detail,
+            "Generating AI stack",
+            "The selected provider is planning review layers from the prepared checkout.",
+            None,
+        ));
     }
-}
 
-fn ai_stack_for_error(detail: &PullRequestDetail, message: String) -> ReviewStack {
-    crate::stacks::providers::ai_virtual::ai_unavailable_stack(
+    if ai_stack_state.loading {
+        return Arc::new(ai_stack_placeholder(
+            detail,
+            "Preparing AI stack",
+            ai_stack_state
+                .message
+                .as_deref()
+                .unwrap_or("Preparing the local checkout before AI stack generation."),
+            None,
+        ));
+    }
+
+    if let Some(error) = ai_stack_state.error {
+        return Arc::new(ai_stack_placeholder(
+            detail,
+            "AI stack unavailable",
+            "The full pull request diff is still available while the AI stack is unavailable.",
+            Some(error),
+        ));
+    }
+
+    Arc::new(ai_stack_placeholder(
         detail,
-        &format!("AI stack planning failed. {message}"),
-        Some(serde_json::json!({ "error": message })),
-    )
-    .unwrap_or_else(|_| ReviewStack {
-        id: format!("stack-error:{}#{}", detail.repository, detail.number),
+        "AI stack queued",
+        "Entering Review will prepare the checkout and generate the AI stack.",
+        None,
+    ))
+}
+
+fn ai_stack_placeholder(
+    detail: &PullRequestDetail,
+    title: &str,
+    summary: &str,
+    warning: Option<String>,
+) -> ReviewStack {
+    let stack_id = format!(
+        "ai-stack-placeholder:{}#{}:{}",
+        detail.repository,
+        detail.number,
+        detail.head_ref_oid.as_deref().unwrap_or("unknown")
+    );
+    let warnings = warning
+        .map(|message| vec![StackWarning::new("ai-virtual-stack-unavailable", message)])
+        .unwrap_or_default();
+
+    ReviewStack {
+        id: stack_id.clone(),
         repository: detail.repository.clone(),
         selected_pr_number: detail.number,
-        source: crate::stacks::model::StackSource::VirtualAi,
-        kind: crate::stacks::model::StackKind::Virtual,
+        source: StackSource::VirtualAi,
+        kind: StackKind::Virtual,
         confidence: Confidence::Low,
         trunk_branch: Some(detail.base_ref_name.clone()),
         base_oid: detail.base_ref_oid.clone(),
         head_oid: detail.head_ref_oid.clone(),
-        layers: Vec::new(),
+        layers: vec![ReviewStackLayer {
+            id: format!("{stack_id}-pending"),
+            index: 0,
+            title: title.to_string(),
+            summary: summary.to_string(),
+            rationale: summary.to_string(),
+            pr: None,
+            virtual_layer: Some(VirtualLayerRef {
+                source: StackSource::VirtualAi,
+                role: crate::stacks::model::ChangeRole::Unknown,
+                source_label: "AI stack".to_string(),
+            }),
+            base_oid: detail.base_ref_oid.clone(),
+            head_oid: detail.head_ref_oid.clone(),
+            atom_ids: Vec::new(),
+            depends_on_layer_ids: Vec::new(),
+            metrics: LayerMetrics::default(),
+            status: LayerReviewStatus::NotReviewed,
+            confidence: Confidence::Low,
+            warnings: warnings.clone(),
+        }],
         atoms: Vec::new(),
-        warnings: vec![crate::stacks::model::StackWarning::new(
-            "ai-virtual-stack-unavailable",
-            "AI stack planning failed and Remiss did not generate a non-AI stack.",
-        )],
+        warnings,
         provider: None,
         generated_at_ms: crate::stacks::model::stack_now_ms(),
-        generator_version: crate::stacks::model::STACK_GENERATOR_VERSION.to_string(),
-    })
+        generator_version: STACK_GENERATOR_VERSION.to_string(),
+    }
 }
 
 fn prepare_review_queue(app_state: &AppState, detail: &PullRequestDetail) -> Arc<ReviewQueue> {
@@ -2132,6 +2103,24 @@ fn render_stack_rail(
         .read(cx)
         .active_detail_state()
         .and_then(|detail_state| detail_state.stack_open_pull_requests_error.clone());
+    let ai_stack_state = state
+        .read(cx)
+        .active_detail_state()
+        .map(|detail_state| detail_state.ai_stack_state.clone())
+        .unwrap_or_default();
+    let review_intelligence_loading = state
+        .read(cx)
+        .active_detail_state()
+        .map(|detail_state| detail_state.review_intelligence_loading)
+        .unwrap_or(false);
+    let ai_stack_busy = ai_stack_state.loading || ai_stack_state.generating;
+    let show_stack_retry =
+        ai_stack_state.error.is_some() && !ai_stack_busy && !review_intelligence_loading;
+    let stack_warning = stack
+        .warnings
+        .first()
+        .map(|warning| warning.message.clone());
+    let state_for_stack_retry = state.clone();
 
     div()
         .px(px(8.0))
@@ -2175,7 +2164,8 @@ fn render_stack_rail(
                         .gap(px(4.0))
                         .items_center()
                         .child(badge(&stack.layers.len().to_string()))
-                        .when(stack_refs_loading, |el| el.child(badge("Checking"))),
+                        .when(stack_refs_loading, |el| el.child(badge("Checking")))
+                        .when(ai_stack_busy, |el| el.child(badge("Generating"))),
                 ),
         )
         .children(stack.layers.iter().map(|layer| {
@@ -2188,19 +2178,42 @@ fn render_stack_rail(
                 reviewed_layer_ids.contains(&layer.id),
             )
         }))
-        .when(!stack.warnings.is_empty(), |el| {
+        .when_some(stack_warning, |el, warning_message| {
             el.child(
                 div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap(px(8.0))
                     .px(px(8.0))
                     .py(px(6.0))
                     .rounded(radius_sm())
                     .bg(warning_muted())
                     .border_1()
                     .border_color(warning())
-                    .text_size(px(11.0))
-                    .line_height(px(16.0))
-                    .text_color(fg_emphasis())
-                    .child(stack.warnings[0].message.clone()),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_grow()
+                            .text_size(px(11.0))
+                            .line_height(px(16.0))
+                            .text_color(fg_emphasis())
+                            .child(warning_message),
+                    )
+                    .when(show_stack_retry, |el| {
+                        el.child(div().flex_shrink_0().child(review_button(
+                            "Retry stack",
+                            move |_, window, cx| {
+                                review_intelligence::trigger_review_intelligence(
+                                    &state_for_stack_retry,
+                                    window,
+                                    cx,
+                                    review_intelligence::ReviewIntelligenceScope::StackOnly,
+                                    true,
+                                );
+                            },
+                        )))
+                    }),
             )
         })
         .when_some(stack_refs_error, |el, error| {
@@ -4247,9 +4260,13 @@ fn render_ai_tour_pending_panel(
         )
     } else if tour_loading {
         (
-            "Looking for a cached AI tour".to_string(),
-            "The app is checking whether this pull request head already has a stored tour."
-                .to_string(),
+            progress_summary
+                .map(str::to_string)
+                .unwrap_or_else(|| "Looking for a cached AI tour".to_string()),
+            progress_detail.map(str::to_string).unwrap_or_else(|| {
+                "The app is checking whether this pull request head already has a stored tour."
+                    .to_string()
+            }),
         )
     } else if tour_generating {
         (
@@ -4339,7 +4356,9 @@ fn render_ai_tour_progress_panel(
     let title = if provider_loading {
         "Checking provider".to_string()
     } else if tour_loading {
-        "Loading cached tour".to_string()
+        progress_summary
+            .map(str::to_string)
+            .unwrap_or_else(|| "Loading cached tour".to_string())
     } else if tour_generating {
         progress_summary
             .map(str::to_string)

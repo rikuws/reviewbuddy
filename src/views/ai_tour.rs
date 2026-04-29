@@ -7,6 +7,7 @@ use crate::code_tour::{
     CodeTourProvider, GeneratedCodeTour,
 };
 use crate::local_repo;
+use crate::review_intelligence::{self, ReviewIntelligenceScope};
 use crate::state::{AppState, CodeTourState};
 use crate::{code_tour, github};
 
@@ -258,9 +259,10 @@ pub async fn refresh_active_tour_flow(
                     .insert(request_key.clone());
             })
             .ok();
-        generate_tour_flow(
+        review_intelligence::run_review_intelligence_flow(
             model,
-            Some((detail_key, detail, provider, request_key)),
+            ReviewIntelligenceScope::All,
+            false,
             true,
             cx,
         )
@@ -272,19 +274,21 @@ pub fn trigger_generate_tour(
     state: &Entity<AppState>,
     window: &mut Window,
     cx: &mut App,
-    automatic: bool,
+    _automatic: bool,
 ) {
-    let model = state.clone();
-    window
-        .spawn(cx, async move |cx: &mut AsyncWindowContext| {
-            generate_tour_flow(model, None, automatic, cx).await;
-        })
-        .detach();
+    review_intelligence::trigger_review_intelligence(
+        state,
+        window,
+        cx,
+        ReviewIntelligenceScope::All,
+        true,
+    );
 }
 
-async fn generate_tour_flow(
+pub(crate) async fn generate_tour_flow(
     model: Entity<AppState>,
     context: Option<(String, github::PullRequestDetail, CodeTourProvider, String)>,
+    prepared_local_repo_status: Option<local_repo::LocalRepositoryStatus>,
     automatic: bool,
     cx: &mut AsyncWindowContext,
 ) {
@@ -368,6 +372,9 @@ async fn generate_tour_flow(
         return;
     }
 
+    let has_prepared_checkout = prepared_local_repo_status.is_some();
+    let prepared_checkout_for_ui = prepared_local_repo_status.clone();
+
     model
         .update(cx, |state, cx| {
             if !detail_request_matches(state, &detail_key, provider, &request_key) {
@@ -375,8 +382,11 @@ async fn generate_tour_flow(
             }
 
             if let Some(detail_state) = state.detail_states.get_mut(&detail_key) {
-                detail_state.local_repository_loading = true;
+                detail_state.local_repository_loading = !has_prepared_checkout;
                 detail_state.local_repository_error = None;
+                if let Some(status) = prepared_checkout_for_ui.as_ref() {
+                    detail_state.local_repository_status = Some(status.clone());
+                }
 
                 let tour_state = detail_state.tour_states.entry(provider).or_default();
                 clear_tour_progress(tour_state);
@@ -388,12 +398,27 @@ async fn generate_tour_flow(
                 tour_state.success = false;
                 apply_tour_progress_message(
                     tour_state,
-                    "Preparing local checkout".to_string(),
-                    Some(format!(
-                        "Checking the linked or managed repository before starting {}.",
-                        provider.label()
-                    )),
-                    Some("Preparing the local checkout".to_string()),
+                    if has_prepared_checkout {
+                        "Using prepared checkout".to_string()
+                    } else {
+                        "Preparing local checkout".to_string()
+                    },
+                    Some(if has_prepared_checkout {
+                        format!(
+                            "Reusing the checkout prepared for the AI stack before starting {}.",
+                            provider.label()
+                        )
+                    } else {
+                        format!(
+                            "Checking the linked or managed repository before starting {}.",
+                            provider.label()
+                        )
+                    }),
+                    Some(if has_prepared_checkout {
+                        "Using the prepared checkout".to_string()
+                    } else {
+                        "Preparing the local checkout".to_string()
+                    }),
                     None,
                 );
             }
@@ -402,23 +427,28 @@ async fn generate_tour_flow(
         })
         .ok();
 
-    let local_repo_result = cx
-        .background_executor()
-        .spawn({
-            let cache = cache.clone();
-            let repository = detail.repository.clone();
-            let pull_request_number = detail.number;
-            let head_ref_oid = detail.head_ref_oid.clone();
-            async move {
-                local_repo::ensure_local_repository_for_pull_request(
-                    &cache,
-                    &repository,
-                    pull_request_number,
-                    head_ref_oid.as_deref(),
-                )
-            }
-        })
-        .await;
+    let local_repo_result = if let Some(status) = prepared_local_repo_status {
+        Ok(status)
+    } else {
+        cx.background_executor()
+            .spawn({
+                let cache = cache.clone();
+                let repository = detail.repository.clone();
+                let pull_request_number = detail.number;
+                let head_ref_oid = detail.head_ref_oid.clone();
+                async move {
+                    review_intelligence::run_foreground_blocking(|| {
+                        local_repo::ensure_local_repository_for_pull_request(
+                            &cache,
+                            &repository,
+                            pull_request_number,
+                            head_ref_oid.as_deref(),
+                        )
+                    })
+                }
+            })
+            .await
+    };
 
     let Ok(local_repo_status) = local_repo_result else {
         let error = local_repo_result
@@ -477,10 +507,11 @@ async fn generate_tour_flow(
     std::thread::spawn({
         let cache = cache.clone();
         move || {
-            let result =
+            let result = review_intelligence::run_foreground_blocking(|| {
                 code_tour::generate_code_tour_with_progress(&cache, generation_input, |progress| {
                     let _ = progress_tx.send(progress);
-                });
+                })
+            });
             let _ = result_tx.send(result);
         }
     });

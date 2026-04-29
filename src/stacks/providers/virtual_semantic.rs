@@ -542,7 +542,7 @@ diff --git a/tests/service_test.rs b/tests/service_test.rs
         .unwrap();
 
         assert!(stack.layers.len() >= 2);
-        assert_eq!(stack.layers.last().unwrap().title.contains("Tests"), true);
+        assert!(stack.layers.last().unwrap().title.contains("Tests"));
         let assigned = stack
             .layers
             .iter()
