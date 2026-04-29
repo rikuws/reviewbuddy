@@ -40,19 +40,11 @@ pub fn discover(
         return Ok(None);
     };
     if !context.suitability.suitable_for_layers {
-        eprintln!(
-            "Commit virtual stack suitability: score={:.2}, suitable=false, reasons={}",
-            context.suitability.score,
-            context.suitability.reasons.join("; ")
-        );
+        log_commit_suitability(selected_pr, &context.suitability);
         return Ok(None);
     }
 
-    eprintln!(
-        "Commit virtual stack suitability: score={:.2}, suitable=true, reasons={}",
-        context.suitability.score,
-        context.suitability.reasons.join("; ")
-    );
+    log_commit_suitability(selected_pr, &context.suitability);
 
     let commits = context.commits;
 
@@ -294,22 +286,22 @@ pub fn score_commit_suitability(
     let mut reasons = Vec::<String>::new();
     let mut hard_reject = false;
 
-    if (3..=12).contains(&commit_count) {
-        score += 0.18;
-    } else {
-        reasons.push(format!(
-            "{} commit{} is outside the preferred 3-12 layer range.",
-            commit_count,
-            if commit_count == 1 { "" } else { "s" }
-        ));
-    }
-
     if commit_count <= 2 && total_changed_lines > 800 {
         hard_reject = true;
         reasons.push(format!(
             "Only {commit_count} commit{} for a {total_changed_lines}-line PR.",
             if commit_count == 1 { "" } else { "s" }
         ));
+    }
+
+    if (3..=12).contains(&commit_count) {
+        score += 0.18;
+    } else if !(commit_count <= 2 && total_changed_lines > 800) {
+        reasons.push(if commit_count == 1 {
+            "1 commit is outside the preferred 3-12 layer range.".to_string()
+        } else {
+            format!("{commit_count} commits are outside the preferred 3-12 layer range.")
+        });
     }
 
     if largest_ratio > 0.65 {
@@ -423,6 +415,30 @@ pub fn score_commit_suitability(
         suitable_for_layers,
         reasons,
     }
+}
+
+fn log_commit_suitability(selected_pr: &PullRequestDetail, suitability: &CommitSuitability) {
+    let primary_reason = suitability
+        .reasons
+        .first()
+        .map(String::as_str)
+        .unwrap_or("Commits are granular, coherent, and balanced.");
+    let additional_reason_count = suitability.reasons.len().saturating_sub(1);
+
+    eprintln!(
+        "Commit virtual stack suitability: pr={}#{} score={:.2} suitable={} decision={} reason=\"{}\" additional_reasons={}",
+        selected_pr.repository,
+        selected_pr.number,
+        suitability.score,
+        suitability.suitable_for_layers,
+        if suitability.suitable_for_layers {
+            "use_commit_layers"
+        } else {
+            "skip_commit_layers"
+        },
+        primary_reason,
+        additional_reason_count
+    );
 }
 
 fn commit_summaries(

@@ -129,7 +129,7 @@ impl CodingAgentBackend for CopilotBackend {
 
         let mut prompt = build_tour_prompt(input);
         if prompt.len() > MAX_PROMPT_BYTES {
-            prompt.truncate(MAX_PROMPT_BYTES);
+            truncate_to_byte_limit(&mut prompt, MAX_PROMPT_BYTES);
         }
 
         let mut child = Command::new(&binary)
@@ -331,7 +331,7 @@ pub fn run_json_prompt(
     }
 
     if prompt.len() > MAX_STACK_PLAN_PROMPT_BYTES {
-        prompt.truncate(MAX_STACK_PLAN_PROMPT_BYTES);
+        truncate_to_byte_limit(&mut prompt, MAX_STACK_PLAN_PROMPT_BYTES);
     }
 
     let mut child = Command::new(&binary)
@@ -768,6 +768,18 @@ fn append_line(target: &mut String, line: &str) {
     target.push_str(trimmed);
 }
 
+fn truncate_to_byte_limit(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+
+    let mut cutoff = max_bytes;
+    while !value.is_char_boundary(cutoff) {
+        cutoff = cutoff.saturating_sub(1);
+    }
+    value.truncate(cutoff);
+}
+
 fn probe_version(binary: &str) -> Result<String, String> {
     let output = Command::new(binary)
         .arg("--version")
@@ -915,6 +927,16 @@ mod tests {
             Some("{\"summary\":\"done\"}")
         );
         assert!(has_usable_final_text(&outcome));
+    }
+
+    #[test]
+    fn prompt_truncation_respects_utf8_boundaries() {
+        let mut prompt = "aaaaébbbb".to_string();
+
+        truncate_to_byte_limit(&mut prompt, 5);
+
+        assert_eq!(prompt, "aaaa");
+        assert!(prompt.len() <= 5);
     }
 
     #[test]
