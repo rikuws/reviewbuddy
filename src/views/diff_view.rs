@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{hash_map::DefaultHasher, BTreeSet},
+    hash::{Hash, Hasher},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use gpui::prelude::*;
 use gpui::*;
@@ -2059,9 +2065,12 @@ fn render_stack_rail(
         .active_review_session()
         .cloned()
         .unwrap_or_default();
-    let selected_layer_id = stack
+    let stack_can_expand = stack.layers.len() > 1;
+    let stack_rail_expanded = session.stack_rail_expanded && stack_can_expand;
+    let selected_layer = stack
         .selected_layer(session.selected_stack_layer_id.as_deref())
-        .map(|layer| layer.id.clone());
+        .cloned();
+    let selected_layer_id = selected_layer.as_ref().map(|layer| layer.id.clone());
     let reviewed_layer_ids = session.reviewed_stack_layer_ids.clone();
     let ai_stack_unavailable = stack
         .warnings
@@ -2121,6 +2130,7 @@ fn render_stack_rail(
         .first()
         .map(|warning| warning.message.clone());
     let state_for_stack_retry = state.clone();
+    let state_for_stack_toggle = state.clone();
 
     div()
         .px(px(8.0))
@@ -2165,19 +2175,48 @@ fn render_stack_rail(
                         .items_center()
                         .child(badge(&stack.layers.len().to_string()))
                         .when(stack_refs_loading, |el| el.child(badge("Checking")))
-                        .when(ai_stack_busy, |el| el.child(badge("Generating"))),
+                        .when(ai_stack_busy, |el| el.child(badge("Generating")))
+                        .when(stack_can_expand, |el| {
+                            el.child(render_stack_rail_toggle(
+                                state_for_stack_toggle,
+                                stack_rail_expanded,
+                            ))
+                        }),
                 ),
         )
-        .children(stack.layers.iter().map(|layer| {
-            render_stack_layer_row(
-                state,
-                detail,
-                stack,
-                layer,
-                selected_layer_id.as_deref() == Some(layer.id.as_str()),
-                reviewed_layer_ids.contains(&layer.id),
+        .when(stack_rail_expanded, |el| {
+            el.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .id("stack-layer-scroll")
+                    .overflow_y_scroll()
+                    .max_h(px(280.0))
+                    .children(stack.layers.iter().map(|layer| {
+                        render_stack_layer_row(
+                            state,
+                            detail,
+                            stack,
+                            layer,
+                            selected_layer_id.as_deref() == Some(layer.id.as_str()),
+                            reviewed_layer_ids.contains(&layer.id),
+                        )
+                    })),
             )
-        }))
+        })
+        .when(!stack_rail_expanded, |el| {
+            if let Some(layer) = selected_layer.as_ref() {
+                el.child(render_stack_layer_summary_row(
+                    state,
+                    layer,
+                    stack_can_expand,
+                    reviewed_layer_ids.contains(&layer.id),
+                ))
+            } else {
+                el
+            }
+        })
         .when_some(stack_warning, |el, warning_message| {
             el.child(
                 div()
@@ -2231,6 +2270,152 @@ fn render_stack_rail(
                     .child(format!("Real stack lookup unavailable: {error}")),
             )
         })
+}
+
+fn render_stack_rail_toggle(state: Entity<AppState>, expanded: bool) -> impl IntoElement {
+    let label = if expanded { "Hide" } else { "Open" };
+
+    div()
+        .px(px(6.0))
+        .py(px(2.0))
+        .rounded(px(999.0))
+        .bg(if expanded {
+            accent_muted()
+        } else {
+            bg_subtle()
+        })
+        .border_1()
+        .border_color(if expanded { accent() } else { border_muted() })
+        .text_size(px(9.0))
+        .font_family(mono_font_family())
+        .text_color(if expanded { accent() } else { fg_muted() })
+        .cursor_pointer()
+        .hover(|style| style.bg(hover_bg()).border_color(border_default()))
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            state.update(cx, |state, cx| {
+                state.set_stack_rail_expanded(!expanded);
+                state.persist_active_review_session();
+                cx.notify();
+            });
+        })
+        .child(label)
+}
+
+fn render_stack_layer_summary_row(
+    state: &Entity<AppState>,
+    layer: &ReviewStackLayer,
+    can_expand: bool,
+    is_reviewed: bool,
+) -> impl IntoElement {
+    let state_for_open = state.clone();
+    let line_count = layer.metrics.changed_lines;
+    let thread_count = layer.metrics.unresolved_thread_count;
+    let confidence = layer.confidence;
+
+    div()
+        .px(px(8.0))
+        .py(px(7.0))
+        .rounded(radius_sm())
+        .border_1()
+        .border_color(focus_border())
+        .bg(bg_selected())
+        .when(can_expand, |el| {
+            el.cursor_pointer()
+                .hover(|style| style.bg(hover_bg()))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    state_for_open.update(cx, |state, cx| {
+                        state.set_stack_rail_expanded(true);
+                        state.persist_active_review_session();
+                        cx.notify();
+                    });
+                })
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .min_w_0()
+                        .child(
+                            div()
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .rounded(radius_sm())
+                                .bg(accent_muted())
+                                .border_1()
+                                .border_color(accent())
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_size(px(10.0))
+                                .font_family(mono_font_family())
+                                .text_color(accent())
+                                .child((layer.index + 1).to_string()),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg_emphasis())
+                                .whitespace_nowrap()
+                                .overflow_x_hidden()
+                                .text_ellipsis()
+                                .child(layer.title.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .font_family(mono_font_family())
+                        .text_color(if is_reviewed { success() } else { fg_subtle() })
+                        .child(if is_reviewed {
+                            "done"
+                        } else {
+                            layer.status.label()
+                        }),
+                ),
+        )
+        .child(
+            div()
+                .mt(px(6.0))
+                .flex()
+                .gap(px(4.0))
+                .flex_wrap()
+                .child(subtle_stack_chip(&format!(
+                    "{} file{}",
+                    layer.metrics.file_count,
+                    if layer.metrics.file_count == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                )))
+                .child(subtle_stack_chip(&format!(
+                    "{line_count} line{}",
+                    if line_count == 1 { "" } else { "s" }
+                )))
+                .when(thread_count > 0, |el| {
+                    el.child(subtle_stack_chip(&format!(
+                        "{thread_count} thread{}",
+                        if thread_count == 1 { "" } else { "s" }
+                    )))
+                })
+                .when(confidence != Confidence::High, |el| {
+                    el.child(subtle_stack_chip(match confidence {
+                        Confidence::High => "high",
+                        Confidence::Medium => "medium",
+                        Confidence::Low => "low",
+                    }))
+                })
+                .when(can_expand, |el| el.child(subtle_stack_chip("Open stack"))),
+        )
 }
 
 fn render_stack_layer_row(
@@ -2404,9 +2589,33 @@ fn render_file_tree(
     review_stack: &ReviewStack,
     cx: &App,
 ) -> impl IntoElement {
-    let tree_rows = {
+    let (tree_rows, file_tree_label, visible_file_count, visible_additions, visible_deletions) = {
         let app_state = state.read(cx);
-        prepare_review_file_tree_rows(&app_state, detail)
+        let stack_filter = app_state.active_review_session().and_then(|session| {
+            build_layer_diff_filter(
+                review_stack,
+                session.stack_diff_mode,
+                session.selected_stack_layer_id.as_deref(),
+                &session.reviewed_stack_atom_ids,
+            )
+        });
+        let visible_paths = stack_filter
+            .as_ref()
+            .map(|filter| stack_file_paths_for_filter(review_stack, filter));
+        let (file_count, additions, deletions) =
+            review_file_tree_totals(detail, visible_paths.as_ref());
+        let label = stack_filter
+            .as_ref()
+            .map(|filter| review_file_tree_label(filter.mode).to_string())
+            .unwrap_or_else(|| "Files".to_string());
+
+        (
+            prepare_review_file_tree_rows(&app_state, detail, visible_paths.as_ref()),
+            label,
+            file_count,
+            additions,
+            deletions,
+        )
     };
     let list_state = {
         let app_state = state.read(cx);
@@ -2442,7 +2651,7 @@ fn render_file_tree(
                         .text_size(px(12.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(fg_emphasis())
-                        .child("Files"),
+                        .child(file_tree_label),
                 )
                 .child(
                     div()
@@ -2454,19 +2663,19 @@ fn render_file_tree(
                         .child(
                             div()
                                 .text_color(fg_muted())
-                                .child(detail.files.len().to_string()),
+                                .child(visible_file_count.to_string()),
                         )
                         .child(div().text_color(fg_subtle()).child("\u{2022}"))
                         .child(
                             div()
                                 .text_color(success())
-                                .child(format!("+{}", detail.additions)),
+                                .child(format!("+{visible_additions}")),
                         )
                         .child(div().text_color(fg_subtle()).child("/"))
                         .child(
                             div()
                                 .text_color(danger())
-                                .child(format!("-{}", detail.deletions)),
+                                .child(format!("-{visible_deletions}")),
                         ),
                 ),
         )
@@ -2527,8 +2736,12 @@ fn prepare_review_file_tree_list_state(app_state: &AppState) -> ListState {
 fn prepare_review_file_tree_rows(
     app_state: &AppState,
     detail: &PullRequestDetail,
+    visible_paths: Option<&BTreeSet<String>>,
 ) -> Arc<Vec<ReviewFileTreeRow>> {
-    let cache_key = review_cache_key(app_state.active_pr_key.as_deref(), "review-file-tree-rows");
+    let cache_key = review_cache_key(
+        app_state.active_pr_key.as_deref(),
+        &review_file_tree_cache_scope(visible_paths),
+    );
     let revision = detail.updated_at.clone();
 
     if let Some(cached) = app_state
@@ -2541,7 +2754,7 @@ fn prepare_review_file_tree_rows(
         return cached.rows;
     }
 
-    let rows = Arc::new(build_review_file_tree_rows(detail));
+    let rows = Arc::new(build_review_file_tree_rows(detail, visible_paths));
     app_state.review_file_tree_cache.borrow_mut().insert(
         cache_key,
         CachedReviewFileTree {
@@ -2552,6 +2765,68 @@ fn prepare_review_file_tree_rows(
     rows
 }
 
+fn review_file_tree_cache_scope(visible_paths: Option<&BTreeSet<String>>) -> String {
+    match visible_paths {
+        None => "review-file-tree-rows:all".to_string(),
+        Some(paths) => {
+            let mut hasher = DefaultHasher::new();
+            paths.hash(&mut hasher);
+            format!(
+                "review-file-tree-rows:stack-filter:{}:{:x}",
+                paths.len(),
+                hasher.finish()
+            )
+        }
+    }
+}
+
+fn review_file_tree_label(mode: StackDiffMode) -> &'static str {
+    match mode {
+        StackDiffMode::WholePr => "Files",
+        StackDiffMode::CurrentLayerOnly => "Layer Files",
+        StackDiffMode::UpToCurrentLayer => "Stack Files",
+        StackDiffMode::CurrentAndDependents => "Dependent Files",
+        StackDiffMode::SinceLastReviewed => "Unreviewed Files",
+    }
+}
+
+fn stack_file_paths_for_filter(
+    review_stack: &ReviewStack,
+    filter: &LayerDiffFilter,
+) -> BTreeSet<String> {
+    filter
+        .visible_atom_ids
+        .iter()
+        .filter_map(|atom_id| review_stack.atom(atom_id))
+        .filter(|atom| !atom.path.is_empty())
+        .map(|atom| atom.path.clone())
+        .collect()
+}
+
+fn review_file_tree_totals(
+    detail: &PullRequestDetail,
+    visible_paths: Option<&BTreeSet<String>>,
+) -> (usize, i64, i64) {
+    detail
+        .files
+        .iter()
+        .filter(|file| {
+            visible_paths
+                .map(|paths| paths.contains(&file.path))
+                .unwrap_or(true)
+        })
+        .fold(
+            (0usize, 0i64, 0i64),
+            |(count, additions, deletions), file| {
+                (
+                    count + 1,
+                    additions + file.additions,
+                    deletions + file.deletions,
+                )
+            },
+        )
+}
+
 #[derive(Default)]
 struct ReviewFileTreeNode {
     name: String,
@@ -2559,9 +2834,19 @@ struct ReviewFileTreeNode {
     files: Vec<ReviewFileTreeRow>,
 }
 
-fn build_review_file_tree_rows(detail: &PullRequestDetail) -> Vec<ReviewFileTreeRow> {
+fn build_review_file_tree_rows(
+    detail: &PullRequestDetail,
+    visible_paths: Option<&BTreeSet<String>>,
+) -> Vec<ReviewFileTreeRow> {
     let mut root = ReviewFileTreeNode::default();
     for file in &detail.files {
+        if visible_paths
+            .map(|paths| !paths.contains(&file.path))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
         let mut cursor = &mut root;
         let mut segments = file.path.split('/').peekable();
         while let Some(segment) = segments.next() {

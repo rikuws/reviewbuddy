@@ -1078,6 +1078,12 @@ impl AppState {
         }
     }
 
+    pub fn set_stack_rail_expanded(&mut self, expanded: bool) {
+        if let Some(session) = self.active_review_session_mut() {
+            session.stack_rail_expanded = expanded;
+        }
+    }
+
     pub fn set_stack_layer_reviewed(
         &mut self,
         stack: &ReviewStack,
